@@ -1,0 +1,27 @@
+/target/
+/.vtracker/
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+
+/native/macos/.build/
+/native/macos/.swiftpm/
+__pycache__/
+
+node_modules/
+
+/native/diarization/.build/
+
+# Local validation artifacts can contain real meeting content.
+/docs/ui-previews/
+/docs/*validation.json
+/design/prototype/screenshots/
+.DS_Store
+.env
+.env.*
+*.wav
+*.mp3
+*.m4a
+*.flac
+*.onnx
+*.bin
