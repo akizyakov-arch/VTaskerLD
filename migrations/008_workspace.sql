@@ -1,0 +1,12 @@
+CREATE TABLE projects (id INTEGER PRIMARY KEY, data_json TEXT NOT NULL, revision INTEGER NOT NULL DEFAULT 1, is_demo INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')));
+CREATE TABLE tasks (id INTEGER PRIMARY KEY, project_id INTEGER REFERENCES projects(id), assignee_id INTEGER REFERENCES people(id), data_json TEXT NOT NULL, revision INTEGER NOT NULL DEFAULT 1, is_demo INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')));
+CREATE TABLE proposals (id INTEGER PRIMARY KEY, data_json TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','accepted','rejected')), is_demo INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')));
+CREATE TABLE decisions (id INTEGER PRIMARY KEY, project_id INTEGER REFERENCES projects(id), meeting_id INTEGER NOT NULL REFERENCES meetings(id), text TEXT NOT NULL, source_json TEXT NOT NULL, is_demo INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE change_events (id INTEGER PRIMARY KEY, entity_type TEXT NOT NULL, entity_id INTEGER NOT NULL, batch_id TEXT, previous_json TEXT, next_json TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')));
+CREATE TABLE workspace_settings (key TEXT PRIMARY KEY, data_json TEXT NOT NULL);
+ALTER TABLE people ADD COLUMN is_demo INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE meetings ADD COLUMN is_demo INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE meetings ADD COLUMN project_id INTEGER REFERENCES projects(id);
+CREATE TABLE meeting_people (meeting_id INTEGER NOT NULL REFERENCES meetings(id), person_id INTEGER NOT NULL REFERENCES people(id), PRIMARY KEY(meeting_id,person_id));
+CREATE TABLE segment_edits (id INTEGER PRIMARY KEY, model_run_id INTEGER NOT NULL REFERENCES model_runs(id), segment_id INTEGER NOT NULL REFERENCES segments(id), text TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')));
+CREATE TABLE segment_assignments (id INTEGER PRIMARY KEY, model_run_id INTEGER NOT NULL REFERENCES model_runs(id), segment_id INTEGER NOT NULL REFERENCES segments(id), person_id INTEGER REFERENCES people(id), created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')));

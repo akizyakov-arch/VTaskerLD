@@ -11,6 +11,7 @@ __pycache__/
 node_modules/
 
 /native/diarization/.build/
+/native/inference/.build/
 
 # Local validation artifacts can contain real meeting content.
 /docs/ui-previews/

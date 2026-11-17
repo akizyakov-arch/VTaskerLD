@@ -1,0 +1,142 @@
+import Foundation
+
+struct Workspace: Decodable {
+    let projects: [Project]
+    let tasks: [TaskItem]
+    let meetings: [Meeting]
+    let people: [Person]
+    let defaultStages: [Stage]
+    let settings: WorkspaceSettings
+    let today: String
+    let proposals: [Proposal]
+    let decisions: [Decision]
+
+    var visibleTasks: [TaskItem] {
+        let archivedIDs = Set(projects.filter { $0.archived == true }.map(\.id))
+        return tasks.filter { task in
+            task.projectId.map { !archivedIDs.contains($0) } ?? true
+        }
+    }
+}
+
+struct Project: Decodable, Identifiable {
+    let id: Int
+    let title: String
+    let description: String?
+    let archived: Bool?
+    let stages: [Stage]
+    let startDate: String?
+    let endDate: String?
+    let revision: Int
+    let goal: String?
+    let materials: String?
+    let ownerId: Int?
+    let members: [Int]?
+    let nextMilestone: String?
+    let nextMilestoneDate: String?
+    let blocker: String?
+    let status: String
+}
+
+struct TaskItem: Decodable, Identifiable {
+    let id: Int
+    let title: String
+    let description: String?
+    let projectId: Int?
+    let stageTitle: String
+    let stageId: String
+    let stageKind: String
+    let assigneeId: Int?
+    let dueDate: String?
+    let overdue: Bool
+    let priority: String?
+    let blocked: Bool?
+    let blockedReason: String?
+    let authorId: Int?
+    let dependencies: [Int]?
+    let sources: [TaskSource]?
+    let createdAt: String?
+    let updatedAt: String?
+    let revision: Int
+    let dueTime: String?
+}
+
+struct TaskSource: Decodable {
+    let meetingId: Int?
+    let quote: String?
+    let topic: String?
+}
+
+struct Meeting: Decodable, Identifiable {
+    let id: Int
+    let scheduledAt: String?
+    let title: String
+    let projectId: Int?
+    let status: String
+    let participants: [Int]
+    let recordings: [Recording]
+    let processing: ProcessingJob?
+    let manualNotes: MeetingNotes?
+    let analysis: MeetingAnalysis?
+
+    var scheduledDate: Date? {
+        scheduledAt.flatMap { ISO8601DateFormatter().date(from: $0) }
+    }
+
+    func scheduleLabel(in zone: TimeZone) -> String? {
+        guard let scheduledDate else { return nil }
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "ru_RU")
+        formatter.timeZone = zone
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .short
+        return formatter.string(from: scheduledDate)
+    }
+}
+
+struct Person: Decodable, Identifiable {
+    let id: Int
+    let name: String
+    let lastName: String?
+    let patronymic: String?
+    let role: String?
+    let organization: String?
+    let department: String?
+    let nickname: String?
+    let photoRevision: Int?
+    let email: String?
+    let phone: String?
+    let notes: String?
+}
+
+struct Stage: Decodable, Identifiable {
+    let id: String
+    let title: String
+    let kind: String
+}
+
+struct Recording: Decodable {
+    let id: Int
+}
+
+struct CaptureStatus: Decodable, Equatable {
+    let active: Session?
+    let hint: SpeakerHint?
+
+    struct SpeakerHint: Decodable, Equatable {
+        let sessionId: String
+        let personId: Int?
+        let status: String
+        let ageMs: Int?
+    }
+
+    struct Session: Decodable, Equatable {
+        let meetingId: Int
+        let state: String
+        let canPause: Bool
+        let sessionId: String?
+        let elapsedMs: Int?
+        let savedMs: Int?
+        let level: Double?
+    }
+}
