@@ -1,5 +1,5 @@
 //! Opt-in, text-only Groq analysis. Credentials never enter SQLite or public snapshots.
-use crate::Store;
+use crate::{local_analysis, workspace::change_fields, Store};
 use anyhow::{bail, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
@@ -17,6 +17,7 @@ pub const MODELS: [&str; 8] = [
     "openai:gpt-4.1-mini", "gemini:gemini-2.5-flash",
     "mistral:mistral-small-latest", "anthropic:claude-sonnet-4-5",
 ];
+const ANALYSIS_POLICY: &str = "vtask-groq-context-tasks-v14";
 
 fn provider(model: &str) -> &str {
     model.split_once(':').map(|(name, _)| name).unwrap_or("groq")
@@ -38,7 +39,7 @@ fn key_account(base: &str, model: &str) -> String {
 pub fn revision(c: &Connection, mid: i64) -> Result<String> {
     let mut hash = Sha256::new();
     // A new extraction policy must not silently reuse an older empty result.
-    hash.update(b"vtask-groq-context-tasks-v4");
+    hash.update(ANALYSIS_POLICY.as_bytes());
     // Include corrections, confirmed names, participants, recording occurrences and workspace date context.
     for sql in [
         "SELECT * FROM meetings WHERE id=?1",
@@ -58,27 +59,86 @@ pub fn revision(c: &Connection, mid: i64) -> Result<String> {
     }
     Ok(format!("{:x}", hash.finalize()))
 }
-// A later run can split a compound поручение into its original actions.
-fn same_action_title(first: &str, second: &str) -> bool {
-    fn words(title: &str) -> std::collections::HashSet<String> {
-        title
-            .to_lowercase()
+pub(crate) fn same_action_title(first: &str, second: &str) -> bool {
+    fn normalized(title: &str) -> Vec<String> {
+        title.to_lowercase().replace('ё', "е")
             .split(|ch: char| !ch.is_alphanumeric())
-            .filter(|word| word.chars().count() >= 4)
-            .map(|word| {
-                if matches!(word, "помыть" | "вымыть" | "мыть") {
-                    return "мыть".into();
-                }
-                word.to_owned()
-            })
+            .filter(|word| !word.is_empty())
+            .map(str::to_owned)
             .collect()
     }
-    if first.trim().to_lowercase() == second.trim().to_lowercase() {
-        return true;
+    normalized(first) == normalized(second)
+}
+
+fn search_terms(text: &str) -> impl Iterator<Item = String> + '_ {
+    text.split(|ch: char| !ch.is_alphanumeric())
+        .filter(|word| word.chars().count() >= 4)
+        .map(|word| word.to_lowercase().replace('ё', "е").chars().take(4).collect())
+}
+
+fn bundle_task_changes(proposals: Vec<Value>, input: &Value) -> Vec<Value> {
+    let mut bundled = Vec::new();
+    for task in input["project_tasks"].as_array().into_iter().flatten() {
+        let changes: Vec<_> = proposals.iter().filter(|p| {
+            p["task_id"] == task["id"] && matches!(p["kind"].as_str(), Some("change_due" | "change_assignee"))
+        }).collect();
+        if !["change_due", "change_assignee"].iter().all(|kind| changes.iter().any(|p| p["kind"] == *kind)) {
+            continue;
+        }
+        let mut bundle = changes[0].clone();
+        bundle["kind"] = json!("change_task");
+        let mut proposed = json!({});
+        let mut conflicts = Vec::new();
+        for (kind, keys) in [("change_due", &["due_date", "due_time"][..]), ("change_assignee", &["assignee_id"][..])] {
+            let mut values = changes.iter().filter(|p| p["kind"] == kind).map(|p| &p["proposed"]);
+            let first = values.next().unwrap();
+            if values.any(|value| value != first) {
+                conflicts.push(if kind == "change_due" { "срок" } else { "исполнителя" });
+                for key in keys { proposed[*key] = Value::Null; }
+            } else {
+                for key in keys { proposed[*key] = first[*key].clone(); }
+            }
+        }
+        bundle["proposed"] = proposed;
+        bundle["due_date"] = bundle["proposed"]["due_date"].clone();
+        bundle["due_time"] = bundle["proposed"]["due_time"].clone();
+        bundle["assignee_id"] = bundle["proposed"]["assignee_id"].clone();
+        let ids: std::collections::HashSet<_> = changes.iter().flat_map(|p| {
+            p["source"]["segment_ids"].as_array().into_iter().flatten().filter_map(Value::as_i64)
+        }).collect();
+        let segments: Vec<_> = input["segments"].as_array().into_iter().flatten()
+            .filter(|s| s["id"].as_i64().is_some_and(|id| ids.contains(&id))).collect();
+        bundle["source"]["segment_ids"] = json!(segments.iter().map(|s| &s["id"]).collect::<Vec<_>>());
+        bundle["source"]["segment_times_ms"] = json!(segments.iter().map(|s| &s["start_ms"]).collect::<Vec<_>>());
+        let finding_ids: std::collections::BTreeSet<_> = changes.iter().flat_map(|p| {
+            p["source"]["finding_ids"].as_array().into_iter().flatten().filter_map(Value::as_str)
+        }).collect();
+        bundle["source"]["finding_ids"] = json!(finding_ids);
+        if !changes.iter().all(|p| p["source"]["person_id"] == changes[0]["source"]["person_id"]) {
+            bundle["source"]["person_id"] = Value::Null;
+        }
+        bundle["source"]["start_ms"] = segments[0]["start_ms"].clone();
+        bundle["source"]["quote"] = json!(segments.iter().filter_map(|s| s["text"].as_str())
+            .collect::<Vec<_>>().join("\n"));
+        let details: std::collections::BTreeSet<_> = changes.iter().filter_map(|p| p["description"].as_str())
+            .filter(|text| !text.is_empty()).collect();
+        bundle["description"] = json!(details.into_iter().collect::<Vec<_>>().join("\n"));
+        let mut clarifications: std::collections::BTreeSet<_> = changes.iter()
+            .filter_map(|p| p["clarification"].as_str())
+            .filter(|text| !text.is_empty()).map(str::to_owned).collect();
+        if !conflicts.is_empty() {
+            clarifications.insert(format!("В протоколе указаны разные значения. Уточните {}.", conflicts.join(" и ")));
+        }
+        bundle["needs_clarification"] = json!(!clarifications.is_empty());
+        bundle["clarification"] = json!(clarifications.into_iter().collect::<Vec<_>>().join("\n"));
+        bundled.push(bundle);
     }
-    let first = words(first);
-    let second = words(second);
-    second.len() >= 2 && second.is_subset(&first)
+    let mut result: Vec<_> = proposals.into_iter().filter(|p| {
+        !matches!(p["kind"].as_str(), Some("change_due" | "change_assignee"))
+            || !bundled.iter().any(|bundle| bundle["task_id"] == p["task_id"])
+    }).collect();
+    result.extend(bundled);
+    result
 }
 
 fn bounded(v: &Value, key: &str, limit: usize, required: bool) -> Result<String> {
@@ -91,7 +151,76 @@ fn bounded(v: &Value, key: &str, limit: usize, required: bool) -> Result<String>
     }
     Ok(text.to_owned())
 }
+
+fn analysis_source(input: &Value, mid: i64, analysis: i64, item: &Value) -> Result<Value> {
+    let ids = item["source_segment_ids"].as_array().context("Нет ссылок на реплики")?;
+    if ids.is_empty() || ids.len() > 30 {
+        bail!("Некорректные ссылки на реплики");
+    }
+    let mut sources = Vec::new();
+    for id in ids {
+        let segment = input["segments"].as_array().into_iter().flatten()
+            .find(|segment| id.is_i64() && segment["id"] == *id)
+            .context("Анализ сослался на несуществующую реплику")?;
+        if !sources.contains(&segment) { sources.push(segment); }
+    }
+    sources.sort_by_key(|s| s["start_ms"].as_u64().unwrap_or(0));
+    let quote = sources.iter().filter_map(|s| s["text"].as_str()).collect::<Vec<_>>().join("\n");
+    let person = &sources[0]["person_id"];
+    let speaker = if sources.iter().all(|s| s["person_id"] == *person) { person.clone() } else { Value::Null };
+    let mut source = json!({"meeting_id":mid,"model_run_id":input["model_run_id"],
+        "start_ms":sources[0]["start_ms"],"quote":quote,"segment_ids":ids,"person_id":speaker,
+        "analysis_id":analysis,"source_revision":input["source_revision"]});
+    if let Some(topic) = item["topic"].as_str() {
+        let topic = topic.split_whitespace().collect::<Vec<_>>().join(" ");
+        if !topic.is_empty() && topic.chars().count() <= 80 { source["topic"] = json!(topic); }
+    }
+    Ok(source)
+}
+
 impl Store {
+    pub fn ai_budget(&self, change: Option<&Value>) -> Result<Value> {
+        if let Some(change) = change {
+            let mut limits = serde_json::Map::new();
+            for key in ["daily_tokens", "monthly_tokens"] {
+                let limit = change[key].as_u64().filter(|limit| *limit <= 1_000_000_000)
+                    .context("Введите лимит от 0 до 1 000 000 000 токенов")?;
+                limits.insert(key.to_owned(), json!(limit));
+            }
+            self.0.execute(
+                "INSERT INTO workspace_settings(key,data_json) VALUES ('ai_budget',?1)
+                 ON CONFLICT(key) DO UPDATE SET data_json=excluded.data_json",
+                [Value::Object(limits).to_string()],
+            )?;
+        }
+        let limits: Option<String> = self.0.query_row(
+            "SELECT data_json FROM workspace_settings WHERE key='ai_budget'", [], |row| row.get(0),
+        ).optional()?;
+        let limits = limits.map(|json| serde_json::from_str::<Value>(&json)).transpose()?.unwrap_or(Value::Null);
+        let today = chrono::Utc::now().date_naive().to_string();
+        let month = format!("{}-01", &today[..7]);
+        let mut statement = self.0.prepare(
+            "SELECT stage,phase,sum(day=?1),sum(CASE WHEN day=?1 THEN charged_tokens ELSE 0 END),
+                    count(*),sum(charged_tokens),sum(coalesce(input_tokens,0)),sum(coalesce(output_tokens,0)),
+                    sum(CASE WHEN state IN ('estimated','reserved') THEN charged_tokens ELSE 0 END)
+             FROM ai_usage WHERE day BETWEEN ?2 AND ?1 GROUP BY stage,phase ORDER BY stage,phase",
+        )?;
+        let stages = statement.query_map(params![today,month], |row| Ok(json!({
+            "stage":row.get::<_,String>(0)?, "phase":row.get::<_,String>(1)?,
+            "today_requests":row.get::<_,i64>(2)?, "today_tokens":row.get::<_,i64>(3)?,
+            "month_requests":row.get::<_,i64>(4)?, "month_tokens":row.get::<_,i64>(5)?,
+            "input_tokens":row.get::<_,i64>(6)?, "output_tokens":row.get::<_,i64>(7)?,
+            "estimated_tokens":row.get::<_,i64>(8)?
+        })))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let total = |key: &str| stages.iter().filter_map(|row| row[key].as_i64()).sum::<i64>();
+        Ok(json!({
+            "daily_tokens":limits["daily_tokens"].as_u64().unwrap_or(0),
+            "monthly_tokens":limits["monthly_tokens"].as_u64().unwrap_or(0),
+            "today_tokens":total("today_tokens"),"month_tokens":total("month_tokens"),
+            "estimated_tokens":total("estimated_tokens"),"stages":stages
+        }))
+    }
+
     pub fn groq_snapshot(&self, mid: i64) -> Result<Value> {
         let (title, date, project, demo, status): (String, String, Option<i64>, bool, String) =
             self.0.query_row(
@@ -134,8 +263,53 @@ impl Store {
                 Ok(json!({"id":r.get::<_,i64>(0)?,"name":r.get::<_,String>(1)?}))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut earlier = self.0.prepare(
+            "SELECT json_extract(data_json,'$.title'), json_extract(data_json,'$.source.start_ms')
+             FROM proposals
+             WHERE is_demo=0 AND status IN ('pending','accepted')
+               AND json_extract(data_json,'$.origin')='groq'
+               AND json_extract(data_json,'$.kind')='create_task'
+               AND json_extract(data_json,'$.source.meeting_id')=?1
+             ORDER BY id DESC LIMIT 48",
+        )?;
+        let discussed_tasks = earlier
+            .query_map([mid], |row| {
+                Ok(json!({"title": row.get::<_, String>(0)?, "start_ms": row.get::<_, Option<i64>>(1)?}))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let (project_tasks, project_decisions) = if let Some(project) = project {
+            let (project_tasks, active_decisions) = self.analysis_project_context(project)?;
+            let transcript_terms: std::collections::HashSet<_> = segments.iter()
+                .filter_map(|s| s["text"].as_str()).flat_map(search_terms).collect();
+            let explicit_ids: std::collections::HashSet<i64> = segments.iter().filter_map(|s| s["text"].as_str())
+                .flat_map(|text| text.split('#').skip(1))
+                .filter_map(|tail| tail[..tail.find(|ch: char| !ch.is_ascii_digit()).unwrap_or(tail.len())]
+                    .parse().ok()).collect();
+            let mut candidates: Vec<_> = project_tasks.iter()
+                .filter(|task| task["stage_kind"] == "active"
+                    || task["id"].as_i64().is_some_and(|id| explicit_ids.contains(&id))).collect();
+            candidates.sort_by_cached_key(|task| {
+                let title_hits = search_terms(task["title"].as_str().unwrap_or(""))
+                    .collect::<std::collections::HashSet<_>>().intersection(&transcript_terms).count();
+                let details_hits = search_terms(task["description"].as_str().unwrap_or(""))
+                    .collect::<std::collections::HashSet<_>>().intersection(&transcript_terms).count();
+                let mentioned = task["id"].as_i64().is_some_and(|id| explicit_ids.contains(&id));
+                std::cmp::Reverse((mentioned, title_hits, details_hits, task["id"].as_i64()))
+            });
+            let tasks: Vec<_> = candidates.into_iter().take(24).map(|task| {
+                let details: String = task["description"].as_str().unwrap_or("").chars().take(240).collect();
+                json!({"id":task["id"],"title":task["title"],"description":details,"revision":task["revision"],
+                    "stage_id":task["stage_id"],"stage_title":task["stage_title"],"stage_kind":task["stage_kind"],
+                    "blocked":task["blocked"],"blocked_reason":task["blocked_reason"],
+                    "due_date":task["due_date"],"due_time":task["due_time"],"assignee_id":task["assignee_id"]})
+            }).collect();
+            let decisions = active_decisions.into_iter()
+                .filter(|decision| tasks.iter().any(|task| task["id"] == decision["task_id"]))
+                .take(12).collect::<Vec<_>>();
+            (tasks, decisions)
+        } else { (Vec::new(), Vec::new()) };
         let timezone = self.workspace_timezone()?;
-        let value = json!({"meeting_id":mid,"title":title,"created_at":date,"timezone":timezone,"project_id":project,"model_run_id":run,"source_revision":revision(&self.0,mid)?,"participants":people,"segments":segments});
+        let value = json!({"meeting_id":mid,"title":title,"created_at":date,"timezone":timezone,"project_id":project,"model_run_id":run,"source_revision":revision(&self.0,mid)?,"participants":people,"segments":segments,"discussed_tasks":discussed_tasks,"project_tasks":project_tasks,"project_decisions":project_decisions});
         if value.to_string().len() > 350_000 {
             bail!("Транскрипт слишком большой для одного анализа");
         }
@@ -156,7 +330,7 @@ impl Store {
             .unwrap_or("Europe/Moscow".into()))
     }
     pub fn groq_analysis(&self, mid: i64) -> Result<Value> {
-        let mut stmt=self.0.prepare("SELECT id,state,model,source_revision,result_json,error,created_at FROM meeting_analyses WHERE meeting_id=?1 ORDER BY id DESC")?;
+        let mut stmt=self.0.prepare("SELECT id,state,model,CASE WHEN instr(source_revision,':run:') > 0 THEN substr(source_revision,1,instr(source_revision,':run:')-1) ELSE source_revision END,result_json,error,created_at FROM meeting_analyses WHERE meeting_id=?1 ORDER BY id DESC")?;
         let rows=stmt.query_map([mid],|r|Ok(json!({"id":r.get::<_,i64>(0)?,"state":r.get::<_,String>(1)?,"model":r.get::<_,String>(2)?,"source_revision":r.get::<_,String>(3)?,"result":r.get::<_,Option<String>>(4)?.and_then(|s|serde_json::from_str::<Value>(&s).ok()),"error":r.get::<_,Option<String>>(5)?,"created_at":r.get::<_,String>(6)?})))?.collect::<rusqlite::Result<Vec<_>>>()?;
         if rows.is_empty() {
             return Ok(Value::Null);
@@ -173,16 +347,64 @@ impl Store {
         Ok(latest)
     }
     pub fn groq_prepare(&self, mid: i64, model: &str, consent: bool) -> Result<(i64, Value, bool)> {
-        if !consent {
+        self.groq_prepare_run(mid, model, consent, false)
+    }
+
+    pub fn groq_prepare_run(&self, mid: i64, model: &str, consent: bool, fresh: bool) -> Result<(i64, Value, bool)> {
+        self.prepare_analysis(mid, model, consent, fresh, None, false)
+    }
+
+    fn prepare_analysis(&self, mid: i64, model: &str, consent: bool, fresh: bool,
+                        mode: Option<&str>, force: bool) -> Result<(i64, Value, bool)> {
+        let local = mode == Some("local") && model == local_analysis::MODEL;
+        if !consent && !local {
             bail!("Подтвердите отправку текста в Groq");
         }
-        if !valid_model(model) {
+        if !local && !valid_model(model) {
             bail!("Неизвестная модель Groq");
         }
-        let input = self.groq_snapshot(mid)?;
+        let mut input = self.groq_snapshot(mid)?;
+        input["analysis_policy"] = json!(ANALYSIS_POLICY);
+        if let Some(mode) = mode {
+            input["analysis_mode"] = json!(mode);
+        }
         let tx = self.0.unchecked_transaction()?;
         if revision(&tx, mid)? != input["source_revision"].as_str().unwrap() {
             bail!("Встреча изменилась. Откройте анализ заново");
+        }
+        if fresh {
+            let active: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM meeting_analyses WHERE meeting_id=?1 AND state IN ('running','pending'))",
+                [mid], |row| row.get(0),
+            )?;
+            if active { bail!("Анализ уже выполняется"); }
+            if mode.is_some() && !force {
+                let previous: Option<(i64, String, String)> = tx.query_row(
+                    "SELECT id,model,input_json FROM meeting_analyses
+                     WHERE meeting_id=?1 AND state='completed' ORDER BY id DESC LIMIT 1",
+                    [mid], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                ).optional()?;
+                if let Some((id, previous_model, raw)) = previous {
+                    let previous: Value = serde_json::from_str(&raw)?;
+                    let same_context = ["analysis_mode", "analysis_policy", "source_revision"].iter()
+                        .all(|key| input[*key] == previous[*key])
+                        && (mode == Some("automatic") || ["project_tasks", "project_decisions"].iter()
+                            .all(|key| input[*key] == previous[*key]));
+                    if previous_model == model && same_context {
+                        return Ok((id, input, true));
+                    }
+                }
+            }
+            // The stored run key distinguishes retries. The input retains the actual transcript revision.
+            let sequence: i64 = tx.query_row("SELECT coalesce(max(id),0)+1 FROM meeting_analyses", [], |row| row.get(0))?;
+            let run_key = format!("{}:run:{sequence}", input["source_revision"].as_str().unwrap());
+            tx.execute(
+                "INSERT INTO meeting_analyses(meeting_id,model_run_id,source_revision,model,state,input_json) VALUES (?1,?2,?3,?4,'running',?5)",
+                params![mid,input["model_run_id"].as_i64(),run_key,model,input.to_string()],
+            )?;
+            let id = tx.last_insert_rowid();
+            tx.commit()?;
+            return Ok((id, input, false));
         }
         let existing:Option<(i64,String)>=tx.query_row("SELECT id,state FROM meeting_analyses WHERE meeting_id=?1 AND source_revision=?2 AND model=?3",params![mid,input["source_revision"].as_str(),model],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
         if let Some((id, state)) = existing {
@@ -204,7 +426,11 @@ impl Store {
     }
     fn groq_previous(&self, id: i64, mid: i64) -> Result<Value> {
         let previous: Option<(String, String)> = self.0.query_row(
-            "SELECT input_json,result_json FROM meeting_analyses WHERE meeting_id=?1 AND id<?2 AND model=(SELECT model FROM meeting_analyses WHERE id=?2) AND state='completed' ORDER BY id DESC LIMIT 1",
+            "SELECT a.input_json,a.result_json FROM meeting_analyses a JOIN meeting_analyses current ON current.id=?2
+             WHERE a.meeting_id=?1 AND a.id<?2 AND a.model=current.model AND a.state='completed'
+               AND json_extract(a.input_json,'$.analysis_policy')=json_extract(current.input_json,'$.analysis_policy')
+               AND json_extract(a.input_json,'$.analysis_mode')=json_extract(current.input_json,'$.analysis_mode')
+             ORDER BY a.id DESC LIMIT 1",
             params![mid, id],
             |r| Ok((r.get(0)?, r.get(1)?)),
         ).optional()?;
@@ -227,6 +453,7 @@ impl Store {
             bail!("Анализ уже завершён");
         }
         let input: Value = serde_json::from_str(&raw)?;
+        let origin = if input["analysis_mode"] == "local" { "local_analysis" } else { "groq" };
         if revision(&tx, mid)? != input["source_revision"].as_str().unwrap() {
             bail!("Транскрипт или участники изменились. Повторите анализ актуальной версии");
         }
@@ -242,8 +469,9 @@ impl Store {
             bail!("Некорректные открытые вопросы");
         }
         let mut proposals = Vec::new();
+        let mut findings = Vec::new();
         let mut seen = std::collections::HashSet::new();
-        for (field, kind) in [("decisions", "decision"), ("tasks", "create_task")] {
+        for (field, default_kind) in [("decisions", "decision"), ("tasks", "create_task")] {
             let items = result[field]
                 .as_array()
                 .context("Нет списка предложений Groq")?;
@@ -251,45 +479,26 @@ impl Store {
                 bail!("Слишком много предложений Groq");
             }
             for item in items {
+                let kind = if field == "tasks" {
+                    match item["kind"].as_str().unwrap_or(default_kind) {
+                        kind @ ("create_task" | "change_due" | "change_assignee" | "change_status" | "change_blocked") => kind,
+                        _ => bail!("Неизвестный тип предложения анализа"),
+                    }
+                } else {
+                    default_kind
+                };
                 let title = bounded(
                     item,
                     if kind == "decision" { "text" } else { "title" },
                     if kind == "decision" { 4000 } else { 500 },
                     true,
                 )?;
-                let ids = item["source_segment_ids"]
-                    .as_array()
-                    .context("Нет ссылок на реплики")?;
-                if ids.is_empty() || ids.len() > 30 {
-                    bail!("Некорректные ссылки на реплики");
-                }
-                let mut sources = Vec::new();
-                for sid in ids {
-                    let s = input["segments"]
-                        .as_array()
-                        .unwrap()
-                        .iter()
-                        .find(|s| s["id"] == *sid && sid.as_i64().is_some())
-                        .context("Groq сослался на несуществующую реплику")?;
-                    if !sources.contains(&s) {
-                        sources.push(s);
-                    }
-                }
-                sources.sort_by_key(|s| s["start_ms"].as_u64().unwrap_or(0));
-                let quote = sources
-                    .iter()
-                    .map(|s| s["text"].as_str().unwrap_or(""))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                let mut source = json!({"meeting_id":mid,"model_run_id":input["model_run_id"],"start_ms":sources[0]["start_ms"],"quote":quote,"segment_ids":ids,"analysis_id":id,"source_revision":input["source_revision"]});
-                if let Some(topic) = item["topic"].as_str() {
-                    let topic = topic.split_whitespace().collect::<Vec<_>>().join(" ");
-                    if !topic.is_empty() && topic.chars().count() <= 80 {
-                        source["topic"] = json!(topic);
-                    }
-                }
-                let mut p = json!({"kind":kind,"title":title,"description":"","project_id":input["project_id"],"assignee_id":null,"due_date":null,"origin":"groq","source":source});
-                if kind == "create_task" {
+                let mut source = analysis_source(&input, mid, id, item)?;
+                let quote = source["quote"].as_str().unwrap_or_default().to_owned();
+                let finding_id = format!("{id}:{}", findings.len() + 1);
+                source["finding_ids"] = json!([finding_id]);
+                let mut p = json!({"kind":kind,"title":title,"description":"","project_id":input["project_id"],"assignee_id":null,"due_date":null,"origin":origin,"source":source});
+                if field == "tasks" {
                     p["description"] = json!(bounded(item, "description", 10000, false)?);
                     if !item["needs_clarification"].is_null()
                         && !item["needs_clarification"].is_boolean()
@@ -345,39 +554,217 @@ impl Store {
                         if matches.len() == 1 {
                             p["assignee_id"] = matches[0]["id"].clone();
                         } else {
-                            p["description"] = json!(format!(
+                            let key = |value: &str| value.trim().to_lowercase().replace('ё', "е");
+                            let requested = key(name);
+                            let mut directory = tx.prepare("SELECT id,name FROM people WHERE is_demo=0")?;
+                            let entries = directory.query_map([], |row| Ok((row.get::<_,i64>(0)?, row.get::<_,String>(1)?)))?;
+                            let mut candidates = Vec::new();
+                            for person in entries {
+                                let (id, name) = person?;
+                                if key(&name) == requested { candidates.push(id); }
+                            }
+                            if candidates.len() == 1 {
+                                p["assignee_id"] = json!(candidates[0]);
+                            } else {
+                                p["description"] = json!(format!(
                                 "{}\nПредполагаемый ответственный: {}. Проверьте назначение.",
                                 p["description"].as_str().unwrap(),
                                 name
-                            ));
+                                ));
+                            }
                         }
                     }
                 }
-                if seen.insert(format!("{kind}:{}", title.to_lowercase())) {
-                    proposals.push(p);
+                if kind == "create_task" {
+                    let title_terms: std::collections::HashSet<_> = search_terms(&title).collect();
+                    let candidates: Vec<_> = input["project_tasks"].as_array().into_iter().flatten()
+                        .filter(|task| item["task_id"].as_i64().is_some() && task["id"] == item["task_id"]
+                            || task["title"].as_str().is_some_and(|name|
+                                same_action_title(name, &title)
+                                || search_terms(name).collect::<std::collections::HashSet<_>>()
+                                    .intersection(&title_terms).count() >= 2))
+                        .take(6).map(|task| &task["id"]).collect();
+                    if !candidates.is_empty() {
+                        p["candidate_task_ids"] = json!(candidates);
+                        p["needs_clarification"] = json!(true);
+                        if p["clarification"] == "" {
+                            p["clarification"] = json!("Проверьте, относится ли поручение к одной из задач проекта.");
+                        }
+                    }
+                }
+                if kind.starts_with("change_") {
+                    if let Some(task_id) = item["task_id"].as_i64() {
+                        if let Some(task) = input["project_tasks"].as_array().into_iter().flatten()
+                            .find(|task| task["id"] == task_id)
+                        {
+                            p["task_id"] = json!(task_id);
+                            p["title"] = task["title"].clone();
+                        }
+                    }
+                    if p["task_id"].is_null() && p["needs_clarification"] != true {
+                        let mut matches = input["project_tasks"].as_array().into_iter().flatten()
+                            .filter(|task| task["title"].as_str().is_some_and(|name| same_action_title(name, &title)));
+                        if let Some(task) = matches.next() {
+                            if matches.next().is_none() {
+                                p["task_id"] = task["id"].clone();
+                                p["title"] = task["title"].clone();
+                            }
+                        }
+                    }
+                    if p["task_id"].is_null() {
+                        let words: std::collections::HashSet<_> = search_terms(&title).chain(search_terms(&quote)).collect();
+                        let candidates: Vec<_> = input["project_tasks"].as_array().into_iter().flatten()
+                            .filter(|task| task["title"].as_str().is_some_and(|name|
+                                search_terms(name).any(|word| words.contains(&word))))
+                            .take(6).map(|task| &task["id"]).collect();
+                        p["candidate_task_ids"] = json!(candidates);
+                    }
+                }
+                match kind {
+                    "change_due" => p["proposed"] = json!({"due_date": p["due_date"], "due_time": p["due_time"]}),
+                    "change_assignee" => p["proposed"] = json!({"assignee_id": p["assignee_id"]}),
+                    "change_status" => {
+                        let stage = bounded(item, "stage_title", 500, true)?;
+                        p["proposed"] = json!({"stage_title": stage});
+                    }
+                    "change_blocked" => {
+                        let blocked = item["blocked"].as_bool().context("Укажите состояние блокировки")?;
+                        let reason = if blocked { bounded(item, "blocked_reason", 2000, true)? } else { String::new() };
+                        p["proposed"] = json!({"blocked":blocked,"blocked_reason":reason});
+                    }
+                    _ => {}
+                }
+                let finding_kind = match kind {
+                    "create_task" => "new_task", "decision" => "decision",
+                    "change_blocked" => "blocker", _ => "task_update",
+                };
+                findings.push(json!({"id":finding_id,"kind":finding_kind,"text":title,
+                    "status":"review","source":p["source"],"project_id":input["project_id"],"task_id":p["task_id"]}));
+                let mut changes = Vec::new();
+                if kind == "change_due" && item["assignee_name"].as_str().is_some_and(|name| !name.trim().is_empty()) {
+                    let mut assignment = p.clone();
+                    assignment["kind"] = json!("change_assignee");
+                    assignment["proposed"] = json!({"assignee_id": p["assignee_id"]});
+                    changes.push(assignment);
+                }
+                if kind == "change_assignee" && !p["due_date"].is_null() {
+                    let mut deadline = p.clone();
+                    deadline["kind"] = json!("change_due");
+                    deadline["proposed"] = json!({"due_date": p["due_date"], "due_time": p["due_time"]});
+                    changes.push(deadline);
+                }
+                changes.push(p);
+                for mut proposal in changes {
+                    match proposal["kind"].as_str() {
+                        Some("change_due") => proposal["assignee_id"] = Value::Null,
+                        Some("change_assignee") => {
+                            proposal["due_date"] = Value::Null;
+                            proposal["due_time"] = Value::Null;
+                        }
+                        _ => {}
+                    }
+                    let identity = json!([proposal["kind"], proposal["task_id"], proposal["title"],
+                                          proposal["assignee_id"], proposal["due_date"], proposal["due_time"],
+                                          proposal["proposed"], proposal["source"]["segment_ids"]]);
+                    if seen.insert(identity.to_string()) {
+                        proposals.push(proposal);
+                    }
                 }
             }
         }
-        for p in proposals {
+        if let Some(observations) = result.get("observations") {
+            let observations = observations.as_array().filter(|items| items.len() <= 96)
+                .context("Некорректный список наблюдений")?;
+            for item in observations {
+                let kind = item["kind"].as_str()
+                    .filter(|kind| ["status_update", "question", "information"].contains(kind))
+                    .context("Неизвестный тип наблюдения")?;
+                let text = bounded(item, "text", 4000, true)?;
+                let source = analysis_source(&input, mid, id, item)?;
+                let task_id = item["task_id"].as_i64().filter(|task_id| {
+                    input["project_tasks"].as_array().into_iter().flatten().any(|task| task["id"] == *task_id)
+                });
+                findings.push(json!({"id":format!("{id}:{}",findings.len()+1),"kind":kind,"text":text,
+                    "status":"recorded","source":source,"task_id":task_id,"project_id":input["project_id"]}));
+            }
+        }
+        tx.execute(
+            "UPDATE proposals
+             SET status='rejected',data_json=json_set(data_json,'$.superseded_by_analysis_id',?2)
+             WHERE is_demo=0 AND status='pending'
+               AND json_extract(data_json,'$.origin')=?3
+               AND json_extract(data_json,'$.source.meeting_id')=?1",
+            params![mid,id,origin],
+        )?;
+        for mut p in bundle_task_changes(proposals, &input) {
+            if p["task_id"].is_null() && p["needs_clarification"] != true
+                && matches!(p["kind"].as_str(), Some("change_due" | "change_assignee" | "change_status" | "change_blocked")) {
+                let mut confirmed = tx.prepare(
+                    "SELECT json_extract(data_json,'$.title'), json_extract(data_json,'$.confirmed_task_id')
+                     FROM proposals WHERE is_demo=0 AND status='accepted'
+                       AND json_extract(data_json,'$.kind')='create_task'
+                       AND json_extract(data_json,'$.source.meeting_id')=?1",
+                )?;
+                let mut rows = confirmed.query([mid])?;
+                let mut matched_tasks = std::collections::HashSet::new();
+                while let Some(row) = rows.next()? {
+                    let title: Option<String> = row.get(0)?;
+                    let task: Option<i64> = row.get(1)?;
+                    if let (Some(title), Some(task)) = (title, task) {
+                        if p["title"].as_str().is_some_and(|name| title.trim().to_lowercase() == name.trim().to_lowercase()) {
+                            matched_tasks.insert(task);
+                        }
+                    }
+                }
+                if matched_tasks.len() == 1 {
+                    p["task_id"] = json!(matched_tasks.into_iter().next());
+                }
+            }
+            let kind = p["kind"].as_str().unwrap_or_default();
+            let fields = change_fields(kind);
+            if !fields.is_empty() && !p["task_id"].is_null() {
+                if let Some(task) = input["project_tasks"].as_array().into_iter().flatten()
+                    .find(|task| task["id"] == p["task_id"])
+                {
+                    let already_applied = match kind {
+                        // The model gives a title; approval is where it becomes a specific stage ID.
+                        "change_status" => false,
+                        "change_assignee" if p["proposed"]["assignee_id"].is_null() => false,
+                        "change_blocked" if p["proposed"]["blocked"] == false => task["blocked"] == false,
+                        _ => fields.iter().all(|key| p["proposed"][*key] == task[*key]),
+                    };
+                    if already_applied && p["needs_clarification"] != true {
+                        continue;
+                    }
+                    let mut baseline = serde_json::Map::new();
+                    baseline.insert("revision".to_owned(), task["revision"].clone());
+                    baseline.extend(fields.iter().map(|key| (key.to_string(), task[*key].clone())));
+                    p["base_task"] = json!(baseline);
+                }
+            }
             let mut candidates = tx.prepare(
-                "SELECT data_json FROM proposals WHERE is_demo=0 AND json_extract(data_json,'$.origin')='groq' AND json_extract(data_json,'$.source.meeting_id')=?1 AND json_extract(data_json,'$.kind')=?2",
+                "SELECT data_json FROM proposals WHERE is_demo=0 AND status IN ('accepted','pending') AND json_extract(data_json,'$.origin') IN ('groq','local_analysis') AND json_extract(data_json,'$.source.meeting_id')=?1 AND json_extract(data_json,'$.kind')=?2",
             )?;
             let mut rows = candidates.query(params![mid, p["kind"].as_str()])?;
             let mut duplicate = false;
             while let Some(row) = rows.next()? {
                 let old: Value = serde_json::from_str(&row.get::<_, String>(0)?)?;
-                if old["title"]
-                    .as_str()
-                    .zip(p["title"].as_str())
-                    .is_some_and(|(a, b)| {
-                        a.trim().eq_ignore_ascii_case(b.trim())
-                            || a.to_lowercase() == b.to_lowercase()
-                            || same_action_title(a, b)
-                    })
-                    && old["source"]["start_ms"]
+                if !old["task_id"].is_null() && !p["task_id"].is_null() && old["task_id"] != p["task_id"] {
+                    continue;
+                }
+                let same_commitment = ["project_id", "assignee_id", "due_date", "due_time", "proposed"]
+                    .iter()
+                    .all(|field| old[*field] == p[*field]);
+                let same_evidence = old["source"]["quote"] == p["source"]["quote"];
+                let nearby = old["source"]["start_ms"]
                         .as_u64()
                         .zip(p["source"]["start_ms"].as_u64())
-                        .is_some_and(|(a, b)| a.abs_diff(b) <= 10_000)
+                        .is_some_and(|(a, b)| a.abs_diff(b) <= 10_000);
+                if ((same_evidence && (p["kind"] != "change_task" || same_commitment)) || (same_commitment && nearby))
+                    && old["title"]
+                    .as_str()
+                    .zip(p["title"].as_str())
+                    .is_some_and(|(a, b)| same_action_title(a, b))
                 {
                     duplicate = true;
                     break;
@@ -391,7 +778,9 @@ impl Store {
                 [p.to_string()],
             )?;
         }
-        tx.execute("UPDATE meeting_analyses SET state='completed',result_json=?2,error=NULL,finished_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?1",params![id,result.to_string()])?;
+        let mut saved = result.clone();
+        saved["findings"] = json!(findings);
+        tx.execute("UPDATE meeting_analyses SET state='completed',result_json=?2,error=NULL,finished_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?1",params![id,saved.to_string()])?;
         tx.commit()?;
         Ok(())
     }
@@ -452,6 +841,7 @@ fn helper(payload: Value) -> std::result::Result<Value, String> {
     Ok(value["value"].clone())
 }
 pub struct GroqWorker {
+    database: std::path::PathBuf,
     key: Option<String>,
     automatic: bool,
     live_model: Option<String>,
@@ -495,6 +885,7 @@ impl GroqWorker {
         let base_account = format!("{:x}", Sha256::digest(path.to_string_lossy().as_bytes()));
         let account = key_account(&base_account, &model);
         let mut worker = Self {
+            database: path.to_owned(),
             key: None,
             automatic: settings["automatic"] == true,
             live_model: settings["live_model"].as_str().filter(|id| valid_model(id)).map(str::to_owned),
@@ -527,7 +918,16 @@ impl GroqWorker {
         );
         Ok(worker)
     }
-    fn launch(&mut self, operation: &str, payload: Value) {
+    fn launch(&mut self, operation: &str, mut payload: Value) {
+        if matches!(operation, "analyze" | "live_preview" | "assistant") {
+            payload["database"] = json!(self.database);
+            payload["stage"] = json!(match operation {
+                "analyze" if payload["automatic"] == true => "automatic",
+                "analyze" => "manual",
+                "live_preview" => "live",
+                _ => "assistant",
+            });
+        }
         let (tx, rx) = mpsc::channel();
         self.rx = Some(rx);
         self.operation = operation.into();
@@ -678,6 +1078,21 @@ impl GroqWorker {
         Ok(self.status())
     }
     pub fn start(&mut self, store: &Store, data: &Value) -> Result<Value> {
+        if data["local"] == true {
+            if self.job.is_some() { bail!("Дождитесь завершения анализа совещания"); }
+            let mid = data["meeting_id"].as_i64().context("Выберите встречу")?;
+            let (id, input, cached) =
+                store.prepare_analysis(mid, local_analysis::MODEL, false, true, Some("local"), false)?;
+            if !cached {
+                if let Err(error) = store.groq_complete(id, &local_analysis::analyze(&input)) {
+                    store.0.execute("UPDATE meeting_analyses SET state='failed',error=?2,
+                        finished_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?1",
+                        params![id,error.to_string()])?;
+                    return Err(error);
+                }
+            }
+            return Ok(json!({"id":id,"cached":cached,"local":true}));
+        }
         self.start_analysis(store, data, false)
     }
     fn start_analysis(&mut self, store: &Store, data: &Value, incremental: bool) -> Result<Value> {
@@ -693,11 +1108,13 @@ impl GroqWorker {
         };
         let load_account = if key.is_none() { Some(key_account(&self.base_account, model)) } else { None };
         let mid = data["meeting_id"].as_i64().context("Выберите встречу")?;
-        let (id, input, cached) = store.groq_prepare(mid, model, data["consent"] == true)?;
+        let force = !incremental && data["force"] == true;
+        let mode = if incremental { "automatic" } else { "manual" };
+        let (id, input, cached) = store.prepare_analysis(mid, model, data["consent"] == true, true, Some(mode), force)?;
         if cached {
             return Ok(json!({"id":id,"cached":true}));
         }
-        let previous = if incremental {
+        let previous = if !force {
             store.groq_previous(id, mid).unwrap_or(Value::Null)
         } else {
             Value::Null
@@ -706,7 +1123,7 @@ impl GroqWorker {
         self.job = Some(id);
         self.launch(
             "analyze",
-            json!({"mode":"analyze","key":key,"load_account":load_account,"model":model,"input":input,"automatic":incremental,"previous":previous}),
+            json!({"mode":"analyze","key":key,"load_account":load_account,"model":model,"input":input,"automatic":incremental,"previous":previous,"force":force}),
         );
         Ok(json!({"id":id,"cached":false}))
     }
@@ -749,9 +1166,10 @@ impl GroqWorker {
         };
         let mut statement = store.0.prepare(
             "SELECT result_json FROM live_chunks WHERE session_id=?1 AND state='completed'
-             AND json_array_length(result_json)>0 ORDER BY sequence DESC LIMIT 12",
+             AND json_array_length(result_json)>0 ORDER BY sequence DESC LIMIT ?2",
         )?;
-        let rows = statement.query_map([session], |row| row.get::<_,String>(0))?
+        let window = (count - self.preview_cursor + 2).min(12);
+        let rows = statement.query_map(params![session,window], |row| row.get::<_,String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         let mut segments = Vec::new();
         for row in rows.iter().rev() {

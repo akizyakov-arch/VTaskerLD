@@ -25,6 +25,8 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/020_person_directory.sql"),
     include_str!("../migrations/021_speech_blocks.sql"),
     include_str!("../migrations/022_processing_timeline.sql"),
+    include_str!("../migrations/023_ai_usage.sql"),
+    include_str!("../migrations/024_decision_context.sql"),
 ];
 
 pub(crate) fn apply(tx: &Transaction<'_>, version: i64) -> Result<()> {

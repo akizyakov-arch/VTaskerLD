@@ -421,6 +421,10 @@ pub fn serve(path: &Path) -> Result<()> {
             (&Method::Post, "/api/groq/settings") => {
                 groq.settings(&store, &body(&mut request, 4096)?)
             }
+            (&Method::Get, "/api/groq/budget") => store.ai_budget(None),
+            (&Method::Post, "/api/groq/budget") => {
+                store.ai_budget(Some(&body(&mut request, 4096)?))
+            }
             (&Method::Post, "/api/groq/analyze") => {
                 let data = body(&mut request, 4096)?;
                 if capture.status()["active"]["meeting_id"] == data["meeting_id"] {

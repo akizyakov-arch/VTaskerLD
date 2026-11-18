@@ -39,6 +39,70 @@ extension View {
     func panelCard(inset: CGFloat = 16) -> some View { modifier(PanelCard(inset: inset)) }
 }
 
+struct ProjectDateField: View {
+    let title: String
+    @Binding var value: String
+    @State private var showingCalendar = false
+    @State private var selectedDay = Date()
+
+    private static let utc = TimeZone(secondsFromGMT: 0)!
+    private static let storage = Date.ISO8601FormatStyle(timeZone: utc)
+        .year().month().day().dateSeparator(.dash)
+
+    static func display(_ value: String) -> String {
+        guard let day = try? storage.parse(value) else { return value }
+        var format = Date.FormatStyle(date: .numeric, time: .omitted)
+        format.locale = .autoupdatingCurrent
+        format.calendar = .autoupdatingCurrent
+        format.timeZone = utc
+        return format.format(day)
+    }
+
+    var body: some View {
+        LabeledContent(title) {
+            HStack(spacing: 6) {
+                Button {
+                    let localFormat = Date.ISO8601FormatStyle(timeZone: .autoupdatingCurrent)
+                        .year().month().day().dateSeparator(.dash)
+                    selectedDay = (try? Self.storage.parse(value))
+                        ?? (try? Self.storage.parse(localFormat.format(.now))) ?? .now
+                    showingCalendar = true
+                } label: {
+                    Label(value.isEmpty ? "Выбрать дату" : Self.display(value), systemImage: "calendar")
+                }
+                .buttonStyle(.bordered)
+                .accessibilityLabel(title + ", " + (value.isEmpty ? "выбрать дату" : Self.display(value)))
+                .popover(isPresented: $showingCalendar) {
+                    VStack(alignment: .trailing, spacing: 12) {
+                        DatePicker(title, selection: $selectedDay, displayedComponents: .date)
+                            .datePickerStyle(.graphical)
+                            .labelsHidden()
+                            .environment(\.timeZone, Self.utc)
+                            .environment(\.locale, .autoupdatingCurrent)
+                            .frame(minWidth: 260)
+                        Button("Выбрать") {
+                            value = Self.storage.format(selectedDay)
+                            showingCalendar = false
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .keyboardShortcut(.defaultAction)
+                    }
+                    .padding(12)
+                }
+                if !value.isEmpty {
+                    Button { value = "" } label: {
+                        Image(systemName: "xmark.circle")
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.secondary)
+                    .help("Очистить дату")
+                    .accessibilityLabel("Очистить дату: " + title)
+                }
+            }
+        }
+    }
+}
+
 struct PanelSearchField: View {
     let placeholder: String
     @Binding var query: String

@@ -345,6 +345,7 @@ struct MeetingTranscript: View {
                 Button("Изменить срок") { propose("change_due", from: segment) }
                 Button("Сменить исполнителя") { propose("change_assignee", from: segment) }
                 Button("Изменить статус") { propose("change_status", from: segment) }
+                Button("Изменить блокировку") { propose("change_blocked", from: segment) }
                 Button("Решение") { propose("decision", from: segment) }
             }
             .disabled(model.saving)

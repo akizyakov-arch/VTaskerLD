@@ -79,6 +79,7 @@ struct WorkspaceView: View {
     @State private var approvalFilters = ApprovalsView.Filters()
     @State private var recoveringRecording = false
     @State private var editingProject: Project?
+    @State private var projectArchiveRequest: Project?
     @State private var creation: Creation?
     @State private var savedView: SavedTaskView?
     @State private var board = false
@@ -296,7 +297,7 @@ struct WorkspaceView: View {
         projectFilter = nil
         assigneeFilter = nil
         unassignedOnly = false
-        taskStatus = .all
+        taskStatus = visibleTasks.first { $0.id == id }?.stageKind == "cancelled" ? .cancelled : .all
     }
 
     private var taskFilters: some View {
@@ -609,7 +610,8 @@ struct WorkspaceView: View {
                         .disabled(meetings.isEmpty)
                     }
                     .padding(.horizontal, 24).padding(.top, 12)
-                    ProjectOverview(project: project, workspace: workspace, openMeeting: openMeeting)
+                    ProjectOverview(model: model, project: project, workspace: workspace,
+                                    openMeeting: openMeeting, openTask: openTask)
                         .id(project.id)
                         .padding(.horizontal, 24)
                         .padding(.vertical, 8)
@@ -624,7 +626,9 @@ struct WorkspaceView: View {
                     ApprovalsView(model: model, workspace: workspace, editing: $reviewingProposal, filters: $approvalFilters)
                 } else if selection == .projectList, let workspace = model.workspace {
                     ProjectDirectory(workspace: workspace, archived: $archivedProjects, filters: $projectDirectoryFilters,
-                                     openProject: { navigate(.project($0)) }, openTask: openTask)
+                                     openProject: { navigate(.project($0)) }, openTask: openTask,
+                                     editProject: { editingProject = $0 }, changeArchive: { projectArchiveRequest = $0 },
+                                     actionsDisabled: model.saving || model.loading)
                 } else if selection == .settings, let workspace = model.workspace {
                     ScrollView {
                         EngineSettingsForm(model: model)
@@ -677,7 +681,9 @@ struct WorkspaceView: View {
     }
 
     private func meetingTasks(_ meeting: Meeting) -> some View {
-        let tasks = visibleTasks.filter { $0.sources?.contains { $0.meetingId == meeting.id } == true }
+        let tasks = visibleTasks.filter {
+            $0.stageKind != "cancelled" && $0.sources?.contains { $0.meetingId == meeting.id } == true
+        }
         let proposals = model.workspace?.proposals.filter {
             $0.kind != "decision" && $0.status == "pending" && $0.source?.meetingId == meeting.id
         } ?? []
@@ -855,7 +861,7 @@ struct WorkspaceView: View {
             .controlSize(.large)
             switch meetingTab {
             case .protocolText:
-                MeetingAnalysisView(model: model, meeting: meeting).id(meeting.id)
+                MeetingAnalysisView(model: model, meeting: meeting, openMeeting: openMeeting, openTask: openTask).id(meeting.id)
                 MeetingOpenQuestions(meeting: meeting).id(meeting.id)
                 meetingTasks(meeting).id(meeting.id)
                 MeetingDecisions(
@@ -1088,6 +1094,15 @@ struct WorkspaceView: View {
                     .disabled(model.saving || model.capture?.active?.meetingId == meeting.id)
             } else if let project {
                 Button("Карточка проекта") { editingProject = project }.disabled(model.saving)
+                Button {
+                    projectArchiveRequest = project
+                } label: {
+                    let archived = project.archived == true
+                    Image(systemName: archived ? "arrow.uturn.backward" : "archivebox")
+                        .accessibilityLabel(archived ? "Восстановить проект" : "Перенести проект в архив")
+                        .help(archived ? "Восстановить проект" : "Перенести проект в архив")
+                }
+                .disabled(model.saving || model.loading)
             }
             Menu {
                 ForEach(Creation.allCases.filter { $0 != .decision }) { kind in
@@ -1306,6 +1321,20 @@ struct WorkspaceView: View {
             ProjectEditor(model: model, project: project)
                 .sheetCloseButton(disabled: model.saving)
         }
+        .alert(projectArchiveRequest?.archived == true ? "Восстановить проект?" : "Перенести проект в архив?",
+               isPresented: Binding(get: { projectArchiveRequest != nil }, set: { if !$0 { projectArchiveRequest = nil } }),
+               presenting: projectArchiveRequest) { project in
+            Button("Отмена", role: .cancel) {}
+            Button(project.archived == true ? "Восстановить" : "В архив") {
+                Task {
+                    if await model.setProjectArchived(project.archived != true, project: project) {
+                        if self.project?.id == project.id { closeInspector() }
+                    }
+                }
+            }
+        } message: { project in
+            Text(project.title)
+        }
         .sheet(item: $creation) { kind in
             VStack(alignment: .leading, spacing: 16) {
                 Text(kind.rawValue).font(.headline)
@@ -1319,8 +1348,8 @@ struct WorkspaceView: View {
                         Text(unresolvedProjectOwner == nil ? "Не назначен" : "Выберите владельца").tag(nil as Int?)
                         ForEach(model.workspace?.people ?? []) { Text($0.name).tag(Optional($0.id)) }
                     }
-                    TextField("Начало (ГГГГ-ММ-ДД)", text: $newProjectStart)
-                    TextField("Срок завершения (ГГГГ-ММ-ДД)", text: $newProjectEnd)
+                    ProjectDateField(title: "Начало", value: $newProjectStart)
+                    ProjectDateField(title: "Срок завершения", value: $newProjectEnd)
                 }
                 if [.task, .meeting, .decision].contains(kind) {
                     if let creationNewProjectName {

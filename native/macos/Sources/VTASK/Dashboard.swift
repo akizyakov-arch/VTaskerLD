@@ -7,6 +7,7 @@ enum TaskFilter: String, CaseIterable, Identifiable {
     case overdue = "Просрочены"
     case undated = "Без срока"
     case done = "Выполнены"
+    case cancelled = "Отменённые"
     case dueSoon = "Ближайшие 7 дней"
     case later = "Позже"
 
@@ -14,12 +15,13 @@ enum TaskFilter: String, CaseIterable, Identifiable {
 
     func matches(_ task: TaskItem, today: String) -> Bool {
         switch self {
-        case .all: return true
+        case .all: return task.stageKind != "cancelled"
         case .active: return task.stageKind == "active"
         case .today: return task.stageKind == "active" && task.dueDate == today
         case .overdue: return task.overdue
         case .undated: return task.stageKind == "active" && task.dueDate == nil
         case .done: return task.stageKind == "done"
+        case .cancelled: return task.stageKind == "cancelled"
         case .dueSoon, .later:
             guard task.stageKind == "active", !task.overdue, let due = task.dueDate else { return false }
             let format = Date.ISO8601FormatStyle().year().month().day().dateSeparator(.dash)

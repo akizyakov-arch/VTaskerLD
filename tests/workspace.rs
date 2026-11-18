@@ -395,7 +395,7 @@ fn participant_profile_survives_upgrade_and_reopen() {
     drop(store);
 
     let old = rusqlite::Connection::open(&path).unwrap();
-    old.execute_batch("DROP TABLE person_profiles; DROP TABLE speech_blocks; DROP TABLE speaker_blocks; ALTER TABLE live_chunks DROP COLUMN last_sequence; ALTER TABLE live_sessions DROP COLUMN speaker_turns_json; ALTER TABLE live_sessions DROP COLUMN speaker_profiles_json; ALTER TABLE processing_jobs DROP COLUMN stage; ALTER TABLE processing_jobs DROP COLUMN started_at; ALTER TABLE processing_jobs DROP COLUMN finished_at; PRAGMA user_version=17;")
+    old.execute_batch("DROP TABLE decision_tasks; DROP TABLE decision_context; DROP TABLE ai_extraction_cache; DROP TABLE ai_usage; DROP TABLE person_profiles; DROP TABLE speech_blocks; DROP TABLE speaker_blocks; ALTER TABLE live_chunks DROP COLUMN last_sequence; ALTER TABLE live_sessions DROP COLUMN speaker_turns_json; ALTER TABLE live_sessions DROP COLUMN speaker_profiles_json; ALTER TABLE processing_jobs DROP COLUMN stage; ALTER TABLE processing_jobs DROP COLUMN started_at; ALTER TABLE processing_jobs DROP COLUMN finished_at; PRAGMA user_version=17;")
         .unwrap();
     drop(old);
 

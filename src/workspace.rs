@@ -505,6 +505,37 @@ impl TaskCounts {
     }
 }
 impl Store {
+    pub(crate) fn analysis_project_context(&self, project_id: i64) -> Result<(Vec<Value>, Vec<Value>)> {
+        let project = entity(&self.0, "projects", project_id)?;
+        same_scope(&project, false)?;
+        let mut statement = self.0.prepare(
+            "SELECT id,data_json,revision,is_demo,created_at,updated_at FROM tasks
+             WHERE is_demo=0 AND json_extract(data_json,'$.project_id')=?1",
+        )?;
+        let tasks = statement.query_map([project_id], decode_entity)?;
+        let stages: HashMap<_, _> = project["stages"].as_array().into_iter().flatten()
+            .filter_map(|stage| stage["id"].as_str().map(|id| (id, stage))).collect();
+        let mut annotated = Vec::new();
+        for task in tasks {
+            let mut task = task?;
+            if let Some(stage) = task["stage_id"].as_str().and_then(|id| stages.get(id)) {
+                task["stage_title"] = stage["title"].clone();
+                task["stage_kind"] = stage["kind"].clone();
+            }
+            annotated.push(task);
+        }
+        let mut statement = self.0.prepare(
+            "SELECT dt.task_id,d.text FROM decisions d JOIN decision_tasks dt ON dt.decision_id=d.id
+             LEFT JOIN decision_context dc ON dc.decision_id=d.id
+             WHERE d.project_id=?1 AND d.is_demo=0 AND coalesce(dc.status,'approved')='approved'
+             ORDER BY d.id DESC, dt.task_id",
+        )?;
+        let decisions = statement.query_map([project_id], |row| Ok(json!({
+            "task_id":row.get::<_,i64>(0)?, "text":row.get::<_,String>(1)?
+        })))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok((annotated, decisions))
+    }
+
     pub fn workspace(&self, demo: bool, at: Option<DateTime<Utc>>) -> Result<Value> {
         let prefs = settings(&self.0)?;
         let now = at.unwrap_or_else(Utc::now);
@@ -604,8 +635,26 @@ impl Store {
             p["created_at"] = json!(created);
             proposals.push(p);
         }
-        let mut stmt=self.0.prepare("SELECT id,project_id,meeting_id,text,source_json FROM decisions WHERE is_demo=?1 ORDER BY id DESC")?;
-        let decisions=stmt.query_map([demo],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,Option<i64>>(1)?,r.get::<_,Option<i64>>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?)))?.collect::<rusqlite::Result<Vec<_>>>()?.into_iter().map(|(i,p,m,t,s)|Ok(json!({"id":i,"project_id":p,"meeting_id":m,"text":t,"source":serde_json::from_str::<Value>(&s)?}))).collect::<Result<Vec<Value>>>()?;
+        let mut stmt = self.0.prepare(
+            "SELECT d.id,d.project_id,d.meeting_id,d.text,d.source_json,
+                    coalesce(dc.status,'approved'),dc.approved_at,dc.reviewer_id,dc.reason,dc.supersedes_id,
+                    (SELECT json_group_array(dt.task_id) FROM decision_tasks dt WHERE dt.decision_id=d.id)
+             FROM decisions d LEFT JOIN decision_context dc ON dc.decision_id=d.id
+             WHERE d.is_demo=?1 ORDER BY d.id DESC",
+        )?;
+        let mut decision_rows = stmt.query([demo])?;
+        let mut decisions = Vec::new();
+        while let Some(row) = decision_rows.next()? {
+            decisions.push(json!({
+                "id":row.get::<_,i64>(0)?,"project_id":row.get::<_,Option<i64>>(1)?,
+                "meeting_id":row.get::<_,Option<i64>>(2)?,"text":row.get::<_,String>(3)?,
+                "source":serde_json::from_str::<Value>(&row.get::<_,String>(4)?)?,
+                "status":row.get::<_,String>(5)?,"approved_at":row.get::<_,Option<String>>(6)?,
+                "reviewer_id":row.get::<_,Option<i64>>(7)?,"reason":row.get::<_,Option<String>>(8)?,
+                "supersedes_id":row.get::<_,Option<i64>>(9)?,
+                "task_ids":serde_json::from_str::<Value>(&row.get::<_,String>(10)?)?
+            }));
+        }
         Ok(
             json!({"schema_version":1,"mode":if demo {"demo"}else{"real"},"now":now.to_rfc3339(),"today":now.with_timezone(&tz).date_naive().to_string(),"settings":prefs,"default_stages":default_stages,"people":people,"projects":projects,"tasks":tasks,"meetings":meetings,"proposals":proposals,"decisions":decisions}),
         )
@@ -719,11 +768,12 @@ impl Store {
                 if decision.is_empty() {
                     bail!("Введите текст решения");
                 }
-                tx.execute(
-                    "INSERT INTO decisions(project_id,text,source_json,is_demo) VALUES (?1,?2,'null',?3)",
-                    params![project_id, decision, demo],
-                )?;
-                json!({"id":tx.last_insert_rowid()})
+                json!({"id":save_decision(&tx, Some(project_id), decision, &Value::Null, body, demo)?})
+            }
+            "cancel_decision" => {
+                let decision_id = id(body, "id").context("Выберите решение")?;
+                close_decision(&tx, decision_id, None, demo, "cancelled")?;
+                json!({"cancelled":true})
             }
             "save_meeting" => {
                 let title = text(&body["data"], "title").trim();
@@ -906,6 +956,7 @@ impl Store {
                     "change_due",
                     "change_assignee",
                     "change_status",
+                    "change_blocked",
                     "decision",
                 ]
                 .contains(&text(p, "kind"))
@@ -920,7 +971,81 @@ impl Store {
                 )?;
                 json!({"id":tx.last_insert_rowid()})
             }
-            "review" => review(&tx, body, demo)?,
+            "save_review_draft" => {
+                let proposal_id = id(body, "id").context("Предложение не выбрано")?;
+                let draft = body["draft"].as_object().context("Нет черновика")?;
+                if !body["draft"]["data"].is_object() || body["draft"].to_string().len() > 64 * 1024
+                    || id(&body["draft"], "id") != Some(proposal_id) || draft.contains_key("reject")
+                {
+                    bail!("Некорректный черновик предложения");
+                }
+                let changed = tx.execute(
+                    "UPDATE proposals SET data_json=json_set(data_json,'$.review_draft',json(?2)) WHERE id=?1 AND is_demo=?3 AND status='pending'",
+                    params![proposal_id, body["draft"].to_string(), demo],
+                )?;
+                if changed != 1 { bail!("Предложение уже рассмотрено или недоступно"); }
+                json!({"saved":true})
+            }
+            "review" => review(&tx, body, demo, None)?,
+            "review_batch" => {
+                let items = body["items"].as_array().context("Выберите предложения")?;
+                if items.is_empty() || items.len() > 100 {
+                    bail!("Выберите от одного до ста предложений");
+                }
+                let mut ordered: Vec<_> = items.iter().collect();
+                let mut decision_id = None;
+                let associate = body["associate_decision"] == true;
+                if associate {
+                    let mut decisions = Vec::new();
+                    for (index, item) in items.iter().enumerate() {
+                        let kind: String = tx.query_row(
+                            "SELECT json_extract(data_json,'$.kind') FROM proposals WHERE id=?1 AND is_demo=?2",
+                            params![id(item, "id"),demo], |row| row.get(0),
+                        ).context("Предложение для пакета не найдено")?;
+                        if kind == "decision" { decisions.push(index); }
+                        if item["reject"] == true { bail!("Уберите отклонённое предложение из пакета"); }
+                    }
+                    if decisions.len() != 1 || items.len() < 2 {
+                        bail!("Выберите одно решение и хотя бы одно связанное изменение");
+                    }
+                    let decision = ordered.remove(decisions[0]);
+                    ordered.insert(0, decision);
+                }
+                let mut results = Vec::with_capacity(items.len());
+                let mut revisions = std::collections::HashMap::<i64, (i64, i64)>::new();
+                for (index, item) in ordered.into_iter().enumerate() {
+                    let mut request = item.clone();
+                    let task = id(item, "existing_task_id");
+                    let expected = id(item, "task_revision");
+                    if let (Some(task), Some(expected)) = (task, expected) {
+                        if let Some(&(initial, current)) = revisions.get(&task) {
+                            if expected == initial {
+                                request["task_revision"] = json!(current);
+                            } else {
+                                bail!("У предложений для одной задачи разные версии. Проверьте пакет заново");
+                            }
+                        } else if entity(&tx, "tasks", task)?["revision"] != json!(expected) {
+                            bail!("Задача изменилась после открытия предложения. Проверьте новые значения");
+                        }
+                    }
+                    let result = review(&tx, &request, demo, decision_id)
+                        .map_err(|error| anyhow::anyhow!("Предложение №{}: {error}", item["id"]))?;
+                    if associate && index == 0 {
+                        decision_id = Some(id(&result, "decision_id").context("Решение не сохранено")?);
+                    }
+                    if let (Some(task), Some(expected), Some(current)) =
+                        (task, expected, id(&result["task"], "revision"))
+                    {
+                        if id(&result["task"], "id") == Some(task) {
+                            revisions.entry(task)
+                                .and_modify(|entry| entry.1 = current)
+                                .or_insert((expected, current));
+                        }
+                    }
+                    results.push(result);
+                }
+                json!({"applied":results})
+            }
             _ => bail!("Неизвестная команда рабочего пространства"),
         };
         tx.commit()?;
@@ -930,7 +1055,78 @@ impl Store {
         Ok(settings(&self.0)?["auto_process"] == true)
     }
 }
-fn review(c: &Connection, body: &Value, demo: bool) -> Result<Value> {
+pub(crate) fn change_fields(kind: &str) -> &'static [&'static str] {
+    match kind {
+        "change_task" => &["due_date", "due_time", "assignee_id"],
+        "change_due" => &["due_date", "due_time"],
+        "change_assignee" => &["assignee_id"],
+        "change_status" => &["stage_id"],
+        "change_blocked" => &["blocked", "blocked_reason"],
+        _ => &[],
+    }
+}
+
+fn close_decision(c: &Connection, decision: i64, project: Option<i64>, demo: bool, status: &str) -> Result<()> {
+    let (scope, existing_project): (bool, Option<i64>) = c.query_row(
+        "SELECT is_demo,project_id FROM decisions WHERE id=?1", [decision],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    ).context("Решение не найдено")?;
+    if scope != demo || (project.is_some() && project != existing_project) {
+        bail!("Выберите решение из того же проекта");
+    }
+    let changed = c.execute(
+        "INSERT INTO decision_context(decision_id,status,approved_at) VALUES (?1,?2,NULL)
+         ON CONFLICT(decision_id) DO UPDATE SET status=excluded.status WHERE decision_context.status='approved'",
+        params![decision,status],
+    )?;
+    if changed == 0 {
+        bail!("Решение уже отменено или заменено");
+    }
+    Ok(())
+}
+
+fn link_decision_task(c: &Connection, decision: i64, task: i64, project: Option<i64>, demo: bool) -> Result<()> {
+    let current = entity(c, "tasks", task)?;
+    same_scope(&current, demo)?;
+    if id(&current, "project_id") != project {
+        bail!("Свяжите решение с задачей из того же проекта");
+    }
+    c.execute("INSERT OR IGNORE INTO decision_tasks(decision_id,task_id) VALUES (?1,?2)", params![decision,task])?;
+    Ok(())
+}
+
+fn save_decision(c: &Connection, project: Option<i64>, decision: &str, source: &Value,
+                 details: &Value, demo: bool) -> Result<i64> {
+    let reason = text(details, "reason").trim();
+    if decision.len() > 24_000 || reason.len() > 12_000 {
+        bail!("Текст решения или обоснования слишком длинный");
+    }
+    let supersedes = id(details, "supersedes_id");
+    if let Some(prior) = supersedes {
+        let project = project.context("Чтобы заменить решение, выберите проект")?;
+        close_decision(c, prior, Some(project), demo, "superseded")?;
+    }
+    c.execute(
+        "INSERT INTO decisions(project_id,meeting_id,text,source_json,is_demo) VALUES (?1,?2,?3,?4,?5)",
+        params![project,id(source,"meeting_id"),decision,source.to_string(),demo],
+    )?;
+    let decision_id = c.last_insert_rowid();
+    let me = id(&settings(c)?, if demo { "demo_me_id" } else { "me_id" });
+    c.execute("INSERT INTO decision_context(decision_id,reviewer_id,reason,supersedes_id) VALUES (?1,?2,?3,?4)",
+        params![decision_id,me,(!reason.is_empty()).then_some(reason),supersedes])?;
+    if let Some(task_id) = id(source, "task_id") {
+        link_decision_task(c, decision_id, task_id, project, demo)?;
+    }
+    if let Some(task_ids) = details.get("task_ids") {
+        let task_ids = task_ids.as_array().filter(|items| items.len() <= 100).context("Некорректный список задач решения")?;
+        for task in task_ids {
+            link_decision_task(c, decision_id, task.as_i64().context("Некорректный идентификатор задачи")?, project, demo)?;
+        }
+    }
+    Ok(decision_id)
+}
+
+fn review(c: &Connection, body: &Value, demo: bool, linked_decision: Option<i64>) -> Result<Value> {
     let pid = id(body, "id").context("Предложение не выбрано")?;
     let (raw, status, scope): (String, String, bool) = c.query_row(
         "SELECT data_json,status,is_demo FROM proposals WHERE id=?1",
@@ -945,11 +1141,24 @@ fn review(c: &Connection, body: &Value, demo: bool) -> Result<Value> {
         return Ok(json!({"rejected":true}));
     }
     let proposal: Value = serde_json::from_str(&raw)?;
-    let source = &proposal["source"];
+    let mut evidence = proposal["source"].clone();
+    let linked_project = if let Some(decision) = linked_decision {
+        let (project, meeting): (Option<i64>, Option<i64>) = c.query_row(
+            "SELECT project_id,meeting_id FROM decisions WHERE id=?1 AND is_demo=?2",
+            params![decision,demo], |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if meeting != id(&evidence, "meeting_id") {
+            bail!("Решение и предложения должны относиться к одной встрече");
+        }
+        evidence["decision_id"] = json!(decision);
+        project
+    } else { None };
+    let source = &evidence;
     // Proposals retain the quoted evidence from the analysis that created them.
     validate_source(c, source, demo)?;
     let approved = &body["data"];
     let mut result = Value::Null;
+    let mut applied_decision_id = linked_decision;
     match text(&proposal, "kind") {
         "decision" => {
             let decision = text(approved, "title").trim();
@@ -960,7 +1169,7 @@ fn review(c: &Connection, body: &Value, demo: bool) -> Result<Value> {
             if let Some(p) = project {
                 same_scope(&entity(c, "projects", p)?, demo)?;
             }
-            c.execute("INSERT INTO decisions(project_id,meeting_id,text,source_json,is_demo) VALUES (?1,?2,?3,?4,?5)",params![project,id(source,"meeting_id"),decision,source.to_string(),demo])?;
+            applied_decision_id = Some(save_decision(c, project, decision, source, approved, demo)?);
         }
         "create_task" => {
             if let Some(existing) = id(body, "existing_task_id") {
@@ -972,22 +1181,81 @@ fn review(c: &Connection, body: &Value, demo: bool) -> Result<Value> {
                     sources.push(source.clone());
                 }
                 data["sources"] = json!(sources);
-                if body["apply_due"] == true {
+                if body["apply_due"] == true || body["apply_assignee"] == true {
                     if body["task_revision"] != old["revision"] {
                         bail!("Задача изменилась. Откройте предложение заново");
                     }
+                }
+                if body["apply_assignee"] == true {
+                    data["assignee_id"] = json!(id(approved, "assignee_id").context("Выберите исполнителя")?);
+                }
+                if body["apply_due"] == true {
                     data["due_date"] = approved["due_date"].clone();
                     data["due_time"] = approved["due_time"].clone();
+                }
+                if body["apply_due"] == true || body["apply_assignee"] == true {
                     validate_task(c, &mut data, demo, Some(existing))?;
                 }
                 result = save(c, "tasks", data, Some(&old), demo, None)?;
             } else {
+                if proposal["origin"] == "groq" && body["confirm_separate_task"] != true {
+                    let project = id(approved, "project_id");
+                    let title = text(approved, "title");
+                    let candidates = proposal["candidate_task_ids"].as_array();
+                    let matching = entities(c, "tasks", demo)?.iter().any(|task| {
+                        id(task, "project_id") == project
+                            && (crate::groq::same_action_title(text(task, "title"), title)
+                                || candidates.is_some_and(|ids| ids.contains(&task["id"])))
+                    });
+                    if matching {
+                        bail!("Есть похожая задача. Выберите её или подтвердите создание отдельной");
+                    }
+                }
                 let mut data = approved.clone();
-                data["sources"] = json!([source]);
+                let mut sources = vec![source.clone()];
+                let mut merged = std::collections::HashSet::new();
+                if let Some(related) = body.get("related_proposal_ids") {
+                    let related = related.as_array().context("Некорректный список связанных предложений")?;
+                    if related.len() > 30 { bail!("Слишком много связанных предложений"); }
+                    for related_id in related {
+                        let related_id = related_id.as_i64().context("Некорректный идентификатор предложения")?;
+                        if related_id == pid { bail!("Предложение уже выбрано как основное"); }
+                        let (raw, status, scope): (String, String, bool) = c.query_row(
+                            "SELECT data_json,status,is_demo FROM proposals WHERE id=?1",
+                            [related_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                        )?;
+                        let item: Value = serde_json::from_str(&raw)?;
+                        let evidence = &item["source"];
+                        if scope != demo || id(evidence, "meeting_id") != id(source, "meeting_id")
+                            || id(&item, "project_id") != id(approved, "project_id") {
+                            bail!("Связанные пункты должны относиться к одной встрече и проекту");
+                        }
+                        match (text(&item, "kind"), status.as_str()) {
+                            ("decision", "accepted") => {}
+                            ("create_task" | "change_due" | "change_assignee", "pending") => {
+                                if !item["task_id"].is_null() {
+                                    bail!("Связанное предложение уже относится к существующей задаче");
+                                }
+                                merged.insert(related_id);
+                            }
+                            _ => bail!("Связанное предложение уже рассмотрено или недоступно"),
+                        }
+                        validate_source(c, evidence, demo)?;
+                        if !sources.contains(evidence) { sources.push(evidence.clone()); }
+                    }
+                }
+                data["sources"] = json!(sources);
                 result = task_save(c, &json!({"data":data}), demo, None)?;
+                for related_id in merged {
+                    c.execute(
+                        "UPDATE proposals SET status='accepted',data_json=json_remove(
+                            json_set(data_json,'$.confirmed_task_id',?2),'$.review_draft') WHERE id=?1",
+                        params![related_id, id(&result, "id")],
+                    )?;
+                }
             }
         }
-        kind @ ("change_due" | "change_assignee" | "change_status") => {
+        kind @ ("change_task" | "change_due" | "change_assignee" | "change_status" | "change_blocked") => {
             let tid = id(body, "existing_task_id")
                 .or_else(|| id(&proposal, "task_id"))
                 .context("Выберите существующую задачу")?;
@@ -996,26 +1264,74 @@ fn review(c: &Connection, body: &Value, demo: bool) -> Result<Value> {
             if body["task_revision"] != old["revision"] {
                 bail!("Задача изменилась после открытия предложения. Проверьте новые значения");
             }
+            let fields = change_fields(kind);
+            let base = &proposal["base_task"];
+            if id(&proposal, "task_id") == Some(tid)
+                && body["acknowledge_task_conflict"] != true
+                && base.is_object()
+                && fields.iter().any(|key| base[*key] != old[*key])
+            {
+                bail!("Поля задачи изменились после анализа. Сверьте текущие значения и подтвердите замену");
+            }
+            if kind == "change_task" {
+                if old["project_id"] != proposal["project_id"] {
+                    bail!("Выберите задачу из проекта совещания");
+                }
+                let project = entity(c, "projects", id(&old, "project_id").context("Задача без проекта")?)?;
+                if project["archived"] == true || !project["stages"].as_array().into_iter().flatten()
+                    .any(|stage| stage["id"] == old["stage_id"] && stage["kind"] == "active") {
+                    bail!("Пакет можно применить только к активной задаче проекта");
+                }
+                if text(approved, "due_date").is_empty() || id(approved, "assignee_id").is_none() {
+                    bail!("Укажите срок и исполнителя для пакета изменений");
+                }
+            }
             let mut data = old.clone();
-            for key in match kind {
-                "change_due" => vec!["due_date", "due_time"],
-                "change_assignee" => vec!["assignee_id"],
-                _ => vec!["stage_id"],
-            } {
-                data[key] = approved[key].clone();
+            for key in fields {
+                data[*key] = approved[*key].clone();
             }
             validate_task(c, &mut data, demo, Some(tid))?;
+            let mut sources = data["sources"].as_array().cloned().unwrap_or_default();
+            let mut evidence = source.clone();
+            evidence["proposal_id"] = json!(pid);
+            evidence["task_id"] = json!(tid);
+            if kind == "change_task" {
+                if ["due_date", "due_time", "assignee_id"].iter().all(|key| data[*key] == old[*key]) {
+                    bail!("Этот срок и исполнитель уже установлены");
+                }
+                let person: String = c.query_row("SELECT name FROM people WHERE id=?1", [id(&data, "assignee_id")], |r| r.get(0))?;
+                let deadline = [data["due_date"].as_str(), data["due_time"].as_str()]
+                    .into_iter().flatten().collect::<Vec<_>>().join(" ");
+                let decision = format!("{} · срок {} · исполнитель {}", text(&old, "title"), deadline, person);
+                if applied_decision_id.is_none() {
+                    applied_decision_id = Some(save_decision(c, id(&old, "project_id"), &decision, &evidence, &Value::Null, demo)?);
+                }
+                evidence["decision_id"] = json!(applied_decision_id);
+            }
+            if !sources.contains(&evidence) { sources.push(evidence); }
+            data["sources"] = json!(sources);
             result = save(c, "tasks", data, Some(&old), demo, None)?;
         }
         _ => bail!("Неизвестный тип предложения"),
     }
+    if let Some(decision) = linked_decision {
+        link_decision_task(c, decision, id(&result, "id").context("Выберите предложение по задаче")?, linked_project, demo)?;
+    }
     let mut saved = proposal.clone();
+    saved.as_object_mut().context("Некорректное предложение")?.remove("review_draft");
     saved["confirmed_task_id"] = result["id"].clone();
+    let fields = change_fields(text(&proposal, "kind"));
+    if !fields.is_empty() {
+        saved["applied"] = Value::Object(fields.iter().map(|key| (key.to_string(), result[*key].clone())).collect());
+    }
+    if let Some(decision_id) = applied_decision_id {
+        saved["decision_id"] = json!(decision_id);
+    }
     c.execute(
         "UPDATE proposals SET status='accepted',data_json=?2 WHERE id=?1",
         params![pid, saved.to_string()],
     )?;
-    Ok(json!({"accepted":true,"task":result}))
+    Ok(json!({"accepted":true,"task":result,"decision_id":applied_decision_id}))
 }
 impl Store {
     fn seed_demo(&self) -> Result<Value> {

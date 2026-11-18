@@ -95,13 +95,13 @@ struct ProjectEditor: View {
                 }
             }
             Section("Сроки") {
-                TextField("Начало (ГГГГ-ММ-ДД)", text: $start)
-                TextField("Срок (ГГГГ-ММ-ДД)", text: $end)
+                ProjectDateField(title: "Начало", value: $start)
+                ProjectDateField(title: "Срок завершения", value: $end)
             }
             teamFields
             Section("План и риски") {
                 TextField("Ближайший этап", text: $milestone)
-                TextField("Срок этапа (ГГГГ-ММ-ДД)", text: $milestoneDate)
+                ProjectDateField(title: "Срок этапа", value: $milestoneDate)
                 TextField("Что мешает работе", text: $blocker, axis: .vertical)
             }
             Section("Этапы проекта") {
@@ -158,8 +158,7 @@ struct ProjectEditor: View {
             HStack {
                 Button {
                     Task {
-                        if await model.command(["op": "archive_project", "id": project.id,
-                                                "revision": project.revision, "archived": project.archived != true]) {
+                        if await model.setProjectArchived(project.archived != true, project: project) {
                             dismiss()
                         }
                     }
@@ -272,9 +271,12 @@ struct MeetingNotesEditor: View {
 }
 
 struct ProjectOverview: View {
+    @ObservedObject var model: WorkspaceModel
     let project: Project
     let workspace: Workspace
     let openMeeting: (Int) -> Void
+    let openTask: (Int) -> Void
+    @State private var decisionToCancel: Decision?
 
     var body: some View {
         MeetingDisclosure(title: "Обзор проекта", icon: "folder", count: nil) {
@@ -284,12 +286,13 @@ struct ProjectOverview: View {
                     LabeledContent("Владелец", value: owner?.name ?? "Не назначен")
                     let team = workspace.people.filter { (project.members ?? []).contains($0.id) }
                     LabeledContent("Команда", value: team.isEmpty ? "Без участников" : team.map(\.name).joined(separator: ", "))
-                    LabeledContent("Начало и срок", value: [project.startDate ?? "—", project.endDate ?? "—"].joined(separator: " / "))
+                    LabeledContent("Начало и срок", value: [project.startDate, project.endDate]
+                        .map { $0.map(ProjectDateField.display) ?? "—" }.joined(separator: " / "))
                     detail("Описание", project.description)
                     detail("Цель", project.goal)
                     detail("Материалы", project.materials)
                     detail("Ближайший этап", project.nextMilestone)
-                    detail("Срок этапа", project.nextMilestoneDate)
+                    detail("Срок этапа", project.nextMilestoneDate.map(ProjectDateField.display))
                     detail("Что мешает работе", project.blocker)
                     Divider()
                     Text("Встречи").font(.headline)
@@ -303,10 +306,23 @@ struct ProjectOverview: View {
                     let decisions = workspace.decisions.filter { $0.projectId == project.id }
                     if decisions.isEmpty { Text("Подтверждённых решений пока нет").foregroundStyle(.secondary) }
                     ForEach(decisions) { decision in
-                        HStack {
+                        VStack(alignment: .leading, spacing: 4) {
                             Text(decision.text).textSelection(.enabled)
-                            if let id = decision.meetingId {
-                                Button("К встрече") { openMeeting(id) }.buttonStyle(.link)
+                            Text(decision.statusLabel).font(.caption).foregroundStyle(.secondary)
+                            if let reason = decision.reason { detail("Обоснование", reason) }
+                            if let prior = decisions.first(where: { $0.id == decision.supersedesId }) {
+                                detail("Заменяет решение", prior.text)
+                            }
+                            ForEach(workspace.visibleTasks.filter { (decision.taskIds ?? []).contains($0.id) }) { task in
+                                Button(task.title) { openTask(task.id) }.buttonStyle(.link)
+                            }
+                            HStack {
+                                if let id = decision.meetingId {
+                                    Button("К встрече") { openMeeting(id) }.buttonStyle(.link)
+                                }
+                                if decision.active {
+                                    Button("Отменить решение") { decisionToCancel = decision }.buttonStyle(.link)
+                                }
                             }
                         }
                     }
@@ -315,6 +331,13 @@ struct ProjectOverview: View {
             }
             .frame(maxHeight: 250)
         }
+        .confirmationDialog("Отменить решение?", isPresented: Binding(
+            get: { decisionToCancel != nil }, set: { if !$0 { decisionToCancel = nil } }
+        ), presenting: decisionToCancel) { decision in
+            Button("Отменить решение", role: .destructive) {
+                Task { await model.command(["op": "cancel_decision", "id": decision.id]) }
+            }
+        } message: { decision in Text(decision.text) }
     }
 
     @ViewBuilder
@@ -344,6 +367,9 @@ struct ProjectDirectory: View {
     @Binding var filters: Filters
     let openProject: (Int) -> Void
     let openTask: (Int) -> Void
+    let editProject: (Project) -> Void
+    let changeArchive: (Project) -> Void
+    let actionsDisabled: Bool
     @State private var expandedProjects: Set<Int> = []
 
     private var palette: PanelPalette { PanelPalette(dark: scheme == .dark) }
@@ -386,8 +412,21 @@ struct ProjectDirectory: View {
                               : [GridItem(.flexible())], alignment: .leading, spacing: 12) {
                         ForEach(results) { project in
                             if filters.cards {
-                                Button { openProject(project.id) } label: { projectRow(project) }
-                                    .buttonStyle(.plain)
+                                VStack(alignment: .leading, spacing: 8) {
+                                    Button { openProject(project.id) } label: { projectRow(project) }
+                                        .buttonStyle(.plain)
+                                    Divider()
+                                    HStack {
+                                        Button { editProject(project) } label: {
+                                            Label("Карточка проекта", systemImage: "square.and.pencil")
+                                        }
+                                        .buttonStyle(.link)
+                                        .disabled(actionsDisabled)
+                                        Spacer(minLength: 4)
+                                        projectActions(project)
+                                    }
+                                }
+                                .panelCard()
                             } else {
                                 projectListRow(project)
                             }
@@ -463,25 +502,28 @@ struct ProjectDirectory: View {
 
     private func projectListRow(_ project: Project) -> some View {
         let expanded = expandedProjects.contains(project.id)
-        let tasks = workspace.visibleTasks.filter { $0.projectId == project.id }
+        let tasks = workspace.visibleTasks.filter { $0.projectId == project.id && $0.stageKind != "cancelled" }
         return VStack(alignment: .leading, spacing: 10) {
-            Button {
-                if expanded { expandedProjects.remove(project.id) }
-                else { expandedProjects.insert(project.id) }
-            } label: {
-                HStack(spacing: 8) {
-                    Image(systemName: expanded ? "chevron.down" : "chevron.right")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.secondary)
-                        .accessibilityHidden(true)
-                    Text(project.title).font(.headline)
-                    Spacer(minLength: 8)
-                    statusBadge(project)
+            HStack(spacing: 8) {
+                Button {
+                    if expanded { expandedProjects.remove(project.id) }
+                    else { expandedProjects.insert(project.id) }
+                } label: {
+                    HStack(spacing: 8) {
+                        Image(systemName: expanded ? "chevron.down" : "chevron.right")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                            .accessibilityHidden(true)
+                        Text(project.title).font(.headline)
+                        Spacer(minLength: 8)
+                        statusBadge(project)
+                    }
+                    .contentShape(Rectangle())
                 }
-                .contentShape(Rectangle())
+                .buttonStyle(.plain)
+                .accessibilityValue(expanded ? "Развёрнуто" : "Свёрнуто")
+                projectActions(project, includesEdit: true)
             }
-            .buttonStyle(.plain)
-            .accessibilityValue(expanded ? "Развёрнуто" : "Свёрнуто")
             if expanded {
                 Button("Открыть проект") { openProject(project.id) }
                     .buttonStyle(.link)
@@ -499,6 +541,25 @@ struct ProjectDirectory: View {
             }
         }
         .panelCard()
+    }
+
+    private func projectActions(_ project: Project, includesEdit: Bool = false) -> some View {
+        Menu {
+            if includesEdit {
+                Button("Карточка проекта") { editProject(project) }
+            }
+            Button {
+                changeArchive(project)
+            } label: {
+                Label(project.archived == true ? "Восстановить проект" : "Перенести в архив",
+                      systemImage: project.archived == true ? "arrow.uturn.backward" : "archivebox")
+            }
+        } label: {
+            Image(systemName: "ellipsis.circle")
+        }
+        .accessibilityLabel("Действия проекта «\(project.title)»")
+        .fixedSize()
+        .disabled(actionsDisabled)
     }
 
     private func projectRow(_ project: Project) -> some View {
@@ -520,9 +581,10 @@ struct ProjectDirectory: View {
             if let goal = project.goal, !goal.isEmpty { Text(goal).font(.callout).lineLimit(2) }
             Label(person?.speakerPickerName ?? "Владелец не назначен", systemImage: "person")
                 .font(.caption).foregroundStyle(palette.muted).lineLimit(1)
-            let dates = [project.startDate, project.endDate].compactMap { $0 }.joined(separator: " – ")
-            if !dates.isEmpty {
-                Label(dates, systemImage: "calendar").font(.caption.monospacedDigit())
+            if let dates = project.startDate.map(ProjectDateField.display) ?? project.endDate.map(ProjectDateField.display) {
+                let end = project.startDate == nil ? nil : project.endDate.map(ProjectDateField.display)
+                Label([dates, end].compactMap { $0 }.joined(separator: " – "), systemImage: "calendar")
+                    .font(.caption.monospacedDigit())
                     .foregroundStyle(palette.muted)
             }
             if project.archived != true {
@@ -530,7 +592,7 @@ struct ProjectDirectory: View {
                     .font(.caption).foregroundStyle(.secondary)
             }
         }
-        .panelCard()
+        .frame(maxWidth: .infinity, alignment: .leading)
         .contentShape(Rectangle())
     }
 }

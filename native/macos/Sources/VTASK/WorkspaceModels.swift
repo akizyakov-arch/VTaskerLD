@@ -61,7 +61,7 @@ struct TaskItem: Decodable, Identifiable {
     let dueTime: String?
 }
 
-struct TaskSource: Decodable {
+struct TaskSource: Decodable, Equatable {
     let meetingId: Int?
     let quote: String?
     let topic: String?

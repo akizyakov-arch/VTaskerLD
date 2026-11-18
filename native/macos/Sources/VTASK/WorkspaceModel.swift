@@ -196,6 +196,12 @@ final class WorkspaceModel: ObservableObject {
         await commandResponse(payload, path: path) != nil
     }
 
+    @discardableResult
+    func setProjectArchived(_ archived: Bool, project: Project) async -> Bool {
+        await command(["op": "archive_project", "id": project.id,
+                       "revision": project.revision, "archived": archived])
+    }
+
     func interpretAssistant(_ text: String, hasSearch: Bool, hasProject: Bool) async throws -> AssistantIntent {
         struct Reply: Decodable {
             let state: String
@@ -329,6 +335,11 @@ final class WorkspaceModel: ObservableObject {
     func engineSettings() async throws -> EngineSettings {
         let data = try await request("api/status")
         return try decode(EngineSettings.self, from: data)
+    }
+
+    func aiBudget() async throws -> AIBudget {
+        let data = try await request("api/groq/budget")
+        return try decode(AIBudget.self, from: data)
     }
 
     func personPhotoURL(_ person: Person) -> URL? {

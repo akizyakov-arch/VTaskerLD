@@ -104,12 +104,29 @@ struct ProcessingControls: View {
             VStack(alignment: .leading, spacing: 8) { actions }
         }
         .controlSize(.large)
-        .confirmationDialog("Отправить протокол выбранному провайдеру ИИ?", isPresented: $confirmGroq) {
-            Button("Отправить и проанализировать") {
+        .confirmationDialog("Как проанализировать протокол?", isPresented: $confirmGroq) {
+            Button("Выделить явные команды на Mac") {
+                Task {
+                    await model.command(["meeting_id": meeting.id, "local": true], path: "api/groq/analyze")
+                }
+            }
+            Button("Получить облачный анализ") {
                 Task {
                     await model.command(["meeting_id": meeting.id, "consent": true], path: "api/groq/analyze")
                 }
             }
+            if meeting.analysis?.saved != nil {
+                Button("Заново запросить у провайдера") {
+                    Task {
+                        await model.command(["meeting_id": meeting.id, "consent": true, "force": true],
+                                            path: "api/groq/analyze")
+                    }
+                }
+            }
+        } message: {
+            Text(meeting.projectId == nil
+                 ? "Облачный анализ отправляет протокол провайдеру и переиспользует сохранённый результат, если данные совпадают."
+                 : "Локальный разбор понимает явные команды, например «По задаче #42: перенести срок на 24 ноября». Облачный анализ использует протокол и подходящие данные проекта. При совпадении контекста и модели используется сохранённый результат.")
         }
     }
 
@@ -196,6 +213,12 @@ struct TaskHistoryEntry: Decodable, Identifiable {
         let title: String
         let dueDate: String?
         let dueTime: String?
+        let projectId: Int?
+        let assigneeId: Int?
+        let stageId: String?
+        let blocked: Bool?
+        let blockedReason: String?
+        let sources: [TaskSource]?
     }
     let id: Int
     let createdAt: String
@@ -411,6 +434,30 @@ struct TaskEditor: View {
                     Text((item.before == nil ? "Создана: " : "Изменена: ") + item.after.title)
                     if item.before?.dueDate != item.after.dueDate || item.before?.dueTime != item.after.dueTime {
                         Text("Срок: " + [item.after.dueDate, item.after.dueTime].compactMap { $0 }.joined(separator: " "))
+                    }
+                    if let before = item.before, before.assigneeId != item.after.assigneeId {
+                        let people = model.workspace?.people ?? []
+                        let old = people.first { $0.id == before.assigneeId }?.name ?? "Без исполнителя"
+                        let new = people.first { $0.id == item.after.assigneeId }?.name ?? "Без исполнителя"
+                        Text("Исполнитель: " + old + " → " + new)
+                    }
+                    if let before = item.before, before.stageId != item.after.stageId {
+                        let old = stages(for: before.projectId).first { $0.id == before.stageId }?.title ?? before.stageId ?? "—"
+                        let new = stages(for: item.after.projectId).first { $0.id == item.after.stageId }?.title ?? item.after.stageId ?? "—"
+                        Text("Статус: " + old + " → " + new)
+                    }
+                    if let before = item.before, (before.blocked == true) != (item.after.blocked == true)
+                        || before.blockedReason != item.after.blockedReason {
+                        Text(item.after.blocked == true ? "Блокировка: " + (item.after.blockedReason ?? "") : "Блокировка снята")
+                    }
+                    let added = (item.after.sources ?? []).filter { !(item.before?.sources ?? []).contains($0) }
+                    ForEach(Array(added.enumerated()), id: \.offset) { _, source in
+                        if let quote = source.quote { Text(quote).font(.caption).textSelection(.enabled) }
+                        if let id = source.meetingId, returnToMeeting == nil {
+                            Button(model.workspace?.meetings.first { $0.id == id }?.title ?? "Открыть встречу") {
+                                openMeeting(id)
+                            }.buttonStyle(.link)
+                        }
                     }
                 }
             }

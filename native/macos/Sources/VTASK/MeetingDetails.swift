@@ -81,10 +81,22 @@ struct MeetingAnalysis: Decodable {
     }
     struct Result: Decodable {
         struct Item: Decodable { let title: String? }
+        struct Finding: Decodable, Identifiable {
+            let id: String
+            let kind: String
+            let text: String
+            let source: Proposal.Source?
+            let taskId: Int?
+
+            var label: String {
+                ["status_update": "Ход работы", "question": "Вопрос", "information": "Наблюдение"][kind] ?? kind
+            }
+        }
         let summary: String?
         let openQuestions: [String]?
         let decisions: [Item]?
         let tasks: [Item]?
+        let findings: [Finding]?
     }
 
     let state: String
@@ -98,11 +110,17 @@ struct MeetingAnalysis: Decodable {
 struct MeetingAnalysisView: View {
     @ObservedObject var model: WorkspaceModel
     let meeting: Meeting
+    let openMeeting: (Int) -> Void
+    let openTask: (Int) -> Void
+    @State private var showingAgenda = false
     @State private var editingNotes = false
 
     var body: some View {
         let analysis = meeting.analysis
         let summary = analysis?.saved?.result?.summary ?? ""
+        let observations = analysis?.saved?.result?.findings?.filter {
+            ["status_update", "question", "information"].contains($0.kind)
+        } ?? []
         let manualSummary = meeting.manualNotes?.summary ?? ""
         VStack(alignment: .leading, spacing: 14) {
             HStack {
@@ -110,6 +128,10 @@ struct MeetingAnalysisView: View {
                     .font(.title3.weight(.semibold))
                     .accessibilityAddTraits(.isHeader)
                 Spacer()
+                if meeting.projectId != nil {
+                    Button("Черновик повестки") { showingAgenda = true }
+                        .buttonStyle(.bordered)
+                }
                 if meeting.manualNotes != nil {
                     Button { editingNotes = true } label: {
                         Label("Заметки", systemImage: "square.and.pencil")
@@ -136,9 +158,29 @@ struct MeetingAnalysisView: View {
             if summary.isEmpty && manualSummary.isEmpty && analysis?.running != true {
                 Text("Резюме пока нет.").foregroundStyle(.secondary)
             }
-
+            if !observations.isEmpty {
+                MeetingDisclosure(title: "Наблюдения", icon: "list.bullet.rectangle", count: observations.count) {
+                    ForEach(observations) { item in
+                        DisclosureGroup {
+                            if let quote = item.source?.quote { Text(quote).textSelection(.enabled) }
+                            if let id = item.taskId, let task = model.workspace?.visibleTasks.first(where: { $0.id == id }) {
+                                Button(task.title) { openTask(id) }.buttonStyle(.link)
+                            }
+                        } label: {
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(item.text)
+                                Text([item.label, item.source?.startMs.map(meetingTime)].compactMap { $0 }.joined(separator: " · "))
+                                    .font(.caption).foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                }
+            }
         }
         .panelCard()
+        .sheet(isPresented: $showingAgenda) {
+            agenda.sheetCloseButton()
+        }
         .sheet(isPresented: $editingNotes) {
             Group {
                 if let notes = meeting.manualNotes {
@@ -149,6 +191,61 @@ struct MeetingAnalysisView: View {
             .sheetCloseButton(disabled: model.saving)
         }
     }
+    private var agenda: some View {
+        let tasks = (model.workspace?.visibleTasks ?? []).filter {
+            $0.projectId == meeting.projectId && $0.stageKind == "active"
+        }
+        let priorMeetings = (model.workspace?.meetings ?? []).filter {
+            $0.projectId == meeting.projectId && $0.id < meeting.id
+        }
+        return ScrollView {
+            VStack(alignment: .leading, spacing: 14) {
+                Text("Повестка").font(.title2.bold())
+                MeetingDisclosure(title: "Открытые вопросы прошлых встреч", icon: "questionmark.bubble", count: nil) {
+                    ForEach(priorMeetings) { prior in
+                        let manual = prior.manualNotes?.openQuestions ?? ""
+                        let questions = prior.analysis?.saved?.result?.openQuestions ?? []
+                        if !manual.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !questions.isEmpty {
+                            Button(prior.title) {
+                                showingAgenda = false
+                                openMeeting(prior.id)
+                            }.buttonStyle(.link)
+                            if !manual.isEmpty { Text(manual).textSelection(.enabled) }
+                            ForEach(Array(questions.enumerated()), id: \.offset) { _, question in
+                                Text(question).textSelection(.enabled)
+                            }
+                        }
+                    }
+                    if !priorMeetings.contains(where: {
+                        !($0.manualNotes?.openQuestions.trimmingCharacters(in: .whitespacesAndNewlines) ?? "").isEmpty
+                            || $0.analysis?.saved?.result?.openQuestions?.isEmpty == false
+                    }) {
+                        Text("Открытых вопросов пока нет.").foregroundStyle(.secondary)
+                    }
+                }
+                agendaTasks("Блокировки", icon: "exclamationmark.circle", tasks: tasks.filter { $0.blocked == true })
+                agendaTasks("Открытые задачи", icon: "checklist", tasks: tasks.filter { $0.blocked != true })
+            }
+            .padding(20)
+        }
+        .frame(width: 560, height: 460)
+    }
+
+    private func agendaTasks(_ title: String, icon: String, tasks: [TaskItem]) -> some View {
+        MeetingDisclosure(title: title, icon: icon, count: tasks.count) {
+            if tasks.isEmpty { Text("Нет задач.").foregroundStyle(.secondary) }
+            ForEach(tasks) { task in
+                Button(task.title) {
+                    showingAgenda = false
+                    openTask(task.id)
+                }.buttonStyle(.link)
+                if let reason = task.blockedReason, !reason.isEmpty, task.blocked == true {
+                    Text(reason).foregroundStyle(.secondary)
+                }
+            }
+        }
+    }
+
 }
 
 struct MeetingDecisions: View {
@@ -170,9 +267,15 @@ struct MeetingDecisions: View {
                     switch row {
                     case .confirmed(let decision):
                         HStack(alignment: .firstTextBaseline, spacing: 10) {
-                            Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
-                                .accessibilityLabel("Подтверждено")
-                            ProtocolProse(text: decision.text)
+                            Image(systemName: decision.active ? "checkmark.circle.fill" : "minus.circle")
+                                .foregroundStyle(decision.active ? Color.green : Color.secondary)
+                                .accessibilityLabel(decision.statusLabel)
+                            VStack(alignment: .leading, spacing: 4) {
+                                ProtocolProse(text: decision.text)
+                                if !decision.active {
+                                    Text(decision.statusLabel).font(.caption).foregroundStyle(.secondary)
+                                }
+                            }
                         }
                     case .proposed(let proposal):
                         MeetingProposalRow(proposal: proposal, icon: "checkmark.seal", review: review)

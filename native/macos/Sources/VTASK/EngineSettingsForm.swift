@@ -1,5 +1,32 @@
 import SwiftUI
 
+struct AIBudget: Decodable {
+    struct Usage: Decodable, Identifiable {
+        let stage: String
+        let phase: String
+        let todayTokens: Int
+        let monthTokens: Int
+        let monthRequests: Int
+        let inputTokens: Int
+        let outputTokens: Int
+
+        var id: String { stage + "/" + phase }
+        var title: String {
+            let name = ["manual": "Ручной анализ", "automatic": "После записи", "live": "Во время записи",
+                        "assistant": "Валли"][stage] ?? stage
+            let detail = ["synthesis": "сводка", "extraction": "извлечение", "interpret": "команды"][phase] ?? phase
+            return "\(name) · \(detail)"
+        }
+    }
+
+    let dailyTokens: Int
+    let monthlyTokens: Int
+    let todayTokens: Int
+    let monthTokens: Int
+    let estimatedTokens: Int
+    let stages: [Usage]
+}
+
 struct EngineSettings: Decodable {
     struct Speech: Decodable {
         var settings: SpeechPreferences
@@ -50,6 +77,9 @@ struct EngineSettingsForm: View {
     @State private var liveModel = "openai/gpt-oss-120b"
     @State private var liveKey = ""
     @State private var persistLiveKey = true
+    @State private var budget: AIBudget?
+    @State private var dailyTokens = 0
+    @State private var monthlyTokens = 0
     private let aiProviders = ["groq", "deepseek", "openai", "anthropic", "gemini", "mistral"]
     private let aiNames = ["groq": "Groq", "deepseek": "DeepSeek", "openai": "OpenAI",
                            "anthropic": "Anthropic · Claude", "gemini": "Google · Gemini", "mistral": "Mistral"]
@@ -108,6 +138,7 @@ struct EngineSettingsForm: View {
                     .disabled(status.groq.busy || !status.groq.hasKey ||
                               status.groq.model != (aiProvider == "groq" ? aiModel : aiProvider + ":" + aiModel))
                 }
+                budgetSection
                 Section("ИИ для анализа на лету") {
                     Toggle("Анализировать фрагменты во время записи Live", isOn: $livePreview)
                     Toggle("Автоматически анализировать после записи", isOn: $automaticAI)
@@ -190,6 +221,54 @@ struct EngineSettingsForm: View {
         }
     }
 
+    private var budgetSection: some View {
+        Section("Бюджет внешнего ИИ") {
+            TextField("Дневной лимит токенов", value: $dailyTokens, format: .number)
+            TextField("Месячный лимит токенов", value: $monthlyTokens, format: .number)
+            Text("0 — без лимита. Периоды считаются по UTC. Учитываются анализ совещаний и команды Валли.")
+                .font(.caption).foregroundStyle(.secondary)
+            HStack {
+                Button("Сохранить лимиты") {
+                    Task {
+                        if await model.command(["daily_tokens": dailyTokens, "monthly_tokens": monthlyTokens],
+                                               path: "api/groq/budget") {
+                            message = "Лимиты сохранены."
+                            await loadBudget()
+                        } else {
+                            error = model.error
+                        }
+                    }
+                }
+                .disabled(!(0...1_000_000_000).contains(dailyTokens) || !(0...1_000_000_000).contains(monthlyTokens))
+                Button("Обновить расход") { Task { await loadBudget(resetLimits: false) } }
+            }
+            if let budget {
+                LabeledContent("Сегодня", value: budget.todayTokens.formatted())
+                LabeledContent("В этом месяце", value: budget.monthTokens.formatted())
+                ForEach(budget.stages) { usage in
+                    LabeledContent(usage.title, value: "\(usage.monthTokens.formatted()) ток. · \(usage.monthRequests.formatted()) запр.")
+                }
+                if budget.estimatedTokens > 0 {
+                    Text("Учтено по оценке или зарезервировано: \(budget.estimatedTokens.formatted()) ток. за месяц.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+            }
+        }
+    }
+
+    private func loadBudget(resetLimits: Bool = true) async {
+        do {
+            let current = try await model.aiBudget()
+            budget = current
+            if resetLimits {
+                dailyTokens = current.dailyTokens
+                monthlyTokens = current.monthlyTokens
+            }
+        } catch {
+            if !Task.isCancelled { self.error = error.localizedDescription }
+        }
+    }
+
     private func load() async {
         do {
             let result = try await model.engineSettings()
@@ -211,6 +290,7 @@ struct EngineSettingsForm: View {
             liveModel = live.last ?? ""
             status = result
             error = nil
+            if budget == nil { await loadBudget() }
         } catch {
             if !Task.isCancelled { self.error = error.localizedDescription }
         }

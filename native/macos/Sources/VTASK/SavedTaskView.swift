@@ -105,12 +105,13 @@ struct SavedTaskView: Decodable, Identifiable {
 extension TaskFilter {
     var savedFilters: [String: Any] {
         switch self {
-        case .all: return [:]
+        case .all: return ["statuses": ["kind:active", "kind:done"]]
         case .active: return ["active": true]
         case .today: return ["active": true, "dues": ["today"]]
         case .overdue: return ["dues": ["overdue"]]
         case .undated: return ["active": true, "dues": ["none"]]
         case .done: return ["statuses": ["kind:done"]]
+        case .cancelled: return ["statuses": ["kind:cancelled"]]
         case .dueSoon: return ["active": true, "dues": ["due-soon"]]
         case .later: return ["active": true, "dues": ["due-later"]]
         }

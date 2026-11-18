@@ -4,6 +4,7 @@ pub mod diarization;
 pub mod groq;
 pub mod live;
 pub mod live_voice;
+mod local_analysis;
 pub mod meeting_notes;
 mod migrations;
 pub mod people;
