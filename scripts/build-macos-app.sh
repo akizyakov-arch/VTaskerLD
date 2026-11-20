@@ -7,6 +7,12 @@ tools_dir="${VTRACKER_TOOLS_DIR:-$HOME/.local/share/vtracker}"
 if [[ -f "$tools_dir/whisper.cpp/build/src/libwhisper.dylib" ]]; then
     bash "$repo_dir/scripts/build-whisper-worker.sh"
 fi
+for sdk in "$tools_dir"/diarization/sherpa-onnx-*-shared-no-tts; do
+    if [[ -f "$sdk/include/sherpa-onnx/c-api/c-api.h" ]]; then
+        python3 "$repo_dir/scripts/build-voice-helper.py"
+        break
+    fi
+done
 cargo build --locked --manifest-path "$repo_dir/Cargo.toml"
 swift build --package-path "$package" --product VTASK
 swift build --package-path "$package" --product vtracker-capture
@@ -15,7 +21,9 @@ app="$package/.build/VTASK.app"
 
 resources="$app/Contents/Resources"
 mkdir -p "$app/Contents/MacOS" "$resources/scripts"
-cp "$package/Resources/VTASK.icns" "$package/Sources/VTASK/Resources/meeting-topics.json" "$resources/"
+cp "$package/Resources/VTASK.icns" "$package/Sources/VTASK/Resources/meeting-topics.json" \
+    "$package/Sources/VTASK/Resources/recording-wave.png" "$resources/"
+cp -R "$package/Sources/VTASK/Resources/Manrope" "$resources/"
 cp "$repo_dir/web/vtask-light.svg" "$repo_dir/web/vtask-dark.svg" "$resources/"
 # Replace executables atomically so a running core keeps its signed inode.
 install -S -m 755 "$repo_dir/target/debug/vtracker" "$app/Contents/MacOS/vtracker"

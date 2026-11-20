@@ -100,8 +100,10 @@ struct ProjectEditor: View {
             }
             teamFields
             Section("План и риски") {
-                TextField("Ближайший этап", text: $milestone)
-                ProjectDateField(title: "Срок этапа", value: $milestoneDate)
+                if project.nextMilestone?.isEmpty == false || project.nextMilestoneDate?.isEmpty == false {
+                    TextField("Этап из прежнего плана", text: $milestone)
+                    ProjectDateField(title: "Срок этапа", value: $milestoneDate)
+                }
                 TextField("Что мешает работе", text: $blocker, axis: .vertical)
             }
             Section("Этапы проекта") {
@@ -271,16 +273,64 @@ struct MeetingNotesEditor: View {
 }
 
 struct ProjectOverview: View {
-    @ObservedObject var model: WorkspaceModel
+    @Environment(\.colorScheme) private var scheme
     let project: Project
     let workspace: Workspace
     let openMeeting: (Int) -> Void
     let openTask: (Int) -> Void
-    @State private var decisionToCancel: Decision?
+    let openTasks: () -> Void
+    @State private var selectedMetric: Metric?
+
+    private enum Metric: String, CaseIterable {
+        case dueSoon = "Срок в ближайшие 7 дней"
+        case overdue = "Просрочено"
+        case blocked = "Заблокировано"
+        case undated = "Без срока"
+
+        var icon: String {
+            switch self {
+            case .dueSoon: return "calendar"
+            case .overdue: return "exclamationmark.clock"
+            case .blocked: return "hand.raised"
+            case .undated: return "calendar.badge.exclamationmark"
+            }
+        }
+
+        func matches(_ task: TaskItem, today: String) -> Bool {
+            switch self {
+            case .dueSoon: return TaskFilter.dueSoon.matches(task, today: today)
+            case .overdue: return TaskFilter.overdue.matches(task, today: today)
+            case .blocked: return task.blocked == true
+            case .undated: return TaskFilter.undated.matches(task, today: today)
+            }
+        }
+    }
+
+    private var palette: PanelPalette { PanelPalette(dark: scheme == .dark) }
+    private var tracksSchedule: Bool {
+        project.archived != true && project.status != "completed" && project.status != "cancelled"
+    }
 
     var body: some View {
-        MeetingDisclosure(title: "Обзор проекта", icon: "folder", count: nil) {
-            ScrollView {
+        let projectTasks = workspace.visibleTasks.filter { $0.projectId == project.id }
+        let active = projectTasks.filter { $0.stageKind == "active" }
+        let critical = projectTasks.filter { $0.priority == "critical" && $0.stageKind != "cancelled" }
+        ScrollView {
+            VStack(alignment: .leading, spacing: 12) {
+                if project.archived != true {
+                    criticalTasksCard(critical)
+                    if tracksSchedule {
+                        riskChart(active)
+                        if let selectedMetric {
+                            metricDetails(selectedMetric.rawValue, tasks: active.filter {
+                                selectedMetric.matches($0, today: workspace.today)
+                            })
+                        } else {
+                            let risks = active.filter { $0.overdue || $0.blocked == true || ($0.priority == "critical" && $0.dueDate == nil) }
+                            if !risks.isEmpty { metricDetails("Требуют внимания", tasks: risks) }
+                        }
+                    }
+                }
                 VStack(alignment: .leading, spacing: 10) {
                     let owner = workspace.people.first { $0.id == project.ownerId }
                     LabeledContent("Владелец", value: owner?.name ?? "Не назначен")
@@ -291,53 +341,147 @@ struct ProjectOverview: View {
                     detail("Описание", project.description)
                     detail("Цель", project.goal)
                     detail("Материалы", project.materials)
-                    detail("Ближайший этап", project.nextMilestone)
-                    detail("Срок этапа", project.nextMilestoneDate.map(ProjectDateField.display))
-                    detail("Что мешает работе", project.blocker)
-                    Divider()
+                    detail("Блокировка проекта", project.blocker)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .panelCard()
+                VStack(alignment: .leading, spacing: 10) {
                     Text("Встречи").font(.headline)
                     let meetings = workspace.meetings.filter { $0.projectId == project.id }
                     if meetings.isEmpty { Text("Встреч пока нет").foregroundStyle(.secondary) }
                     ForEach(meetings) { meeting in
                         Button(meeting.title) { openMeeting(meeting.id) }.buttonStyle(.link)
                     }
-                    Divider()
-                    Text("Решения").font(.headline)
-                    let decisions = workspace.decisions.filter { $0.projectId == project.id }
-                    if decisions.isEmpty { Text("Подтверждённых решений пока нет").foregroundStyle(.secondary) }
-                    ForEach(decisions) { decision in
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text(decision.text).textSelection(.enabled)
-                            Text(decision.statusLabel).font(.caption).foregroundStyle(.secondary)
-                            if let reason = decision.reason { detail("Обоснование", reason) }
-                            if let prior = decisions.first(where: { $0.id == decision.supersedesId }) {
-                                detail("Заменяет решение", prior.text)
-                            }
-                            ForEach(workspace.visibleTasks.filter { (decision.taskIds ?? []).contains($0.id) }) { task in
-                                Button(task.title) { openTask(task.id) }.buttonStyle(.link)
-                            }
-                            HStack {
-                                if let id = decision.meetingId {
-                                    Button("К встрече") { openMeeting(id) }.buttonStyle(.link)
-                                }
-                                if decision.active {
-                                    Button("Отменить решение") { decisionToCancel = decision }.buttonStyle(.link)
-                                }
-                            }
-                        }
-                    }
                 }
-                .padding(.vertical, 8)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .panelCard()
             }
-            .frame(maxHeight: 250)
+            .padding(24)
+            .frame(maxWidth: 860, alignment: .leading)
+            .frame(maxWidth: .infinity)
         }
-        .confirmationDialog("Отменить решение?", isPresented: Binding(
-            get: { decisionToCancel != nil }, set: { if !$0 { decisionToCancel = nil } }
-        ), presenting: decisionToCancel) { decision in
-            Button("Отменить решение", role: .destructive) {
-                Task { await model.command(["op": "cancel_decision", "id": decision.id]) }
+    }
+
+    private func criticalTasksCard(_ tasks: [TaskItem]) -> some View {
+        let done = tasks.filter { $0.stageKind == "done" }.count
+        return VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Label("Вехи проекта", systemImage: "flag.fill").font(.headline)
+                    .accessibilityAddTraits(.isHeader)
+                Spacer()
+                if tracksSchedule {
+                    Button("К задачам", action: openTasks).buttonStyle(.link)
+                }
             }
-        } message: { decision in Text(decision.text) }
+            if tasks.isEmpty {
+                Text("Задачи с приоритетом «Критический» появятся здесь.").foregroundStyle(.secondary)
+            } else {
+                HStack(spacing: 12) {
+                    ZStack {
+                        Circle().stroke(palette.border, lineWidth: 4)
+                        Circle().trim(from: 0, to: CGFloat(done) / CGFloat(tasks.count))
+                            .stroke(palette.accent, style: StrokeStyle(lineWidth: 4, lineCap: .round))
+                            .rotationEffect(.degrees(-90))
+                        Text("\(done)/\(tasks.count)").font(.caption2.weight(.semibold)).monospacedDigit()
+                    }
+                    .frame(width: 42, height: 42)
+                    .accessibilityHidden(true)
+                    Text("Выполнено критичных задач: \(done) из \(tasks.count)")
+                        .font(.callout).foregroundStyle(palette.muted)
+                }
+                ForEach(orderedByDeadline(tasks)) { task in
+                    scheduleRow(task)
+                }
+            }
+        }
+        .panelCard()
+    }
+
+    private func riskChart(_ tasks: [TaskItem]) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Сроки и блокировки").font(.headline).accessibilityAddTraits(.isHeader)
+            ForEach(Metric.allCases, id: \.self) { metric in
+                let count = tasks.filter { metric.matches($0, today: workspace.today) }.count
+                let color = metric == .overdue || metric == .blocked ? palette.recordingInk : palette.accent
+                Button {
+                    selectedMetric = selectedMetric == metric ? nil : metric
+                } label: {
+                    VStack(alignment: .leading, spacing: 5) {
+                        HStack {
+                            Label(metric.rawValue, systemImage: metric.icon)
+                            Spacer()
+                            Text(count, format: .number).monospacedDigit()
+                            Image(systemName: selectedMetric == metric ? "chevron.down" : "chevron.right")
+                                .font(.caption.weight(.semibold)).accessibilityHidden(true)
+                        }
+                        GeometryReader { bar in
+                            Capsule().fill(palette.border.opacity(0.55))
+                            Capsule().fill(color)
+                                .frame(width: bar.size.width * CGFloat(count) / CGFloat(max(1, tasks.count)))
+                        }
+                        .frame(height: 5)
+                        .accessibilityHidden(true)
+                    }
+                    .padding(.vertical, 4)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityAddTraits(selectedMetric == metric ? .isSelected : [])
+            }
+        }
+        .panelCard()
+    }
+
+    private func metricDetails(_ title: String, tasks: [TaskItem]) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(title).font(.headline).accessibilityAddTraits(.isHeader)
+            if tasks.isEmpty {
+                Text("Подходящих задач нет.").foregroundStyle(.secondary)
+            }
+            ForEach(orderedByDeadline(tasks)) { task in
+                scheduleRow(task)
+            }
+        }
+        .panelCard()
+    }
+
+    private func orderedByDeadline(_ tasks: [TaskItem]) -> [TaskItem] {
+        tasks.sorted { ($0.dueDate ?? "9999", $0.dueTime ?? "23:59", $0.id) <
+            ($1.dueDate ?? "9999", $1.dueTime ?? "23:59", $1.id) }
+    }
+
+    private func scheduleRow(_ task: TaskItem) -> some View {
+        let done = task.stageKind == "done"
+        let blocked = !done && task.blocked == true
+        let overdue = !done && task.overdue
+        let noDeadline = !done && task.dueDate == nil
+        let risk = blocked || overdue
+        let color = done ? Color.green : risk ? palette.recordingInk : noDeadline ? palette.muted : palette.accent
+        let state = done ? "Выполнено" : [blocked ? "Заблокировано" : nil, overdue ? "Просрочено" : nil]
+            .compactMap { $0 }.joined(separator: " · ")
+        let owner = workspace.people.first { $0.id == task.assigneeId }?.speakerPickerName
+        let date = task.dueDate.map { [ProjectDateField.display($0), task.dueTime].compactMap { $0 }.joined(separator: " ") }
+        return Button { openTask(task.id) } label: {
+            HStack(spacing: 10) {
+                Image(systemName: done ? "checkmark.circle.fill" : risk ? "exclamationmark.circle.fill" : "circle.fill")
+                    .font(.system(size: risk || done ? 15 : 9)).foregroundStyle(color)
+                    .frame(width: 20)
+                    .accessibilityHidden(true)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(task.title).font(.callout.weight(.semibold)).foregroundStyle(risk ? color : palette.text)
+                    Text([date ?? "Без срока", owner ?? "Без исполнителя", state.isEmpty ? nil : state,
+                          blocked ? task.blockedReason : nil].compactMap { $0 }.joined(separator: " · "))
+                        .font(.caption).foregroundStyle(palette.muted)
+                }
+                Spacer(minLength: 8)
+                Image(systemName: "chevron.right").font(.caption.weight(.semibold))
+                    .foregroundStyle(palette.muted).accessibilityHidden(true)
+            }
+            .padding(8)
+            .background(risk ? palette.recordingSurface : palette.sidebar, in: RoundedRectangle(cornerRadius: 7))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
     }
 
     @ViewBuilder
@@ -346,6 +490,84 @@ struct ProjectOverview: View {
             VStack(alignment: .leading, spacing: 4) {
                 Text(label).font(.caption).foregroundStyle(.secondary)
                 Text(value).textSelection(.enabled)
+            }
+        }
+    }
+}
+
+struct ProjectDecisionCard: View {
+    @ObservedObject var model: WorkspaceModel
+    let workspace: Workspace
+    let decision: Decision
+    let prior: Decision?
+    let openMeeting: (Int) -> Void
+    let openTask: (Int) -> Void
+    @State private var expanded = false
+    @State private var confirmingCancellation = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Button {
+                expanded.toggle()
+            } label: {
+                HStack(spacing: 10) {
+                    Image(systemName: "checkmark.seal").frame(width: 34, height: 34)
+                        .foregroundStyle(.secondary)
+                        .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 8))
+                        .accessibilityHidden(true)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(decision.text).font(.headline).lineLimit(expanded ? nil : 2)
+                        Text("Решение · \(decision.active ? "Согласовано" : decision.statusLabel)")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    Spacer(minLength: 8)
+                    Image(systemName: expanded ? "chevron.down" : "chevron.right")
+                        .font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                        .accessibilityHidden(true)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityValue(expanded ? "Развёрнуто" : "Свёрнуто")
+            if expanded {
+                Divider()
+                details
+            }
+        }
+        .panelCard()
+        .confirmationDialog("Отменить решение?", isPresented: $confirmingCancellation) {
+            Button("Отменить решение", role: .destructive) {
+                Task { await model.command(["op": "cancel_decision", "id": decision.id]) }
+            }
+        } message: { Text(decision.text) }
+    }
+
+    @ViewBuilder
+    private var details: some View {
+        if let reason = decision.reason {
+            LabeledContent("Обоснование", value: reason).textSelection(.enabled)
+        }
+        if let prior {
+            LabeledContent("Заменяет решение", value: prior.text).textSelection(.enabled)
+        }
+        ForEach(decision.source?.materialLinks ?? []) { link in
+            if let target = link.target { Link(link.label, destination: target) }
+        }
+        let linkedTasks = workspace.visibleTasks.filter { (decision.taskIds ?? []).contains($0.id) }
+        if !linkedTasks.isEmpty {
+            Text("Связанные задачи").font(.caption).foregroundStyle(.secondary)
+            ForEach(linkedTasks) { task in
+                Button(task.title) { openTask(task.id) }.buttonStyle(.link)
+            }
+        }
+        HStack {
+            if let id = decision.meetingId {
+                Button("К встрече") { openMeeting(id) }.buttonStyle(.link)
+            }
+            if decision.active {
+                Button("Отменить решение") { confirmingCancellation = true }.buttonStyle(.link)
+                    .disabled(model.saving)
             }
         }
     }

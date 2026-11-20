@@ -14,7 +14,7 @@ int main(int argc, char **argv) {
     auto ex=std::unique_ptr<const SherpaOnnxSpeakerEmbeddingExtractor,decltype(&SherpaOnnxDestroySpeakerEmbeddingExtractor)>(SherpaOnnxCreateSpeakerEmbeddingExtractor(&config),SherpaOnnxDestroySpeakerEmbeddingExtractor);
     if(!ex) throw std::runtime_error("Cannot initialize embedding model");
     auto wave=std::unique_ptr<const SherpaOnnxWave,decltype(&SherpaOnnxFreeWave)>(SherpaOnnxReadWave(argv[2]),SherpaOnnxFreeWave);
-    if(!wave || wave->sample_rate!=16000 || wave->num_samples<96000 || wave->num_samples>960000) throw std::runtime_error("Expected 6..60 seconds of mono 16 kHz WAV");
+    if(!wave || wave->sample_rate!=16000 || wave->num_samples<64000 || wave->num_samples>960000) throw std::runtime_error("Expected 4..60 seconds of mono 16 kHz WAV");
     auto stream=std::unique_ptr<const SherpaOnnxOnlineStream,decltype(&SherpaOnnxDestroyOnlineStream)>(SherpaOnnxSpeakerEmbeddingExtractorCreateStream(ex.get()),SherpaOnnxDestroyOnlineStream);
     if(!stream) throw std::runtime_error("Cannot initialize embedding stream");
     SherpaOnnxOnlineStreamAcceptWaveform(stream.get(),16000,wave->samples,wave->num_samples);

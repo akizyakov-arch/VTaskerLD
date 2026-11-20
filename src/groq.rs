@@ -17,7 +17,13 @@ pub const MODELS: [&str; 8] = [
     "openai:gpt-4.1-mini", "gemini:gemini-2.5-flash",
     "mistral:mistral-small-latest", "anthropic:claude-sonnet-4-5",
 ];
-const ANALYSIS_POLICY: &str = "vtask-groq-context-tasks-v14";
+const ANALYSIS_POLICY: &str = "vtask-groq-context-tasks-v17";
+
+#[derive(Default, Clone, Copy)]
+struct ProjectScope<'a> {
+    additional: &'a [i64],
+    material_links: bool,
+}
 
 fn provider(model: &str) -> &str {
     model.split_once(':').map(|(name, _)| name).unwrap_or("groq")
@@ -76,17 +82,195 @@ fn search_terms(text: &str) -> impl Iterator<Item = String> + '_ {
         .map(|word| word.to_lowercase().replace('ё', "е").chars().take(4).collect())
 }
 
-fn bundle_task_changes(proposals: Vec<Value>, input: &Value) -> Vec<Value> {
-    let mut bundled = Vec::new();
-    for task in input["project_tasks"].as_array().into_iter().flatten() {
-        let changes: Vec<_> = proposals.iter().filter(|p| {
-            p["task_id"] == task["id"] && matches!(p["kind"].as_str(), Some("change_due" | "change_assignee"))
-        }).collect();
-        if !["change_due", "change_assignee"].iter().all(|kind| changes.iter().any(|p| p["kind"] == *kind)) {
-            continue;
+fn administrative_change_title(title: &str) -> bool {
+    let title = title.to_lowercase().replace('ё', "е");
+    let action = title.split_whitespace().next().unwrap_or_default();
+    let changes_person = title.contains("ответствен") || title.contains("исполнител");
+    let changes_deadline = title.contains("срок") || (title.contains(" на ") &&
+        ["числ","январ","феврал","марта","апрел","мая","июня","июля","август","сентябр",
+         "октябр","ноябр","декабр","завтра","понедельник","вторник","среду","четверг","пятниц"]
+        .iter().any(|part| title.contains(part)));
+    match action {
+        "назначить" | "назначение" | "сменить" => changes_person,
+        "перенести" | "перенос" => changes_deadline,
+        "изменить" | "изменение" => changes_person || changes_deadline,
+        _ => false,
+    }
+}
+
+fn previous_change_cards(db: &Connection, project: i64, tasks: &[Value]) -> Result<std::collections::HashSet<i64>> {
+    let mut statement = db.prepare(
+        "SELECT json_extract(data_json,'$.confirmed_task_id'),json_extract(data_json,'$.title')
+         FROM proposals WHERE is_demo=0 AND status='accepted'
+           AND json_extract(data_json,'$.project_id')=?1 AND json_extract(data_json,'$.origin')='groq'
+           AND json_extract(data_json,'$.kind')='create_task'",
+    )?;
+    let proposals = statement.query_map([project], |row| Ok((row.get::<_,Option<i64>>(0)?,row.get::<_,Option<String>>(1)?)))?;
+    let mut administrative = std::collections::HashSet::new();
+    for proposal in proposals {
+        let (Some(id), Some(title)) = proposal? else { continue; };
+        if administrative_change_title(&title) && tasks.iter().any(|task|
+            task["id"] == id && task["title"].as_str().is_some_and(|name| same_action_title(name,&title))) {
+            administrative.insert(id);
         }
+    }
+    Ok(administrative)
+}
+
+fn change_candidates<'a>(input: &'a Value, project: &Value, title: &str, quote: &str) -> Vec<&'a Value> {
+    let words: std::collections::HashSet<_> = search_terms(title).chain(search_terms(quote)).collect();
+    let mut candidates: Vec<_> = input["project_tasks"].as_array().into_iter().flatten()
+        .filter(|task| (project.is_null() || task["project_id"] == *project)
+            && task["legacy_change_card"] != true
+            && task["stage_kind"] == "active")
+        .filter_map(|task| {
+            let terms: std::collections::HashSet<_> = search_terms(task["title"].as_str()?).collect();
+            let hits = terms.intersection(&words).count();
+            (hits > 0).then_some((hits,task))
+        }).collect();
+    candidates.sort_by_key(|(hits,task)| std::cmp::Reverse((*hits,task["id"].as_i64())));
+    let threshold = if candidates.first().is_some_and(|(hits,_)| *hits >= 2) { 2 } else { 1 };
+    candidates.into_iter().filter(|(hits,_)| *hits >= threshold).take(6).map(|(_,task)| task).collect()
+}
+
+fn snapshot_task(input: &Value, task_id: Option<i64>) -> Option<&Value> {
+    let task_id = task_id?;
+    input["project_tasks"].as_array()?.iter().find(|task| task["id"] == task_id)
+}
+
+fn result_project(input: &Value, requested: &Value) -> Value {
+    let mut projects = input["analysis_projects"].as_array().into_iter().flatten();
+    if let Some(id) = requested.as_i64() {
+        return projects.find(|project| project["id"] == id).map(|project| project["id"].clone()).unwrap_or(Value::Null);
+    }
+    let first = projects.next();
+    if projects.next().is_some() { return Value::Null; }
+    first.map(|project| project["id"].clone()).unwrap_or_else(|| input["project_id"].clone())
+}
+
+fn same_proposal_context(db: &Connection, previous: &Value, current: &Value) -> Result<bool> {
+    if previous["project_id"] != current["project_id"] || previous["task_id"] != current["task_id"] {
+        return Ok(false);
+    }
+    let same_title = previous["title"].as_str().zip(current["title"].as_str())
+        .is_some_and(|(a, b)| same_action_title(a, b));
+    if !same_title {
+        return Ok(false);
+    }
+    let old = &previous["source"];
+    let new = &current["source"];
+    let nearby = old["start_ms"].as_u64().zip(new["start_ms"].as_u64())
+        .is_some_and(|(a,b)| a.abs_diff(b) <= 10_000);
+    if nearby || old["quote"] == new["quote"] {
+        return Ok(true);
+    }
+    if current["kind"] != "create_task" {
+        return Ok(false);
+    }
+    // A new transcription may group the same words into longer segments.
+    // Compare the cited intervals individually so gaps between them do not count.
+    let mut stmt = db.prepare_cached(
+        "SELECT EXISTS(
+            SELECT 1 FROM json_each(?1) old_id JOIN segments old ON old.id=old_id.value
+            CROSS JOIN json_each(?2) new_id JOIN segments new ON new.id=new_id.value
+            WHERE old.model_run_id=?3 AND new.model_run_id=?4
+              AND (old.id=new.id OR min(old.end_ms,new.end_ms)-max(old.start_ms,new.start_ms)>=1000)
+        )",
+    )?;
+    Ok(stmt.query_row(
+        params![old["segment_ids"].to_string(), new["segment_ids"].to_string(), old["model_run_id"].as_i64(), new["model_run_id"].as_i64()],
+        |row| row.get(0),
+    )?)
+}
+
+fn material_links(text: &str) -> impl Iterator<Item = (String, String, String)> + '_ {
+    text.lines().filter_map(|line| {
+        let start = line.match_indices("https://").chain(line.match_indices("http://"))
+            .map(|(start, _)| start).min()?;
+        let raw = line[start..].split(|ch: char| ch.is_whitespace() || matches!(ch, ')' | ']' | '>' | '"' | '`'))
+            .next()?.trim_end_matches(['.', ',', ';']);
+        let link = raw.split(['?', '#']).next()?.trim_end_matches(['.', ',', ';']);
+        let authority = link.split_once("://")?.1.split('/').next()?;
+        if authority.is_empty() || authority.contains('@') || link.len() > 300 || raw.len() > 2000 {
+            return None;
+        }
+        let label = line[..start].trim().trim_matches(|ch: char| !ch.is_alphanumeric());
+        if label.is_empty() { return None; }
+        Some((label.chars().take(140).collect(), link.to_owned(), raw.to_owned()))
+    })
+}
+
+fn recent_task_change(db: &Connection, task: i64) -> Result<Value> {
+    let mut statement = db.prepare_cached(
+        "SELECT previous_json,next_json FROM change_events
+         WHERE entity_type='tasks' AND entity_id=?1 AND previous_json IS NOT NULL ORDER BY id DESC LIMIT 12",
+    )?;
+    let mut rows = statement.query([task])?;
+    let mut changes = serde_json::Map::new();
+    while let Some(row) = rows.next()? {
+        let before: Value = serde_json::from_str(&row.get::<_,String>(0)?)?;
+        let after: Value = serde_json::from_str(&row.get::<_,String>(1)?)?;
+        if !changes.contains_key("due_date") &&
+            (before["due_date"] != after["due_date"] || before["due_time"] != after["due_time"]) {
+            for key in ["due_date", "due_time"] {
+                changes.insert(key.to_owned(), json!({"before":before[key],"after":after[key]}));
+            }
+        }
+        for key in ["assignee_id", "stage_id", "blocked"] {
+            if before[key] != after[key] && !changes.contains_key(key) {
+                changes.insert(key.to_owned(), json!({"before":before[key],"after":after[key]}));
+            }
+        }
+        if changes.len() == 5 { break; }
+    }
+    Ok(if changes.is_empty() { Value::Null } else { json!(changes) })
+}
+
+fn bundle_task_changes(proposals: Vec<Value>, input: &Value) -> Vec<Value> {
+    let mut groups = Vec::new();
+    for task in input["project_tasks"].as_array().into_iter().flatten() {
+        let entries: Vec<_> = proposals.iter().enumerate().filter(|(_,p)| p["task_id"] == task["id"]
+            && matches!(p["kind"].as_str(), Some("change_due" | "change_assignee"))).collect();
+        if ["change_due", "change_assignee"].iter().all(|kind| entries.iter().any(|(_,p)| p["kind"] == *kind)) {
+            groups.push(entries);
+        }
+    }
+    let same_unresolved_task = |deadline: &Value, assignment: &Value| {
+        deadline["kind"] == "change_due" && assignment["kind"] == "change_assignee"
+            && deadline["task_id"].is_null() && assignment["task_id"].is_null()
+            && !deadline["project_id"].is_null() && deadline["project_id"] == assignment["project_id"]
+            && deadline["proposed"]["due_date"].is_string() && assignment["proposed"]["assignee_id"].is_i64()
+            && deadline["candidate_task_ids"].as_array().is_some_and(|due| !due.is_empty()
+                && assignment["candidate_task_ids"].as_array().is_some_and(|owner|
+                    due.len() == owner.len() && due.iter().all(|id| owner.contains(id))))
+            && deadline["source"]["segment_ids"].as_array().is_some_and(|evidence|
+                assignment["source"]["segment_ids"].as_array().is_some_and(|other|
+                    evidence.iter().any(|id| other.contains(id))))
+    };
+    for (index, deadline) in proposals.iter().enumerate().filter(|(_,p)| p["kind"] == "change_due") {
+        let mut assignments = proposals.iter().enumerate().filter(|(_,p)| same_unresolved_task(deadline,p));
+        if let Some((owner_index, assignment)) = assignments.next() {
+            if assignments.next().is_none() && proposals.iter().filter(|p| same_unresolved_task(p,assignment)).count() == 1 {
+                groups.push(vec![(index,deadline),(owner_index,assignment)]);
+            }
+        }
+    }
+    let mut bundled = Vec::new();
+    let mut consumed = std::collections::HashSet::new();
+    for group in groups {
+        consumed.extend(group.iter().map(|(index,_)| *index));
+        let changes: Vec<_> = group.into_iter().map(|(_,proposal)| proposal).collect();
         let mut bundle = changes[0].clone();
         bundle["kind"] = json!("change_task");
+        if bundle["task_id"].is_null() {
+            bundle["title"] = json!("Изменить срок и исполнителя");
+            let baselines: Vec<_> = bundle["candidate_task_ids"].as_array().into_iter().flatten()
+                .filter_map(|id| snapshot_task(input,id.as_i64())).map(|task| json!({
+                    "task_id":task["id"],"base":{"due_date":task["due_date"],
+                        "due_time":task["due_time"],"assignee_id":task["assignee_id"]}
+                })).collect();
+            bundle["candidate_baselines"] = json!(baselines);
+        }
         let mut proposed = json!({});
         let mut conflicts = Vec::new();
         for (kind, keys) in [("change_due", &["due_date", "due_time"][..]), ("change_assignee", &["assignee_id"][..])] {
@@ -114,6 +298,13 @@ fn bundle_task_changes(proposals: Vec<Value>, input: &Value) -> Vec<Value> {
             p["source"]["finding_ids"].as_array().into_iter().flatten().filter_map(Value::as_str)
         }).collect();
         bundle["source"]["finding_ids"] = json!(finding_ids);
+        let mut links = std::collections::BTreeMap::new();
+        for link in changes.iter().flat_map(|p| p["source"]["material_links"].as_array().into_iter().flatten()) {
+            if let Some(id) = link["id"].as_i64() { links.insert(id, link); }
+        }
+        if !links.is_empty() {
+            bundle["source"]["material_links"] = json!(links.values().take(3).collect::<Vec<_>>());
+        }
         if !changes.iter().all(|p| p["source"]["person_id"] == changes[0]["source"]["person_id"]) {
             bundle["source"]["person_id"] = Value::Null;
         }
@@ -126,6 +317,10 @@ fn bundle_task_changes(proposals: Vec<Value>, input: &Value) -> Vec<Value> {
         let mut clarifications: std::collections::BTreeSet<_> = changes.iter()
             .filter_map(|p| p["clarification"].as_str())
             .filter(|text| !text.is_empty()).map(str::to_owned).collect();
+        if bundle["task_id"].is_null() {
+            clarifications.clear();
+            clarifications.insert("Выберите задачу, к которой относятся срок и назначение.".to_owned());
+        }
         if !conflicts.is_empty() {
             clarifications.insert(format!("В протоколе указаны разные значения. Уточните {}.", conflicts.join(" и ")));
         }
@@ -133,10 +328,8 @@ fn bundle_task_changes(proposals: Vec<Value>, input: &Value) -> Vec<Value> {
         bundle["clarification"] = json!(clarifications.into_iter().collect::<Vec<_>>().join("\n"));
         bundled.push(bundle);
     }
-    let mut result: Vec<_> = proposals.into_iter().filter(|p| {
-        !matches!(p["kind"].as_str(), Some("change_due" | "change_assignee"))
-            || !bundled.iter().any(|bundle| bundle["task_id"] == p["task_id"])
-    }).collect();
+    let mut result: Vec<_> = proposals.into_iter().enumerate()
+        .filter_map(|(index,proposal)| (!consumed.contains(&index)).then_some(proposal)).collect();
     result.extend(bundled);
     result
 }
@@ -176,6 +369,15 @@ fn analysis_source(input: &Value, mid: i64, analysis: i64, item: &Value) -> Resu
         if !topic.is_empty() && topic.chars().count() <= 80 { source["topic"] = json!(topic); }
     }
     Ok(source)
+}
+
+fn referenced_materials(input: &Value, item: &Value, project: &Value) -> Vec<Value> {
+    let cited = |id: &Value| item["material_ids"].as_array().is_some_and(|ids| ids.contains(id));
+    input["project_materials"].as_array().into_iter().flatten()
+        .filter(|link| &link["project_id"] == project && cited(&link["id"]))
+        .take(3).map(|link| json!({"id":link["id"],"project_id":link["project_id"],
+            "label":link["label"],"url":link["local_url"].as_str().unwrap_or_else(|| link["url"].as_str().unwrap_or_default())}))
+        .collect()
 }
 
 impl Store {
@@ -222,6 +424,10 @@ impl Store {
     }
 
     pub fn groq_snapshot(&self, mid: i64) -> Result<Value> {
+        self.groq_snapshot_in_projects(mid, ProjectScope::default())
+    }
+
+    fn groq_snapshot_in_projects(&self, mid: i64, scope: ProjectScope<'_>) -> Result<Value> {
         let (title, date, project, demo, status): (String, String, Option<i64>, bool, String) =
             self.0.query_row(
                 "SELECT title,created_at,project_id,is_demo,status FROM meetings WHERE id=?1",
@@ -233,6 +439,31 @@ impl Store {
         }
         if status == "recording" || status == "paused" {
             bail!("Завершите запись перед анализом");
+        }
+        let mut project_ids = Vec::from_iter(project);
+        let mut additional = scope.additional.to_vec();
+        additional.sort_unstable();
+        for id in additional {
+            if !project_ids.contains(&id) { project_ids.push(id); }
+        }
+        if project_ids.len() > 4 { bail!("Выберите до четырёх проектов для анализа встречи"); }
+        let mut analysis_projects = Vec::new();
+        let mut project_materials = Vec::new();
+        for &id in &project_ids {
+            let (title, archived, materials): (String, bool, Option<String>) = self.0.query_row(
+                "SELECT json_extract(data_json,'$.title'),coalesce(json_extract(data_json,'$.archived'),0),
+                        CASE WHEN ?2 THEN json_extract(data_json,'$.materials') END
+                 FROM projects WHERE id=?1 AND is_demo=0",
+                params![id,scope.material_links], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+            ).context("Выбранный проект недоступен для анализа")?;
+            if archived && Some(id) != project { bail!("Проект в архиве. Выберите активный проект"); }
+            analysis_projects.push(json!({"id":id,"title":title}));
+            let mut seen = std::collections::HashSet::new();
+            for (label,url,local_url) in material_links(materials.as_deref().unwrap_or_default())
+                .filter(|(_,_,local_url)| seen.insert(local_url.clone())).take(12) {
+                project_materials.push(json!({"id":project_materials.len()+1,
+                    "project_id":id,"label":label,"url":url,"local_url":local_url}));
+            }
         }
         let t = self.transcript(mid)?;
         let run = t["model_run_id"]
@@ -264,7 +495,7 @@ impl Store {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         let mut earlier = self.0.prepare(
-            "SELECT json_extract(data_json,'$.title'), json_extract(data_json,'$.source.start_ms')
+            "SELECT json_extract(data_json,'$.title'),json_extract(data_json,'$.source.start_ms'),json_extract(data_json,'$.project_id')
              FROM proposals
              WHERE is_demo=0 AND status IN ('pending','accepted')
                AND json_extract(data_json,'$.origin')='groq'
@@ -272,44 +503,63 @@ impl Store {
                AND json_extract(data_json,'$.source.meeting_id')=?1
              ORDER BY id DESC LIMIT 48",
         )?;
-        let discussed_tasks = earlier
+        let discussed_tasks: Vec<_> = earlier
             .query_map([mid], |row| {
-                Ok(json!({"title": row.get::<_, String>(0)?, "start_ms": row.get::<_, Option<i64>>(1)?}))
+                Ok(json!({"title":row.get::<_,String>(0)?,"start_ms":row.get::<_,Option<i64>>(1)?,
+                    "project_id":row.get::<_,Option<i64>>(2)?}))
             })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        let (project_tasks, project_decisions) = if let Some(project) = project {
-            let (project_tasks, active_decisions) = self.analysis_project_context(project)?;
+            .collect::<rusqlite::Result<Vec<_>>>()?.into_iter().filter(|task| {
+                task["project_id"].as_i64().map_or(project_ids.is_empty(), |id| project_ids.contains(&id))
+                    && !task["title"].as_str().is_some_and(administrative_change_title)
+            }).collect();
+        let mut project_tasks = Vec::new();
+        let mut project_decisions = Vec::new();
+        if !project_ids.is_empty() {
             let transcript_terms: std::collections::HashSet<_> = segments.iter()
                 .filter_map(|s| s["text"].as_str()).flat_map(search_terms).collect();
             let explicit_ids: std::collections::HashSet<i64> = segments.iter().filter_map(|s| s["text"].as_str())
                 .flat_map(|text| text.split('#').skip(1))
                 .filter_map(|tail| tail[..tail.find(|ch: char| !ch.is_ascii_digit()).unwrap_or(tail.len())]
                     .parse().ok()).collect();
-            let mut candidates: Vec<_> = project_tasks.iter()
-                .filter(|task| task["stage_kind"] == "active"
-                    || task["id"].as_i64().is_some_and(|id| explicit_ids.contains(&id))).collect();
-            candidates.sort_by_cached_key(|task| {
-                let title_hits = search_terms(task["title"].as_str().unwrap_or(""))
-                    .collect::<std::collections::HashSet<_>>().intersection(&transcript_terms).count();
-                let details_hits = search_terms(task["description"].as_str().unwrap_or(""))
-                    .collect::<std::collections::HashSet<_>>().intersection(&transcript_terms).count();
-                let mentioned = task["id"].as_i64().is_some_and(|id| explicit_ids.contains(&id));
-                std::cmp::Reverse((mentioned, title_hits, details_hits, task["id"].as_i64()))
-            });
-            let tasks: Vec<_> = candidates.into_iter().take(24).map(|task| {
-                let details: String = task["description"].as_str().unwrap_or("").chars().take(240).collect();
-                json!({"id":task["id"],"title":task["title"],"description":details,"revision":task["revision"],
-                    "stage_id":task["stage_id"],"stage_title":task["stage_title"],"stage_kind":task["stage_kind"],
-                    "blocked":task["blocked"],"blocked_reason":task["blocked_reason"],
-                    "due_date":task["due_date"],"due_time":task["due_time"],"assignee_id":task["assignee_id"]})
-            }).collect();
-            let decisions = active_decisions.into_iter()
-                .filter(|decision| tasks.iter().any(|task| task["id"] == decision["task_id"]))
-                .take(12).collect::<Vec<_>>();
-            (tasks, decisions)
-        } else { (Vec::new(), Vec::new()) };
+            let per_project = 24 / project_ids.len();
+            for &context_id in &project_ids {
+                let (context_tasks, active_decisions) = self.analysis_project_context(context_id)?;
+                let prior_changes = previous_change_cards(&self.0,context_id,&context_tasks)?;
+                let mut candidates: Vec<_> = context_tasks.iter()
+                    .filter(|task| task["stage_kind"] == "active"
+                        || task["id"].as_i64().is_some_and(|id| explicit_ids.contains(&id))).collect();
+                candidates.sort_by_cached_key(|task| {
+                    let title_hits = search_terms(task["title"].as_str().unwrap_or(""))
+                        .collect::<std::collections::HashSet<_>>().intersection(&transcript_terms).count();
+                    let details_hits = search_terms(task["description"].as_str().unwrap_or(""))
+                        .collect::<std::collections::HashSet<_>>().intersection(&transcript_terms).count();
+                    let mentioned = task["id"].as_i64().is_some_and(|id| explicit_ids.contains(&id));
+                    let administrative = task["id"].as_i64().is_some_and(|id| prior_changes.contains(&id));
+                    std::cmp::Reverse((mentioned, !administrative, title_hits, details_hits, task["id"].as_i64()))
+                });
+                let tasks: Vec<_> = candidates.into_iter().take(per_project).map(|task| {
+                    let details: String = task["description"].as_str().unwrap_or("").chars().take(240).collect();
+                    let task_id = task["id"].as_i64().context("У задачи нет идентификатора")?;
+                    let recent_change = recent_task_change(&self.0, task_id)?;
+                    let legacy_change_card = prior_changes.contains(&task_id) && !explicit_ids.contains(&task_id);
+                    Ok(json!({"id":task_id,"project_id":context_id,"title":task["title"],"description":details,"revision":task["revision"],
+                        "stage_id":task["stage_id"],"stage_title":task["stage_title"],"stage_kind":task["stage_kind"],
+                        "blocked":task["blocked"],"blocked_reason":task["blocked_reason"],
+                        "related_task_ids":task["related_task_ids"].as_array().map(|items| items.iter().take(8).collect::<Vec<_>>()),
+                        "due_date":task["due_date"],"due_time":task["due_time"],"assignee_id":task["assignee_id"],
+                        "recent_change":recent_change,"legacy_change_card":legacy_change_card}))
+                }).collect::<Result<_>>()?;
+                project_decisions.extend(active_decisions.into_iter()
+                    .filter(|decision| tasks.iter().any(|task| task["id"] == decision["task_id"]))
+                    .take(12 / project_ids.len()));
+                project_tasks.extend(tasks);
+            }
+        }
         let timezone = self.workspace_timezone()?;
-        let value = json!({"meeting_id":mid,"title":title,"created_at":date,"timezone":timezone,"project_id":project,"model_run_id":run,"source_revision":revision(&self.0,mid)?,"participants":people,"segments":segments,"discussed_tasks":discussed_tasks,"project_tasks":project_tasks,"project_decisions":project_decisions});
+        let value = json!({"meeting_id":mid,"title":title,"created_at":date,"timezone":timezone,"project_id":project,
+            "analysis_projects":analysis_projects,"model_run_id":run,"source_revision":revision(&self.0,mid)?,
+            "participants":people,"segments":segments,"discussed_tasks":discussed_tasks,
+            "project_tasks":project_tasks,"project_decisions":project_decisions,"project_materials":project_materials});
         if value.to_string().len() > 350_000 {
             bail!("Транскрипт слишком большой для одного анализа");
         }
@@ -351,11 +601,16 @@ impl Store {
     }
 
     pub fn groq_prepare_run(&self, mid: i64, model: &str, consent: bool, fresh: bool) -> Result<(i64, Value, bool)> {
-        self.prepare_analysis(mid, model, consent, fresh, None, false)
+        self.prepare_analysis(mid, model, consent, fresh, None, false, ProjectScope::default())
+    }
+
+    pub fn groq_prepare_projects(&self, mid: i64, model: &str, consent: bool, force: bool,
+                                 additional: &[i64], material_links: bool) -> Result<(i64, Value, bool)> {
+        self.prepare_analysis(mid, model, consent, true, Some("manual"), force, ProjectScope { additional, material_links })
     }
 
     fn prepare_analysis(&self, mid: i64, model: &str, consent: bool, fresh: bool,
-                        mode: Option<&str>, force: bool) -> Result<(i64, Value, bool)> {
+                        mode: Option<&str>, force: bool, scope: ProjectScope<'_>) -> Result<(i64, Value, bool)> {
         let local = mode == Some("local") && model == local_analysis::MODEL;
         if !consent && !local {
             bail!("Подтвердите отправку текста в Groq");
@@ -363,7 +618,7 @@ impl Store {
         if !local && !valid_model(model) {
             bail!("Неизвестная модель Groq");
         }
-        let mut input = self.groq_snapshot(mid)?;
+        let mut input = self.groq_snapshot_in_projects(mid, scope)?;
         input["analysis_policy"] = json!(ANALYSIS_POLICY);
         if let Some(mode) = mode {
             input["analysis_mode"] = json!(mode);
@@ -388,7 +643,7 @@ impl Store {
                     let previous: Value = serde_json::from_str(&raw)?;
                     let same_context = ["analysis_mode", "analysis_policy", "source_revision"].iter()
                         .all(|key| input[*key] == previous[*key])
-                        && (mode == Some("automatic") || ["project_tasks", "project_decisions"].iter()
+                        && (mode == Some("automatic") || ["analysis_projects", "project_tasks", "project_decisions", "project_materials"].iter()
                             .all(|key| input[*key] == previous[*key]));
                     if previous_model == model && same_context {
                         return Ok((id, input, true));
@@ -497,7 +752,22 @@ impl Store {
                 let quote = source["quote"].as_str().unwrap_or_default().to_owned();
                 let finding_id = format!("{id}:{}", findings.len() + 1);
                 source["finding_ids"] = json!([finding_id]);
-                let mut p = json!({"kind":kind,"title":title,"description":"","project_id":input["project_id"],"assignee_id":null,"due_date":null,"origin":origin,"source":source});
+                let requested_task = item["task_id"].as_i64();
+                let related_task = snapshot_task(&input, item["related_task_id"].as_i64());
+                let target_task = snapshot_task(&input, requested_task);
+                let requested_project = &item["project_id"];
+                let selected_project = result_project(&input, requested_project);
+                let reference = if kind == "create_task" { related_task.or(target_task) } else { target_task };
+                let project = reference.filter(|task| requested_project.is_null() || task["project_id"] == selected_project)
+                    .map(|task| task["project_id"].clone()).unwrap_or(selected_project);
+                let project_required = input["analysis_projects"].as_array().is_some_and(|projects| projects.len() > 1)
+                    || (requested_project.as_i64().is_some() && project.is_null());
+                let mut p = json!({"kind":kind,"title":title,"description":"","project_id":project,
+                    "project_required":project_required,"assignee_id":null,"due_date":null,"origin":origin,"source":source});
+                p["analysis_project_ids"] = json!(input["analysis_projects"].as_array().into_iter()
+                    .flatten().filter_map(|project| project["id"].as_i64()).collect::<Vec<_>>());
+                let links = referenced_materials(&input, item, &project);
+                if !links.is_empty() { p["source"]["material_links"] = json!(links); }
                 if field == "tasks" {
                     p["description"] = json!(bounded(item, "description", 10000, false)?);
                     if !item["needs_clarification"].is_null()
@@ -575,9 +845,25 @@ impl Store {
                         }
                     }
                 }
+                if project_required && project.is_null() {
+                    p["needs_clarification"] = json!(true);
+                    if p["clarification"].as_str().is_none_or(str::is_empty) {
+                        p["clarification"] = json!("Уточните проект этого пункта.");
+                    }
+                }
+                if kind == "decision" {
+                    if let Some(task) = target_task.filter(|task| task["project_id"] == project) {
+                        p["decision_task_ids"] = json!([task["id"]]);
+                    }
+                }
+                let matches_project = |task: &&Value| project.is_null() || task["project_id"] == project;
                 if kind == "create_task" {
+                    if let Some(task) = related_task.filter(|task| task["project_id"] == project) {
+                        p["related_task_id"] = task["id"].clone();
+                    }
                     let title_terms: std::collections::HashSet<_> = search_terms(&title).collect();
                     let candidates: Vec<_> = input["project_tasks"].as_array().into_iter().flatten()
+                        .filter(matches_project)
                         .filter(|task| item["task_id"].as_i64().is_some() && task["id"] == item["task_id"]
                             || task["title"].as_str().is_some_and(|name|
                                 same_action_title(name, &title)
@@ -593,16 +879,17 @@ impl Store {
                     }
                 }
                 if kind.starts_with("change_") {
-                    if let Some(task_id) = item["task_id"].as_i64() {
-                        if let Some(task) = input["project_tasks"].as_array().into_iter().flatten()
-                            .find(|task| task["id"] == task_id)
-                        {
-                            p["task_id"] = json!(task_id);
-                            p["title"] = task["title"].clone();
-                        }
+                    let candidates = change_candidates(&input, &project, &title, &quote);
+                    let target_was_change_card = target_task.is_some_and(|task| task["legacy_change_card"] == true)
+                        && !candidates.is_empty();
+                    if let Some(task) = target_task.filter(|task| task["project_id"] == project && !target_was_change_card) {
+                        p["task_id"] = task["id"].clone();
+                        p["title"] = task["title"].clone();
                     }
-                    if p["task_id"].is_null() && p["needs_clarification"] != true {
+                    if p["task_id"].is_null() && p["needs_clarification"] != true && requested_task.is_none() {
                         let mut matches = input["project_tasks"].as_array().into_iter().flatten()
+                            .filter(matches_project)
+                            .filter(|task| task["legacy_change_card"] != true)
                             .filter(|task| task["title"].as_str().is_some_and(|name| same_action_title(name, &title)));
                         if let Some(task) = matches.next() {
                             if matches.next().is_none() {
@@ -612,12 +899,13 @@ impl Store {
                         }
                     }
                     if p["task_id"].is_null() {
-                        let words: std::collections::HashSet<_> = search_terms(&title).chain(search_terms(&quote)).collect();
-                        let candidates: Vec<_> = input["project_tasks"].as_array().into_iter().flatten()
-                            .filter(|task| task["title"].as_str().is_some_and(|name|
-                                search_terms(name).any(|word| words.contains(&word))))
-                            .take(6).map(|task| &task["id"]).collect();
-                        p["candidate_task_ids"] = json!(candidates);
+                        p["candidate_task_ids"] = json!(candidates.iter().map(|task| &task["id"]).collect::<Vec<_>>());
+                        if requested_task.is_some() {
+                            p["needs_clarification"] = json!(true);
+                            if p["clarification"].as_str().is_none_or(str::is_empty) {
+                                p["clarification"] = json!("Уточните, к какой задаче относится изменение.");
+                            }
+                        }
                     }
                 }
                 match kind {
@@ -639,7 +927,7 @@ impl Store {
                     "change_blocked" => "blocker", _ => "task_update",
                 };
                 findings.push(json!({"id":finding_id,"kind":finding_kind,"text":title,
-                    "status":"review","source":p["source"],"project_id":input["project_id"],"task_id":p["task_id"]}));
+                    "status":"review","source":p["source"],"project_id":p["project_id"],"task_id":p["task_id"]}));
                 let mut changes = Vec::new();
                 if kind == "change_due" && item["assignee_name"].as_str().is_some_and(|name| !name.trim().is_empty()) {
                     let mut assignment = p.clone();
@@ -663,7 +951,7 @@ impl Store {
                         }
                         _ => {}
                     }
-                    let identity = json!([proposal["kind"], proposal["task_id"], proposal["title"],
+                    let identity = json!([proposal["kind"], proposal["project_id"], proposal["task_id"], proposal["title"],
                                           proposal["assignee_id"], proposal["due_date"], proposal["due_time"],
                                           proposal["proposed"], proposal["source"]["segment_ids"]]);
                     if seen.insert(identity.to_string()) {
@@ -680,22 +968,28 @@ impl Store {
                     .filter(|kind| ["status_update", "question", "information"].contains(kind))
                     .context("Неизвестный тип наблюдения")?;
                 let text = bounded(item, "text", 4000, true)?;
-                let source = analysis_source(&input, mid, id, item)?;
-                let task_id = item["task_id"].as_i64().filter(|task_id| {
-                    input["project_tasks"].as_array().into_iter().flatten().any(|task| task["id"] == *task_id)
+                let mut source = analysis_source(&input, mid, id, item)?;
+                let project = result_project(&input, &item["project_id"]);
+                let task = snapshot_task(&input, item["task_id"].as_i64()).filter(|task| {
+                    item["project_id"].is_null() || task["project_id"] == project
                 });
+                let project = task.map(|task| task["project_id"].clone()).unwrap_or(project);
+                let links = referenced_materials(&input, item, &project);
+                if !links.is_empty() { source["material_links"] = json!(links); }
                 findings.push(json!({"id":format!("{id}:{}",findings.len()+1),"kind":kind,"text":text,
-                    "status":"recorded","source":source,"task_id":task_id,"project_id":input["project_id"]}));
+                    "status":"recorded","source":source,"task_id":task.map(|task| &task["id"]),
+                    "project_id":project}));
             }
         }
-        tx.execute(
-            "UPDATE proposals
-             SET status='rejected',data_json=json_set(data_json,'$.superseded_by_analysis_id',?2)
-             WHERE is_demo=0 AND status='pending'
-               AND json_extract(data_json,'$.origin')=?3
-               AND json_extract(data_json,'$.source.meeting_id')=?1",
-            params![mid,id,origin],
+        let mut statement = tx.prepare(
+            "SELECT id,data_json FROM proposals WHERE is_demo=0 AND status='pending'
+             AND json_extract(data_json,'$.origin')=?2 AND json_extract(data_json,'$.source.meeting_id')=?1",
         )?;
+        let previous_pending = statement.query_map(params![mid,origin], |row| {
+            Ok((row.get::<_,i64>(0)?,row.get::<_,String>(1)?))
+        })?.collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+        let mut kept = std::collections::HashSet::new();
         for mut p in bundle_task_changes(proposals, &input) {
             if p["task_id"].is_null() && p["needs_clarification"] != true
                 && matches!(p["kind"].as_str(), Some("change_due" | "change_assignee" | "change_status" | "change_blocked")) {
@@ -703,9 +997,10 @@ impl Store {
                     "SELECT json_extract(data_json,'$.title'), json_extract(data_json,'$.confirmed_task_id')
                      FROM proposals WHERE is_demo=0 AND status='accepted'
                        AND json_extract(data_json,'$.kind')='create_task'
-                       AND json_extract(data_json,'$.source.meeting_id')=?1",
+                       AND json_extract(data_json,'$.source.meeting_id')=?1
+                       AND json_extract(data_json,'$.project_id') IS ?2",
                 )?;
-                let mut rows = confirmed.query([mid])?;
+                let mut rows = confirmed.query(params![mid,p["project_id"].as_i64()])?;
                 let mut matched_tasks = std::collections::HashSet::new();
                 while let Some(row) = rows.next()? {
                     let title: Option<String> = row.get(0)?;
@@ -743,31 +1038,35 @@ impl Store {
                 }
             }
             let mut candidates = tx.prepare(
-                "SELECT data_json FROM proposals WHERE is_demo=0 AND status IN ('accepted','pending') AND json_extract(data_json,'$.origin') IN ('groq','local_analysis') AND json_extract(data_json,'$.source.meeting_id')=?1 AND json_extract(data_json,'$.kind')=?2",
+                "SELECT id,status,data_json FROM proposals WHERE is_demo=0 AND status IN ('accepted','pending')
+                 AND json_extract(data_json,'$.origin') IN ('groq','local_analysis')
+                 AND json_extract(data_json,'$.source.meeting_id')=?1 AND json_extract(data_json,'$.kind')=?2
+                 ORDER BY status,id",
             )?;
-            let mut rows = candidates.query(params![mid, p["kind"].as_str()])?;
+            let rows = candidates.query_map(params![mid,p["kind"].as_str()], |row| {
+                Ok((row.get::<_,i64>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?))
+            })?.collect::<rusqlite::Result<Vec<_>>>()?;
             let mut duplicate = false;
-            while let Some(row) = rows.next()? {
-                let old: Value = serde_json::from_str(&row.get::<_, String>(0)?)?;
-                if !old["task_id"].is_null() && !p["task_id"].is_null() && old["task_id"] != p["task_id"] {
-                    continue;
-                }
-                let same_commitment = ["project_id", "assignee_id", "due_date", "due_time", "proposed"]
+            for (previous_id, status, raw) in rows {
+                let old: Value = serde_json::from_str(&raw)?;
+                if !same_proposal_context(&tx, &old, &p)? { continue; }
+                let same_commitment = ["assignee_id", "due_date", "due_time", "proposed",
+                    "related_task_id", "decision_task_ids"]
                     .iter()
                     .all(|field| old[*field] == p[*field]);
-                let same_evidence = old["source"]["quote"] == p["source"]["quote"];
-                let nearby = old["source"]["start_ms"]
-                        .as_u64()
-                        .zip(p["source"]["start_ms"].as_u64())
-                        .is_some_and(|(a, b)| a.abs_diff(b) <= 10_000);
-                if ((same_evidence && (p["kind"] != "change_task" || same_commitment)) || (same_commitment && nearby))
-                    && old["title"]
-                    .as_str()
-                    .zip(p["title"].as_str())
-                    .is_some_and(|(a, b)| same_action_title(a, b))
-                {
+                let has_draft = old["review_draft"].is_object();
+                if same_commitment && (!has_draft || old["description"] == p["description"]) {
+                    if status == "pending" && old["origin"] == origin {
+                        kept.insert(previous_id);
+                        if !has_draft {
+                            tx.execute("UPDATE proposals SET data_json=?2 WHERE id=?1", params![previous_id,p.to_string()])?;
+                        }
+                    }
                     duplicate = true;
                     break;
+                }
+                if status == "pending" && old["origin"] == origin && has_draft {
+                    p["replaces_draft_id"] = json!(previous_id);
                 }
             }
             if duplicate {
@@ -777,6 +1076,23 @@ impl Store {
                 "INSERT INTO proposals(data_json,is_demo) VALUES (?1,0)",
                 [p.to_string()],
             )?;
+        }
+        let project_ids: Vec<_> = input["analysis_projects"].as_array().into_iter().flatten()
+            .filter_map(|project| project["id"].as_i64()).collect();
+        for (proposal_id, raw) in previous_pending {
+            if kept.contains(&proposal_id) { continue; }
+            let proposal: Value = serde_json::from_str(&raw)?;
+            let in_scope = if let Some(project) = proposal["project_id"].as_i64() {
+                project_ids.contains(&project)
+            } else {
+                proposal["analysis_project_ids"].as_array().into_iter().flatten()
+                    .filter_map(Value::as_i64).all(|project| project_ids.contains(&project))
+            };
+            if in_scope {
+                tx.execute("UPDATE proposals SET status='rejected',
+                    data_json=json_set(data_json,'$.superseded_by_analysis_id',?2) WHERE id=?1",
+                    params![proposal_id,id])?;
+            }
         }
         let mut saved = result.clone();
         saved["findings"] = json!(findings);
@@ -1082,7 +1398,7 @@ impl GroqWorker {
             if self.job.is_some() { bail!("Дождитесь завершения анализа совещания"); }
             let mid = data["meeting_id"].as_i64().context("Выберите встречу")?;
             let (id, input, cached) =
-                store.prepare_analysis(mid, local_analysis::MODEL, false, true, Some("local"), false)?;
+                store.prepare_analysis(mid, local_analysis::MODEL, false, true, Some("local"), false, ProjectScope::default())?;
             if !cached {
                 if let Err(error) = store.groq_complete(id, &local_analysis::analyze(&input)) {
                     store.0.execute("UPDATE meeting_analyses SET state='failed',error=?2,
@@ -1110,7 +1426,17 @@ impl GroqWorker {
         let mid = data["meeting_id"].as_i64().context("Выберите встречу")?;
         let force = !incremental && data["force"] == true;
         let mode = if incremental { "automatic" } else { "manual" };
-        let (id, input, cached) = store.prepare_analysis(mid, model, data["consent"] == true, true, Some(mode), force)?;
+        let additional = if !incremental && !data["project_ids"].is_null() {
+            data["project_ids"].as_array().filter(|values| values.len() <= 4)
+                .context("Некорректный список проектов анализа")?.iter()
+                .map(|value| value.as_i64().filter(|id| *id > 0).context("Некорректный проект анализа"))
+                .collect::<Result<Vec<_>>>()?
+        } else { Vec::new() };
+        let (id, input, cached) = if incremental {
+            store.prepare_analysis(mid, model, data["consent"] == true, true, Some(mode), false, ProjectScope::default())?
+        } else {
+            store.groq_prepare_projects(mid, model, data["consent"] == true, force, &additional, data["include_material_links"] == true)?
+        };
         if cached {
             return Ok(json!({"id":id,"cached":true}));
         }

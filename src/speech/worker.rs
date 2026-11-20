@@ -28,7 +28,7 @@ impl Default for SpeechWorker {
 }
 impl SpeechWorker {
     pub(crate) fn config(&self) -> Result<SpeechConfig> {
-        let mut config = SpeechConfig::from_env()?;
+        let mut config = SpeechConfig::from_env_with_speaker_detection(self.speaker_detection_enabled())?;
         if let Some(path) = self.settings["local_model"]
             .as_str()
             .filter(|v| !v.is_empty())
@@ -36,6 +36,10 @@ impl SpeechWorker {
             config.model = PathBuf::from(path);
         }
         Ok(config)
+    }
+
+    pub(crate) fn speaker_detection_enabled(&self) -> bool {
+        self.settings["speaker_detection"] != false
     }
     pub fn status(&self) -> Value {
         {

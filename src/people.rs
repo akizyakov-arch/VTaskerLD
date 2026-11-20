@@ -2,7 +2,55 @@
 use crate::Store;
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 impl Store {
+    pub(crate) fn reviewed_speaker_groups(
+        &self, run: i64, turns: &[Value],
+    ) -> Result<HashMap<String, (i64, String)>> {
+        struct Review {
+            person: i64,
+            name: String,
+            end: u64,
+            independent: usize,
+            covered_ms: u64,
+            conflict: bool,
+        }
+        let mut statement = self.0.prepare(
+            "SELECT s.start_ms,s.end_ms,a.person_id,p.name
+             FROM segments s JOIN segment_assignments a ON a.model_run_id=s.model_run_id AND a.segment_id=s.id
+             JOIN people p ON p.id=a.person_id
+             WHERE s.model_run_id=?1 AND a.id=(
+                 SELECT max(last.id) FROM segment_assignments last
+                 WHERE last.model_run_id=s.model_run_id AND last.segment_id=s.id)
+             ORDER BY s.start_ms,s.id",
+        )?;
+        let selected = statement.query_map([run], |row| Ok((
+            row.get::<_, u64>(0)?, row.get::<_, u64>(1)?,
+            row.get::<_, i64>(2)?, row.get::<_, String>(3)?,
+        )))?;
+        let mut groups = HashMap::<String, Review>::new();
+        for row in selected {
+            let (start, end, person, name) = row?;
+            let attribution = crate::diarization::attribution(start, end, turns);
+            let Some(candidate) = crate::diarization::dominant_speaker_candidate(start, end, &attribution) else { continue; };
+            let speaker = candidate["speaker_id"].as_str().unwrap();
+            let duration = candidate["overlap_ms"].as_u64().unwrap_or_default();
+            let review = groups.entry(speaker.to_owned()).or_insert(Review {
+                person, name, end: 0, independent: 0, covered_ms: 0, conflict: false,
+            });
+            if review.person != person { review.conflict = true; }
+            if start >= review.end {
+                review.independent += 1;
+                review.covered_ms += duration;
+            }
+            review.end = review.end.max(end);
+        }
+        Ok(groups.into_iter().filter_map(|(speaker, review)| {
+            (!review.conflict && review.independent >= 2 && review.covered_ms >= 6_000)
+                .then_some((speaker, (review.person, review.name)))
+        }).collect())
+    }
+
     pub fn person_photo(&self, id: i64) -> Result<Option<Vec<u8>>> {
         use rusqlite::OptionalExtension;
         Ok(self.0.query_row("SELECT photo FROM person_profiles WHERE person_id=?1", [id],
@@ -26,6 +74,10 @@ impl Store {
     }
 
     pub fn assign_speaker(&self, run: i64, speaker: &str, person: Option<i64>) -> Result<i64> {
+        self.assign_speaker_from_segment(run, speaker, person, None)
+    }
+
+    pub fn assign_speaker_from_segment(&self, run: i64, speaker: &str, person: Option<i64>, segment: Option<i64>) -> Result<i64> {
         let tx = self.0.unchecked_transaction()?;
         let valid: bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM speaker_turns t JOIN model_runs m ON m.id=t.model_run_id WHERE t.model_run_id=?1 AND t.speaker_id=?2 AND m.status='completed')",rusqlite::params![run,speaker],|r|r.get(0))?;
         if !valid {
@@ -48,6 +100,29 @@ impl Store {
             rusqlite::params![run, speaker, person],
         )?;
         let id = tx.last_insert_rowid();
+        if let Some(segment) = segment {
+            let (start, end): (u64, u64) = tx.query_row(
+                "SELECT start_ms,end_ms FROM segments WHERE model_run_id=?1 AND id=?2",
+                rusqlite::params![run, segment], |row| Ok((row.get(0)?, row.get(1)?)),
+            ).context("Реплика не найдена в этой версии протокола")?;
+            let mut statement = tx.prepare(
+                "SELECT start_ms,end_ms,speaker_id FROM speaker_turns
+                 WHERE model_run_id=?1 AND start_ms<?3 AND end_ms>?2",
+            )?;
+            let turns = statement.query_map(rusqlite::params![run, start, end], |row| Ok(json!({
+                "start_ms":row.get::<_,u64>(0)?,"end_ms":row.get::<_,u64>(1)?,"speaker_id":row.get::<_,String>(2)?
+            })))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            if crate::diarization::attribution(start, end, &turns)["speaker_id"] != speaker {
+                bail!("Реплика не относится однозначно к выбранному голосу");
+            }
+            let overridden: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM segment_assignments WHERE model_run_id=?1 AND segment_id=?2)",
+                rusqlite::params![run, segment], |row| row.get(0),
+            )?;
+            if overridden {
+                self.assign_segment(run, segment, person)?;
+            }
+        }
         tx.commit()?;
         Ok(id)
     }

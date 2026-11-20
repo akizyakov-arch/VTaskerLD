@@ -63,6 +63,10 @@ pub(crate) fn normalize(values: &[f64]) -> Result<Vec<f64>> {
     Ok(values.iter().map(|v| v / norm).collect())
 }
 pub(crate) fn quality(path: &Path) -> Result<Value> {
+    voice_quality(path, 6.0)
+}
+
+pub(crate) fn voice_quality(path: &Path, minimum_seconds: f64) -> Result<Value> {
     let mut wav = hound::WavReader::open(path)?;
     let spec = wav.spec();
     if spec.channels != 1
@@ -73,8 +77,8 @@ pub(crate) fn quality(path: &Path) -> Result<Value> {
         bail!("Нужен mono PCM16 WAV 16 кГц");
     }
     let seconds = wav.duration() as f64 / 16000.0;
-    if !(6.0..=60.0).contains(&seconds) {
-        bail!("Образец должен содержать от 6 до 60 секунд речи одного человека");
+    if !(minimum_seconds..=60.0).contains(&seconds) {
+        bail!("Образец должен содержать от {minimum_seconds} до 60 секунд речи одного человека");
     }
     let mut squares = 0.0;
     let mut clipped = 0usize;
@@ -99,16 +103,72 @@ pub(crate) fn quality(path: &Path) -> Result<Value> {
         json!({"duration_seconds":seconds,"rms":rms,"clipped_fraction":clipping,"audible_fraction":audible as f64/count as f64,"check":"technical-only-single-speaker-confirmed-by-user"}),
     )
 }
-const MAX_VOICE_SAMPLES: i64 = 3;
+const MAX_MANUAL_VOICE_SAMPLES: i64 = 3;
+pub(crate) const MEETING_VOICE_LIMIT_MS: i64 = 60_000;
 
-pub(crate) fn require_voice_sample_slot(db: &rusqlite::Connection, person: i64) -> Result<()> {
-    let occupied: i64 = db.query_row(
-        "SELECT (SELECT COUNT(*) FROM voice_samples WHERE person_id=?1)
-              + (SELECT COUNT(*) FROM voice_jobs WHERE person_id=?1 AND state IN ('pending','running'))",
-        [person], |row| row.get(0),
+#[derive(Default)]
+struct VoiceSampleUsage {
+    person_id: i64,
+    manual_samples: i64,
+    pending_manual_samples: i64,
+    meeting_ms: i64,
+    pending_meeting_ms: i64,
+}
+
+fn voice_sample_usage(
+    db: &rusqlite::Connection,
+    person: Option<i64>,
+) -> Result<Vec<VoiceSampleUsage>> {
+    // A source plan is persisted for meeting excerpts. Use its duration for
+    // reservations and saved samples so completing a job keeps the same usage.
+    let mut stmt = db.prepare(
+        "WITH usage AS (
+            SELECT j.person_id, j.source_json IS NULL AS manual, 0 AS pending,
+                   coalesce(json_extract(j.source_json,'$.duration_ms'),
+                            CAST(round(json_extract(s.quality_json,'$.duration_seconds') * 1000) AS INTEGER),
+                            0) AS duration_ms
+            FROM voice_samples s JOIN voice_jobs j ON j.id=s.job_id
+            JOIN voice_consents c ON c.id=s.consent_id AND c.revoked_at IS NULL
+            WHERE (?1 IS NULL OR s.person_id=?1)
+            UNION ALL
+            SELECT j.person_id, j.source_json IS NULL, 1,
+                   coalesce(json_extract(j.source_json,'$.duration_ms'),0)
+            FROM voice_jobs j JOIN voice_consents c ON c.id=j.consent_id AND c.revoked_at IS NULL
+            WHERE j.state IN ('pending','running') AND (?1 IS NULL OR j.person_id=?1)
+         )
+         SELECT person_id, sum(manual AND NOT pending), sum(manual AND pending),
+                sum(CASE WHEN NOT manual AND NOT pending THEN duration_ms ELSE 0 END),
+                sum(CASE WHEN NOT manual AND pending THEN duration_ms ELSE 0 END)
+         FROM usage GROUP BY person_id",
     )?;
-    if occupied >= MAX_VOICE_SAMPLES {
-        bail!("На участника можно сохранить до {MAX_VOICE_SAMPLES} голосовых образцов, включая образцы в обработке");
+    let rows = stmt.query_map([person], |row| {
+        Ok(VoiceSampleUsage {
+            person_id: row.get(0)?,
+            manual_samples: row.get(1)?,
+            pending_manual_samples: row.get(2)?,
+            meeting_ms: row.get(3)?,
+            pending_meeting_ms: row.get(4)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+pub(crate) fn require_voice_sample_capacity(
+    db: &rusqlite::Connection,
+    person: i64,
+    source: Option<&Value>,
+) -> Result<()> {
+    let usage = voice_sample_usage(db, Some(person))?.pop().unwrap_or_default();
+    if let Some(source) = source {
+        let duration = source["duration_ms"].as_i64()
+            .filter(|duration| *duration > 0)
+            .context("Не удалось определить длительность образца из совещания")?;
+        let remaining = (MEETING_VOICE_LIMIT_MS - usage.meeting_ms - usage.pending_meeting_ms).max(0);
+        if duration > remaining {
+            bail!("В профиле можно хранить до 60 секунд из совещаний. С учётом обработки осталось {:.1} с. Выберите более короткий отрывок", remaining as f64 / 1000.0);
+        }
+    } else if usage.manual_samples + usage.pending_manual_samples >= MAX_MANUAL_VOICE_SAMPLES {
+        bail!("В карточке участника можно сохранить до {MAX_MANUAL_VOICE_SAMPLES} голосовых образцов, включая образцы в обработке");
     }
     Ok(())
 }
@@ -145,7 +205,7 @@ impl Store {
             std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))?;
         }
         let tx = self.0.unchecked_transaction()?;
-        require_voice_sample_slot(&tx, person)?;
+        require_voice_sample_capacity(&tx, person, None)?;
         tx.execute(
             "INSERT INTO voice_consents(person_id) VALUES (?1)",
             [person],
@@ -192,9 +252,22 @@ impl Store {
         let jobs:Vec<Value>=stmt.query_map([],|r|Ok(json!({"id":r.get::<_,i64>(0)?,"person_id":r.get::<_,i64>(1)?,"state":r.get::<_,String>(2)?,"error":r.get::<_,Option<String>>(3)?,"created_at":r.get::<_,String>(4)?})))?.collect::<rusqlite::Result<_>>()?;
         let mut stmt=self.0.prepare("SELECT j.id,j.model_run_id,m.meeting_id,j.state,j.error,j.created_at FROM voice_match_jobs j JOIN model_runs m ON m.id=j.model_run_id ORDER BY j.id DESC LIMIT 50")?;
         let match_jobs:Vec<Value>=stmt.query_map([],|r|Ok(json!({"id":r.get::<_,i64>(0)?,"model_run_id":r.get::<_,i64>(1)?,"meeting_id":r.get::<_,i64>(2)?,"state":r.get::<_,String>(3)?,"error":r.get::<_,Option<String>>(4)?,"created_at":r.get::<_,String>(5)?})))?.collect::<rusqlite::Result<_>>()?;
-        Ok(
-            json!({"profiles":profiles,"sample_limit":MAX_VOICE_SAMPLES,"jobs":jobs,"match_jobs":match_jobs,"settings":self.voice_matching_settings()?}),
-        )
+        let usage: Vec<Value> = voice_sample_usage(&self.0, None)?.into_iter().map(|item| json!({
+            "person_id": item.person_id,
+            "manual_samples": item.manual_samples,
+            "pending_manual_samples": item.pending_manual_samples,
+            "meeting_ms": item.meeting_ms,
+            "pending_meeting_ms": item.pending_meeting_ms,
+        })).collect();
+        Ok(json!({
+            "profiles": profiles,
+            "sample_limit": MAX_MANUAL_VOICE_SAMPLES,
+            "meeting_sample_limit_ms": MEETING_VOICE_LIMIT_MS,
+            "sample_usage": usage,
+            "jobs": jobs,
+            "match_jobs": match_jobs,
+            "settings": self.voice_matching_settings()?
+        }))
     }
     pub fn voice_busy(&self) -> Result<bool> {
         Ok(self.0.query_row(
@@ -224,13 +297,9 @@ impl Store {
         let wav = scratch.join("sample.wav");
         let published = root.join(format!("sample-{id}.wav"));
         let outcome = (|| -> Result<()> {
+            let source: Option<Value> = source.as_deref().map(serde_json::from_str).transpose()?;
             if let Some(source) = &source {
-                self.prepare_voice_excerpt(
-                    &serde_json::from_str::<Value>(source)?,
-                    &wav,
-                    scratch,
-                    config,
-                )?;
+                self.prepare_voice_excerpt(source, &wav, scratch, config)?;
             } else {
                 run_command(
                     Command::new(&config.ffmpeg)
@@ -318,6 +387,9 @@ impl Store {
                 "UPDATE voice_jobs SET state='completed',input_path='' WHERE id=?1",
                 [id],
             )?;
+            if let Some(source_run) = source.as_ref().and_then(|v| v["model_run_id"].as_i64()) {
+                self.refresh_voice_matches_after_enrollment(source_run, person)?;
+            }
             tx.commit()?;
             let _ = std::fs::remove_file(&input);
             Ok(())
@@ -364,12 +436,13 @@ impl Store {
     }
     pub fn retry_voice(&self, id: i64) -> Result<()> {
         let tx = self.0.unchecked_transaction()?;
-        let person: i64 = tx.query_row(
-            "SELECT j.person_id FROM voice_jobs j JOIN voice_consents c ON c.id=j.consent_id
+        let (person, source): (i64, Option<String>) = tx.query_row(
+            "SELECT j.person_id,j.source_json FROM voice_jobs j JOIN voice_consents c ON c.id=j.consent_id
              WHERE j.id=?1 AND j.state='failed' AND c.revoked_at IS NULL",
-            [id], |row| row.get(0),
+            [id], |row| Ok((row.get(0)?, row.get(1)?)),
         ).context("Задание не найдено, не завершилось ошибкой или согласие отозвано")?;
-        require_voice_sample_slot(&tx, person)?;
+        let source: Option<Value> = source.as_deref().map(serde_json::from_str).transpose()?;
+        require_voice_sample_capacity(&tx, person, source.as_ref())?;
         tx.execute("UPDATE voice_jobs SET state='pending',error=NULL WHERE id=?1", [id])?;
         tx.commit()?;
         Ok(())
@@ -401,9 +474,8 @@ impl VoiceWorker {
     }
     pub fn poll(&mut self, db: &Path, store: &Store, can_start: bool) -> Result<()> {
         if let Some(child) = self.child.as_mut() {
-            if self
-                .started
-                .is_some_and(|t| t.elapsed() > Duration::from_secs(65))
+            let timeout = if self.kind.as_deref() == Some("match") { 900 } else { 65 };
+            if self.started.is_some_and(|t| t.elapsed() > Duration::from_secs(timeout))
             {
                 crate::live::kill_group(child);
             }

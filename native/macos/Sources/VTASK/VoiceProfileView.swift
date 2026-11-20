@@ -31,9 +31,17 @@ struct VoiceStatus: Decodable, Equatable {
     struct Data: Decodable, Equatable {
         let profiles: [Profile]
         let sampleLimit: Int?
+        let meetingSampleLimitMs: Int?
+        let sampleUsage: [SampleUsage]?
         let jobs: [Job]
         let matchJobs: [MatchJob]?
         let settings: VoiceMatchingSettings?
+
+        func meetingCapacity(for personID: Int) -> MeetingCapacity? {
+            guard let limit = meetingSampleLimitMs else { return nil }
+            let usage = sampleUsage?.first { $0.personId == personID }
+            return MeetingCapacity(saved: usage?.meetingMs ?? 0, pending: usage?.pendingMeetingMs ?? 0, limit: limit)
+        }
 
         struct MatchJob: Decodable, Equatable {
             let id: Int
@@ -43,12 +51,47 @@ struct VoiceStatus: Decodable, Equatable {
         }
     }
 
+    struct SampleUsage: Decodable, Equatable {
+        let personId: Int
+        let manualSamples: Int
+        let pendingManualSamples: Int
+        let meetingMs: Int
+        let pendingMeetingMs: Int
+    }
+
+    struct MeetingCapacity {
+        let saved: Int
+        let pending: Int
+        let limit: Int
+        var remaining: Int { max(0, limit - saved - pending) }
+
+        var label: String {
+            let savedTime = Self.seconds(saved)
+            let limitTime = Self.seconds(limit)
+            return pending == 0 ? "\(savedTime) из \(limitTime) с" :
+                "\(savedTime) из \(limitTime) с · ещё \(Self.seconds(pending)) с в обработке"
+        }
+
+        func blocker(for duration: Int) -> String? {
+            guard duration > remaining else { return nil }
+            if remaining < 6_000 {
+                return "На новый образец из совещаний нужно минимум 6 с. Осталось \(Self.seconds(remaining)) с."
+            }
+            return "Для образца из совещаний осталось \(Self.seconds(remaining)) с. Выберите более короткий отрывок."
+        }
+
+        private static func seconds(_ milliseconds: Int) -> String {
+            (Double(milliseconds) / 1_000).formatted(.number.precision(.fractionLength(0...1)))
+        }
+    }
+
     struct Profile: Decodable, Equatable {
         let personId: Int
         let sampleCount: Int
     }
 
     struct Job: Decodable, Equatable {
+        let id: Int
         let personId: Int
         let state: String
         let error: String?
@@ -76,8 +119,14 @@ struct VoiceProfileView: View {
             if let status {
                 let profiles = status.voiceData.profiles.filter { $0.personId == person.id }
                 let count = profiles.reduce(0) { $0 + $1.sampleCount }
-                let limit = status.voiceData.sampleLimit
-                LabeledContent("Образцы в профиле", value: limit.map { "\(count) из \($0)" } ?? String(count))
+                let usage = status.voiceData.sampleUsage?.first { $0.personId == person.id }
+                let manualCount = usage?.manualSamples ?? (status.voiceData.sampleUsage == nil ? count : 0)
+                let manualLimit = status.voiceData.sampleLimit
+                let manualSlotsFull = manualLimit.map { manualCount + (usage?.pendingManualSamples ?? 0) >= $0 } ?? false
+                LabeledContent("Образцы из карточки", value: manualLimit.map { "\(manualCount) из \($0)" } ?? String(manualCount))
+                if let capacity = status.voiceData.meetingCapacity(for: person.id) {
+                    LabeledContent("Реплики из совещаний", value: capacity.label)
+                }
                 if let job = status.voiceData.jobs.first(where: { $0.personId == person.id }) {
                     if job.state == "pending" || job.state == "running" {
                         Text("Создаётся голосовой профиль…")
@@ -90,6 +139,9 @@ struct VoiceProfileView: View {
                     } else {
                         Text("Открыт образец другого участника.")
                     }
+                } else if manualSlotsFull {
+                    Text("Места для образцов из карточки заняты, включая образцы в обработке.")
+                        .font(.caption).foregroundStyle(.secondary)
                 } else {
                     Toggle("Участник согласен на запись и создание голосового профиля", isOn: $consent)
                     Text("Прочитайте каждую фразу обычным голосом и сделайте паузу примерно на полторы секунды.")
@@ -234,14 +286,15 @@ struct VoiceMatchingSettingsForm: View {
             Section("Сопоставление голосов") {
                 if let error { Text(error).foregroundStyle(.red) }
                 if loaded {
-                    Toggle("Искать совпадения после распознавания", isOn: $enabled)
+                    Toggle("Автоматически назначать говорящих по голосовым профилям", isOn: $enabled)
                     Stepper(value: $threshold, in: 0.50...0.99, step: 0.01) {
                         Text("Порог сходства · \(threshold, specifier: "%.2f")")
                     }
                     Stepper(value: $margin, in: 0.05...0.50, step: 0.01) {
                         Text("Отрыв от второго кандидата · \(margin, specifier: "%.2f")")
                     }
-                    Text("Подсказки по именам подтверждаются в протоколе.").foregroundStyle(.secondary)
+                    Text("Уверенные совпадения подписываются автоматически. Ручные назначения имеют приоритет.")
+                        .foregroundStyle(.secondary)
                     Button("Сохранить параметры голосов") {
                         Task {
                             await model.command(["enabled": enabled,

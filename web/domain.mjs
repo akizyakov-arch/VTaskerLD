@@ -53,7 +53,9 @@ export function transcriptParagraphs(segments) {
  let current, previous;
  for(const segment of segments){
   if(!segment.text?.trim())continue;
-  const speaker=orbitIdentity(segment);
+  const suggested=segment.voice_suggestion?.status==='candidate'?segment.voice_suggestion.person_id:null;
+  const speaker=segment.overlap_label?'overlap:'+segment.overlap_label:
+   segment.person_id==null&&suggested!=null?'person:'+suggested:orbitIdentity(segment);
   const pause=previous ? segment.start_ms-previous.end_ms : 0;
   if(!current||speaker!==current.speaker||pause>=1600||(current.length>=420&&/[.!?…]$/.test(previous.text.trim()))||current.length>=850){
    current={speaker,segments:[],length:0};paragraphs.push(current);

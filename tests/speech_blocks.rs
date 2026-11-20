@@ -42,14 +42,24 @@ fn live_blocks_are_reused_by_final_processing_and_keep_speaker_labels() {
     std::fs::write(
         &engine,
         r#"#!/usr/bin/env python3
-import json,sys,pathlib,wave
+import json,sys,pathlib,time,wave
+root=pathlib.Path(__file__).parent
 for line in sys.stdin:
     request=json.loads(line)
+    if (root/'check-parallel').exists():
+        current,other=('whisper','speaker') if 'pcm' in request else ('speaker','whisper')
+        (root/current).touch()
+        deadline=time.monotonic()+5
+        while not (root/other).exists():
+            if time.monotonic()>deadline:
+                raise RuntimeError('inference workers did not overlap')
+            time.sleep(0.01)
     if 'pcm' in request:
         path=pathlib.Path(request['pcm'])
         duration=path.stat().st_size//64
         result={'transcription':[{'text':'Речь','offsets':{'from':0,'to':duration}}]}
     else:
+        (root/'speaker-threads').write_text(sys.argv[4])
         path=pathlib.Path(request['wav'])
         with wave.open(str(path),'rb') as audio:
             duration=audio.getnframes()//16
@@ -113,6 +123,7 @@ for line in sys.stdin:
     let calls = std::fs::read_to_string(scratch.path().join("calls")).unwrap();
     assert_eq!(calls.lines().filter(|line| *line == "pcm").count(), 5);
     assert_eq!(calls.lines().filter(|line| *line == "wav").count(), 2);
+    assert_eq!(std::fs::read_to_string(scratch.path().join("speaker-threads")).unwrap(), "2");
 
     connection
         .execute(
@@ -130,4 +141,15 @@ for line in sys.stdin:
         std::fs::read_to_string(scratch.path().join("calls")).unwrap(),
         calls
     );
+
+    connection.execute_batch("DELETE FROM speech_blocks; DELETE FROM speaker_blocks;").unwrap();
+    std::fs::write(scratch.path().join("check-parallel"), []).unwrap();
+    store.enqueue(meeting).unwrap();
+    command(&["jobs", "run", "--meeting", &meeting.to_string()]);
+    let parallel = store.transcript(meeting).unwrap();
+    assert_eq!(parallel["parameters"]["parallel_diarization"], true);
+    let expected_threads = std::thread::available_parallelism().map_or(2, |count| count.get().min(4));
+    assert_eq!(parallel["parameters"]["diarization"]["threads"], expected_threads);
+    assert_eq!(std::fs::read_to_string(scratch.path().join("speaker-threads")).unwrap(), expected_threads.to_string());
+    assert_eq!(parallel["segments"][4]["speaker_id"], "speaker_0");
 }

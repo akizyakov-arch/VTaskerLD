@@ -7,6 +7,7 @@ fn multiple_voices_remain_explicit_and_sparse_overlap_stays_unknown() {
     assert_eq!(mixed["speaker_status"], "multiple");
     assert!(mixed["speaker_id"].is_null());
     assert_eq!(mixed["speaker_candidates"].as_array().unwrap().len(), 2);
+    assert_eq!(mixed["overlapping_speakers"], json!([]));
     assert_eq!(attribution(0, 100, &turns)["speaker_id"], "speaker_0");
     assert_eq!(attribution(190, 400, &turns)["speaker_status"], "unknown");
     assert_eq!(attribution(300, 400, &turns)["speaker_status"], "unknown");

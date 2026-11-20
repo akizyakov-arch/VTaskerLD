@@ -78,15 +78,17 @@ static json infer(const json &request, const SherpaOnnxOfflineSpeakerDiarization
 }
 
 int main(int argc, char **argv) {
-    if (argc != 4) return 2;
+    if (argc != 4 && argc != 5) return 2;
     try {
+        const int threads = argc == 5 ? std::stoi(argv[4]) : 2;
+        if (threads < 1 || threads > 4) throw std::runtime_error("Speaker worker expects 1..4 CPU threads");
         SherpaOnnxOfflineSpeakerDiarizationConfig config{};
         config.segmentation.pyannote.model = argv[1];
         config.segmentation.pyannote.window_shift_ratio = 0.2f;
-        config.segmentation.num_threads = 2;
+        config.segmentation.num_threads = threads;
         config.segmentation.provider = "cpu";
         config.embedding.model = argv[2];
-        config.embedding.num_threads = 2;
+        config.embedding.num_threads = threads;
         config.embedding.provider = "cpu";
         config.clustering.num_clusters = 0;
         config.clustering.threshold = std::stof(argv[3]);

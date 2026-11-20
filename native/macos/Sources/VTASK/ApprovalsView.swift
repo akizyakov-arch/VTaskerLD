@@ -7,6 +7,7 @@ struct Proposal: Decodable, Identifiable {
         let startMs: Int?
         let topic: String?
         var segmentTimesMs: [Int]?
+        var materialLinks: [AnalysisMaterialLink]?
     }
 
     let id: Int
@@ -23,9 +24,15 @@ struct Proposal: Decodable, Identifiable {
     let proposed: Changes?
     var baseTask: Changes?
     var candidateTaskIds: [Int]?
+    var candidateBaselines: [CandidateBaseline]?
     var reviewDraft: ReviewDraft?
     var needsClarification: Bool?
     var clarification: String?
+    var projectRequired: Bool?
+    var decisionTaskIds: [Int]?
+    var relatedTaskId: Int?
+    var replacesDraftId: Int?
+    var supersededByAnalysisId: Int?
 
     struct ReviewDraft: Decodable {
         struct Fields: Decodable {
@@ -41,6 +48,7 @@ struct Proposal: Decodable, Identifiable {
             let reason: String?
             let supersedesId: Int?
             let taskIds: [Int]?
+            let relatedTaskId: Int?
         }
 
         let existingTaskId: Int?
@@ -59,6 +67,11 @@ struct Proposal: Decodable, Identifiable {
         let stageTitle: String?
         let blocked: Bool?
         let blockedReason: String?
+    }
+
+    struct CandidateBaseline: Decodable {
+        let taskId: Int
+        let base: Changes
     }
 
     var presentation: (title: String, icon: String) {
@@ -107,6 +120,30 @@ struct Decision: Decodable, Identifiable {
 }
 
 struct ApprovalsView: View {
+    struct ProjectList {
+        enum Kind: String, CaseIterable {
+            case all = "Все"
+            case tasks = "Задачи"
+            case decisions = "Решения"
+        }
+
+        enum Status: String, CaseIterable {
+            case all = "Все"
+            case approved = "Согласовано"
+            case pending = "На согласовании"
+        }
+
+        let project: Project
+        let kind: Kind
+        let status: Status
+        let openTask: (Int) -> Void
+        let openMeeting: (Int) -> Void
+
+        func includesDecision(_ isDecision: Bool) -> Bool {
+            kind == .all || (kind == .decisions) == isDecision
+        }
+    }
+
     enum SortOrder: String, CaseIterable {
         case newest = "Сначала новые"
         case oldest = "Сначала старые"
@@ -169,6 +206,7 @@ struct ApprovalsView: View {
     let workspace: Workspace
     @Binding var editing: Proposal?
     @Binding var filters: Filters
+    var projectList: ProjectList? = nil
     @State private var expanded: Set<Int> = []
     @State private var prepared: [Int: [String: Any]] = [:]
     @State private var batchResult: String?
@@ -176,18 +214,35 @@ struct ApprovalsView: View {
 
     var body: some View {
         let pending = pendingRows
-        let shown = filteredRows(pending)
+        let shown = filteredRows(pending).filter { row in
+            projectList?.status != .approved && (projectList?.includesDecision(row.proposal.kind == "decision") ?? true)
+        }
+        let search = filters.query.trimmingCharacters(in: .whitespacesAndNewlines)
+        let acceptedTasks = projectTasks(matching: search)
+        let projectDecisions = projectList.map { list in
+            workspace.decisions.filter { $0.projectId == list.project.id }
+        } ?? []
+        let shownDecisions = projectDecisions.filter { decision in
+            guard let projectList, projectList.status != .pending, projectList.includesDecision(true) else { return false }
+            return (projectList.status == .all || decision.active) &&
+                (search.isEmpty || decision.text.localizedStandardContains(search) ||
+                    decision.reason?.localizedStandardContains(search) == true)
+        }
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 10) {
-                listControls(pending, count: shown.count)
-                .padding(.bottom, 4)
+                if projectList != nil {
+                    PanelSearchField(placeholder: "Поиск по задачам и решениям", query: $filters.query)
+                } else {
+                    listControls(pending, count: shown.count).padding(.bottom, 4)
+                }
                 if let error = model.error {
                     Label(error, systemImage: "exclamationmark.circle")
                         .foregroundStyle(.red)
                         .panelCard()
                 }
-                if shown.isEmpty {
-                    Label(pending.isEmpty ? "Нет предложений на подтверждение" : "Предложения не найдены",
+                if shown.isEmpty && acceptedTasks.isEmpty && shownDecisions.isEmpty {
+                    Label(projectList != nil ? "По выбранным фильтрам ничего нет" :
+                            pending.isEmpty ? "Нет предложений на подтверждение" : "Предложения не найдены",
                           systemImage: pending.isEmpty ? "tray" : "magnifyingglass")
                         .foregroundStyle(.secondary)
                         .panelCard()
@@ -215,20 +270,32 @@ struct ApprovalsView: View {
                     }
                     .panelCard()
                 }
-                let groups = Dictionary(grouping: shown) { $0.project?.id }
-                let groupIDs = shown.map { $0.project?.id }.reduce(into: [Int?]()) { ids, id in
-                    if !ids.contains(id) { ids.append(id) }
-                }
-                ForEach(groupIDs, id: \.self) { id in
-                    if let rows = groups[id] {
-                        Text(rows.first?.project?.title ?? "Без проекта")
-                            .font(.headline).accessibilityAddTraits(.isHeader)
-                            .padding(.top, 8)
-                        ForEach(rows, content: proposalCard)
+                if let projectList {
+                    ForEach(acceptedTasks) { task in
+                        acceptedTaskRow(task, open: projectList.openTask)
                     }
+                    ForEach(shownDecisions) { decision in
+                        ProjectDecisionCard(model: model, workspace: workspace, decision: decision,
+                                            prior: projectDecisions.first { $0.id == decision.supersedesId },
+                                            openMeeting: projectList.openMeeting, openTask: projectList.openTask)
+                    }
+                    ForEach(shown, content: proposalCard)
+                } else {
+                    let groups = Dictionary(grouping: shown) { $0.project?.id }
+                    let groupIDs = shown.map { $0.project?.id }.reduce(into: [Int?]()) { ids, id in
+                        if !ids.contains(id) { ids.append(id) }
+                    }
+                    ForEach(groupIDs, id: \.self) { id in
+                        if let rows = groups[id] {
+                            Text(rows.first?.project?.title ?? "Без проекта")
+                                .font(.headline).accessibilityAddTraits(.isHeader)
+                                .padding(.top, 8)
+                            ForEach(rows, content: proposalCard)
+                        }
+                    }
+                    decisions.padding(.top, 6)
+                    archivedDrafts
                 }
-                decisions
-                    .padding(.top, 6)
             }
             .padding(24)
             .frame(maxWidth: 860)
@@ -247,14 +314,53 @@ struct ApprovalsView: View {
         }
     }
 
+    private func projectTasks(matching search: String) -> [TaskItem] {
+        guard let projectList, projectList.project.archived != true,
+              projectList.status != .pending, projectList.includesDecision(false) else { return [] }
+        return workspace.visibleTasks.filter { task in
+            task.projectId == projectList.project.id &&
+                (search.isEmpty || task.title.localizedStandardContains(search) ||
+                    task.description?.localizedStandardContains(search) == true)
+        }
+    }
+
+    private func acceptedTaskRow(_ task: TaskItem, open: @escaping (Int) -> Void) -> some View {
+        let palette = PanelPalette(dark: scheme == .dark)
+        let assignee = workspace.people.first { $0.id == task.assigneeId }?.speakerPickerName
+        let due = task.dueDate.map { [ProjectDateField.display($0), task.dueTime].compactMap { $0 }.joined(separator: " ") }
+        return Button { open(task.id) } label: {
+            HStack(spacing: 10) {
+                Image(systemName: "checklist")
+                    .foregroundStyle(palette.selectedInk)
+                    .frame(width: 34, height: 34)
+                    .background(palette.selected, in: RoundedRectangle(cornerRadius: 8))
+                    .accessibilityHidden(true)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(task.title).font(.headline)
+                        .foregroundStyle(task.overdue ? palette.recordingInk : palette.text)
+                    Text(["Задача · Согласовано", task.stageTitle, assignee ?? "Без исполнителя", due ?? "Без срока"]
+                        .compactMap { $0 }.joined(separator: " · "))
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                Spacer(minLength: 8)
+                Image(systemName: "chevron.right").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .panelCard()
+    }
+
     private var pendingRows: [Row] {
         let tasks = Dictionary(uniqueKeysWithValues: workspace.visibleTasks.map { ($0.id, $0) })
         let projects = Dictionary(uniqueKeysWithValues: workspace.projects.map { ($0.id, $0) })
         let people = Dictionary(uniqueKeysWithValues: workspace.people.map { ($0.id, $0) })
         let meetings = Dictionary(uniqueKeysWithValues: workspace.meetings.map { ($0.id, $0) })
-        return workspace.proposals.filter { $0.status == "pending" }.map { proposal in
+        return workspace.proposals.filter { $0.status == "pending" }.compactMap { proposal in
             let target = proposal.taskId.flatMap { tasks[$0] }
             let projectID = target?.projectId ?? proposal.projectId
+            if let projectList, projectID != projectList.project.id { return nil }
             let assigneeID = proposal.editsAssignee
                 ? proposal.proposed?.assigneeId : (proposal.assigneeId ?? target?.assigneeId)
             return Row(proposal: proposal, target: target, project: projectID.flatMap { projects[$0] },
@@ -297,7 +403,8 @@ struct ApprovalsView: View {
     private func listControls(_ pending: [Row], count: Int) -> some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(spacing: 8) {
-                Text("Предложения").font(.headline).accessibilityAddTraits(.isHeader)
+                Text("Предложения")
+                    .font(.headline).accessibilityAddTraits(.isHeader)
                 Text(count == pending.count ? "\(count)" : "\(count) из \(pending.count)")
                     .font(.caption.weight(.medium).monospacedDigit())
                     .padding(.horizontal, 8)
@@ -389,7 +496,8 @@ struct ApprovalsView: View {
         let proposal = row.proposal
         let open = expanded.contains(proposal.id)
         let kind = proposal.presentation
-        let subtitle = [proposal.displayTitle == kind.title ? nil : kind.title, row.project?.title]
+        let subtitle = [proposal.displayTitle == kind.title && projectList == nil ? nil : kind.title,
+                        projectList == nil ? row.project?.title : "На согласовании"]
             .compactMap { $0 }.joined(separator: " · ")
         let palette = PanelPalette(dark: scheme == .dark)
         return VStack(alignment: .leading, spacing: 12) {
@@ -513,6 +621,36 @@ struct ApprovalsView: View {
         }
     }
 
+    @ViewBuilder
+    private var archivedDrafts: some View {
+        let drafts = workspace.proposals.filter { proposal in
+            proposal.status == "rejected" && proposal.supersededByAnalysisId != nil && proposal.reviewDraft != nil &&
+                (filters.meetingId == nil || filters.meetingId == proposal.source?.meetingId)
+        }
+        if !drafts.isEmpty {
+            MeetingDisclosure(title: "Прежние черновики", icon: "archivebox", count: drafts.count) {
+                ForEach(drafts) { proposal in
+                    if let fields = proposal.reviewDraft?.data {
+                        DisclosureGroup(fields.title ?? proposal.displayTitle) {
+                            if let description = fields.description, !description.isEmpty {
+                                Text(description).textSelection(.enabled)
+                            }
+                            if let date = fields.dueDate {
+                                LabeledContent("Срок", value: [date, fields.dueTime].compactMap { $0 }.joined(separator: " "))
+                            }
+                            if let person = workspace.people.first(where: { $0.id == fields.assigneeId }) {
+                                LabeledContent("Исполнитель", value: person.name)
+                            }
+                            if let quote = proposal.source?.quote {
+                                Text(quote).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     private func stages(for projectID: Int?) -> [Stage] {
         workspace.projects.first { $0.id == projectID }?.stages ?? workspace.defaultStages
     }
@@ -550,6 +688,8 @@ struct ProposalEditor: View {
     @State private var decisionReason = ""
     @State private var supersedesDecisionID: Int?
     @State private var decisionTaskIDs: Set<Int> = []
+    @State private var decisionTasksExpanded = false
+    @State private var relatedTaskID: Int?
 
     init(model: WorkspaceModel, workspace: Workspace, proposal: Proposal, fromMeeting: Bool = false,
          prepare: (([String: Any]) -> Void)? = nil) {
@@ -570,6 +710,8 @@ struct ProposalEditor: View {
         let stages = workspace.projects.first { $0.id == proposal.projectId }?.stages ?? workspace.defaultStages
         let defaultStage = proposal.kind == "create_task" ? stages.first { $0.kind == "active" }?.id : nil
         _stageID = State(initialValue: proposal.proposed?.stageId ?? defaultStage ?? "")
+        _decisionTaskIDs = State(initialValue: Set(proposal.decisionTaskIds ?? []))
+        _relatedTaskID = State(initialValue: proposal.relatedTaskId)
         if let draft = proposal.reviewDraft {
             let fields = draft.data
             _title = State(initialValue: fields.title ?? "")
@@ -589,6 +731,7 @@ struct ProposalEditor: View {
             _decisionReason = State(initialValue: fields.reason ?? "")
             _supersedesDecisionID = State(initialValue: fields.supersedesId)
             _decisionTaskIDs = State(initialValue: Set(fields.taskIds ?? []))
+            _relatedTaskID = State(initialValue: fields.relatedTaskId)
         }
     }
 
@@ -597,13 +740,18 @@ struct ProposalEditor: View {
     private var bundlesChanges: Bool { proposal.kind == "change_task" }
     private var target: TaskItem? { workspace.visibleTasks.first { $0.id == taskID } }
     private var taskChoices: [TaskItem] {
-        bundlesChanges ? workspace.visibleTasks.filter { $0.projectId == proposal.projectId && $0.stageKind == "active" }
-            : workspace.visibleTasks
+        let scopedProject = createsTask ? projectID : proposal.projectId
+        return workspace.visibleTasks.filter { task in
+            if task.id == taskID { return true }
+            if bundlesChanges { return task.projectId == scopedProject && task.stageKind == "active" }
+            return scopedProject == nil || task.projectId == scopedProject
+        }
     }
     private var taskConflict: Bool {
-        guard let task = target, task.id == proposal.taskId, let base = proposal.baseTask else {
-            return false
-        }
+        guard let task = target else { return false }
+        let baseline = task.id == proposal.taskId ? proposal.baseTask
+            : proposal.candidateBaselines?.first(where: { $0.taskId == task.id })?.base
+        guard let base = baseline else { return false }
         let deadlineChanged = base.dueDate != task.dueDate || base.dueTime != task.dueTime
         switch proposal.kind {
         case "change_task": return deadlineChanged || base.assigneeId != task.assigneeId
@@ -630,7 +778,7 @@ struct ProposalEditor: View {
         }
         let name = normalizedTitle(createsTask ? title : proposal.title ?? "")
         guard !name.isEmpty else { return [] }
-        let matches = workspace.visibleTasks.filter {
+        let matches = taskChoices.filter {
             normalizedTitle($0.title) == name
         }
         let meetingProject = workspace.meetings.first { $0.id == proposal.source?.meetingId }?.projectId
@@ -726,6 +874,42 @@ struct ProposalEditor: View {
     }
 
     @ViewBuilder
+    private var decisionTaskPicker: some View {
+        let tasks = workspace.visibleTasks.filter { $0.projectId == projectID }
+        let selectedCount = tasks.filter { decisionTaskIDs.contains($0.id) }.count
+        Button {
+            decisionTasksExpanded.toggle()
+        } label: {
+            HStack {
+                Text("Связанные задачи")
+                Spacer()
+                Text("Выбрано: \(selectedCount)")
+                    .foregroundStyle(.secondary)
+                Image(systemName: decisionTasksExpanded ? "chevron.down" : "chevron.right")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .accessibilityHidden(true)
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 4)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityValue(decisionTasksExpanded ? "Развёрнуто" : "Свёрнуто")
+
+        if decisionTasksExpanded {
+            Text(tasks.isEmpty ? "В проекте пока нет задач." : "Отметьте задачи, которые относятся к решению.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            ForEach(tasks) { task in
+                Toggle(task.title, isOn: Binding(get: { decisionTaskIDs.contains(task.id) }, set: { selected in
+                    if selected { decisionTaskIDs.insert(task.id) } else { decisionTaskIDs.remove(task.id) }
+                }))
+            }
+        }
+    }
+
+    @ViewBuilder
     private func changePreview(_ task: TaskItem) -> some View {
         Section("Изменения в задаче") {
             if bundlesChanges {
@@ -792,10 +976,21 @@ struct ProposalEditor: View {
 
     private var fields: some View {
         Form {
+            if proposal.replacesDraftId != nil {
+                Text("Повторный анализ предложил другие значения. Прежний черновик сохранён в истории.")
+                    .foregroundStyle(.secondary)
+            }
             if proposal.needsClarification == true,
                let clarification = proposal.clarification, !clarification.isEmpty {
                 Section("Нужно уточнение") {
                     Label(clarification, systemImage: "questionmark.bubble")
+                }
+            }
+            if let materials = proposal.source?.materialLinks, !materials.isEmpty {
+                Section("Материалы проекта") {
+                    ForEach(materials) { item in
+                        if let target = item.target { Link(item.label, destination: target) }
+                    }
                 }
             }
             if let quote = proposal.source?.quote, !quote.isEmpty {
@@ -858,6 +1053,7 @@ struct ProposalEditor: View {
                         relatedIDs.removeAll()
                         supersedesDecisionID = nil
                         decisionTaskIDs.removeAll()
+                        relatedTaskID = nil
                         resetStageIfNeeded()
                     }
                 }
@@ -872,17 +1068,19 @@ struct ProposalEditor: View {
                                 Text(decision.text).tag(Optional(decision.id))
                             }
                         }
-                        DisclosureGroup("Связанные задачи") {
-                            ForEach(workspace.visibleTasks.filter { $0.projectId == projectID }) { task in
-                                Toggle(task.title, isOn: Binding(get: { decisionTaskIDs.contains(task.id) }, set: { selected in
-                                    if selected { decisionTaskIDs.insert(task.id) } else { decisionTaskIDs.remove(task.id) }
-                                }))
-                            }
-                        }
+                        decisionTaskPicker
                     }
                 }
             }
             relatedSection
+            if createsTask && target == nil && projectID != nil {
+                Picker("Связать с задачей", selection: $relatedTaskID) {
+                    Text("Без связи").tag(nil as Int?)
+                    ForEach(workspace.visibleTasks.filter { $0.projectId == projectID }) { candidate in
+                        Text(candidate.title).tag(Optional(candidate.id))
+                    }
+                }
+            }
             if createsTask && target != nil {
                 Toggle("Изменить срок существующей задачи", isOn: $applyDue)
                 Toggle("Назначить исполнителя существующей задачи", isOn: $applyAssignee)
@@ -964,6 +1162,7 @@ struct ProposalEditor: View {
 
     private var canConfirm: Bool {
         if !createsTask && !isDecision && target == nil { return false }
+        if proposal.projectRequired == true && (isDecision || (createsTask && target == nil)) && projectID == nil { return false }
         if taskConflict && !acknowledgeTaskConflict { return false }
         if applyAssignee && assigneeID == nil { return false }
         if bundlesChanges && (assigneeID == nil || dueDate.isEmpty) { return false }
@@ -995,6 +1194,9 @@ struct ProposalEditor: View {
             data["reason"] = decisionReason
             data["supersedes_id"] = supersedesDecisionID
             data["task_ids"] = decisionTaskIDs.sorted()
+        }
+        if createsTask && target == nil {
+            data["related_task_id"] = relatedTaskID.map { $0 as Any } ?? NSNull()
         }
         if editsDue {
             data["due_date"] = dueDate.isEmpty ? NSNull() as Any : dueDate

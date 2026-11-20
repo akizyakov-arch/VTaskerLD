@@ -11,5 +11,9 @@ let package = Package(
     ],
     targets: [.executableTarget(name: "VTrackerCapture", linkerSettings: [
         .unsafeFlags(["-Xlinker", "-sectcreate", "-Xlinker", "__TEXT", "-Xlinker", "__info_plist", "-Xlinker", infoPlist])
-    ]), .executableTarget(name: "VTASK", resources: [.copy("Resources/meeting-topics.json")])]
+    ]), .executableTarget(name: "VTASK", resources: [
+        .copy("Resources/meeting-topics.json"),
+        .copy("Resources/recording-wave.png"),
+        .copy("Resources/Manrope")
+    ])]
 )

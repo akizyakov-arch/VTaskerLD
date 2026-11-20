@@ -258,10 +258,12 @@ fn main() -> Result<()> {
             )?;
         }
         Command::LiveBlocks { session, scratch } => {
-            store.run_live_blocks(&session, vtracker::speech::SpeechConfig::from_env()?, &scratch)?;
+            let config = vtracker::speech::SpeechConfig::from_env_with_speaker_detection(store.speaker_detection_enabled()?)?;
+            store.run_live_blocks(&session, config, &scratch)?;
         }
         Command::LiveChunk { id, scratch } => {
-            store.run_live_chunk(id, vtracker::speech::SpeechConfig::from_env()?, &scratch)?;
+            let config = vtracker::speech::SpeechConfig::from_env_with_speaker_detection(false)?;
+            store.run_live_chunk(id, config, &scratch)?;
         }
         Command::Audio { command } => match command {
             Audio::Import {
@@ -419,7 +421,7 @@ fn main() -> Result<()> {
         },
         Command::Jobs { command } => match command {
             Jobs::Run { meeting } => {
-                let config = vtracker::speech::SpeechConfig::from_env()?;
+                let config = vtracker::speech::SpeechConfig::from_env_with_speaker_detection(store.speaker_detection_enabled()?)?;
                 println!(
                     "{}",
                     serde_json::json!({"completed_job":store.run_meeting(&config,meeting)?})

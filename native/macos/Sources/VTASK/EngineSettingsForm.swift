@@ -54,6 +54,7 @@ struct SpeechPreferences: Decodable {
     var model: String?
     var format: String?
     var processingMode: String?
+    var speakerDetection: Bool?
 }
 
 struct EngineSettingsForm: View {
@@ -65,6 +66,7 @@ struct EngineSettingsForm: View {
     @State private var cloudModel = ""
     @State private var format = "json"
     @State private var mode = "post"
+    @State private var speakerDetection = true
     @State private var speechKey = ""
     @State private var groqKey = ""
     @State private var aiProvider = "groq"
@@ -182,6 +184,20 @@ struct EngineSettingsForm: View {
                 }
                 MicrophoneSettingsForm(model: model)
                 Section("Распознавание речи") {
+                    Toggle("Определять говорящих", isOn: Binding(
+                        get: { speakerDetection },
+                        set: { enabled in
+                            Task {
+                                if await model.command(["enabled": enabled], path: "api/speech/speakers") {
+                                    speakerDetection = enabled
+                                } else {
+                                    error = model.error
+                                }
+                            }
+                        }
+                    ))
+                    Text("Сохраняется сразу. Для новых записей и заданий выключение пропускает определение голосов. Расшифровка текста остаётся доступной.")
+                        .font(.caption).foregroundStyle(.secondary)
                     Picker("Поставщик", selection: $provider) {
                         Text("Локальная модель").tag("local")
                         Text("Облачный API").tag("cloud")
@@ -279,6 +295,7 @@ struct EngineSettingsForm: View {
             cloudModel = prefs.model ?? "gpt-transcribe"
             format = prefs.format ?? "json"
             mode = prefs.processingMode ?? "post"
+            speakerDetection = prefs.speakerDetection ?? true
             let parts = result.groq.model.split(separator: ":", maxSplits: 1).map(String.init)
             aiProvider = parts.count == 2 ? parts[0] : "groq"
             aiModel = parts.count == 2 ? parts[1] : result.groq.model

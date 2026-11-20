@@ -159,7 +159,7 @@ final class WorkspaceModel: ObservableObject {
     }
 
     func voiceSource(run: Int, speaker: String) async throws -> MeetingVoicePlan {
-        let data = try await request("api/voice/source", payload: ["model_run_id": run, "speaker_id": speaker])
+        let data = try await request("api/voice/source", payload: ["model_run_id": run, "speaker_id": speaker, "preview": true])
         return try decode(MeetingVoicePlan.self, from: data)
     }
 
@@ -321,6 +321,31 @@ final class WorkspaceModel: ObservableObject {
     func voiceStatus() async throws -> VoiceStatus {
         let data = try await request("api/voice/status")
         return try decode(VoiceStatus.self, from: data)
+    }
+
+    struct FragmentAssignment: Decodable {
+        let assigned: Int
+        let jobId: Int?
+    }
+
+    func assignTranscriptFragments(_ payload: [String: Any]) async -> FragmentAssignment? {
+        guard let data = await commandResponse(payload, path: "api/speaker/assign-fragments") else { return nil }
+        do {
+            return try decode(FragmentAssignment.self, from: data)
+        } catch {
+            self.error = error.localizedDescription
+            return nil
+        }
+    }
+
+    struct TranscriptVoiceMatchProgress: Decodable {
+        let job: VoiceStatus.Data.MatchJob?
+        let enrollmentPending: Bool?
+    }
+
+    func transcriptVoiceMatchProgress(_ run: Int) async throws -> TranscriptVoiceMatchProgress {
+        let data = try await request("api/voice/match/progress", payload: ["model_run_id": run])
+        return try decode(TranscriptVoiceMatchProgress.self, from: data)
     }
 
     func voiceSampleURL(_ id: String) -> URL {

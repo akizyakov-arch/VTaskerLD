@@ -1,3 +1,4 @@
+import CoreText
 import ImageIO
 import SwiftUI
 import UniformTypeIdentifiers
@@ -163,6 +164,31 @@ struct PersonAvatar: View {
     let person: Person
     let url: URL?
     let size: CGFloat
+    var monogramInk: Color? = nil
+
+    private static let manropeRegular: CTFontDescriptor? = {
+        let url = Bundle.main.url(forResource: "Manrope", withExtension: "ttf", subdirectory: "Manrope")
+            ?? Bundle.module.url(forResource: "Manrope", withExtension: "ttf", subdirectory: "Manrope")
+        guard let url,
+              let descriptors = CTFontManagerCreateFontDescriptorsFromURL(url as CFURL) as? [CTFontDescriptor],
+              let descriptor = descriptors.first else {
+            return nil
+        }
+        CTFontManagerRegisterFontsForURL(url as CFURL, .process, nil)
+        let weightAxis = NSNumber(value: 0x77676874)
+        return CTFontDescriptorCreateCopyWithVariation(descriptor, weightAxis, 400)
+    }()
+
+    private var initialsFont: Font {
+        guard monogramInk != nil else {
+            return .system(size: size * 0.36, weight: .semibold)
+        }
+        let fontSize = size * 0.43
+        if let descriptor = Self.manropeRegular {
+            return Font(CTFontCreateWithFontDescriptor(descriptor, fontSize, nil))
+        }
+        return .system(size: fontSize)
+    }
 
     var body: some View {
         AsyncImage(url: url) { phase in
@@ -170,10 +196,10 @@ struct PersonAvatar: View {
                 image.resizable().scaledToFill()
             } else {
                 Text(String(person.name.prefix(1)).uppercased())
-                    .font(.system(size: size * 0.36, weight: .semibold))
-                    .foregroundStyle(Color.accentColor)
+                    .font(initialsFont)
+                    .foregroundStyle(monogramInk ?? Color.accentColor)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .background(Color.accentColor.opacity(0.12))
+                    .background(monogramInk == nil ? Color.accentColor.opacity(0.12) : Color.clear)
             }
         }
         .frame(width: size, height: size)

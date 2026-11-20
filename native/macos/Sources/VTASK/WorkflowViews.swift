@@ -94,6 +94,7 @@ struct ProcessingControls: View {
     var showsStatus = true
     var showsCancel = false
     @State private var confirmGroq = false
+    @State private var chooseProjects = false
 
     var body: some View {
         if showsStatus, let job = meeting.processing {
@@ -115,6 +116,9 @@ struct ProcessingControls: View {
                     await model.command(["meeting_id": meeting.id, "consent": true], path: "api/groq/analyze")
                 }
             }
+            if model.workspace?.projects.contains(where: { $0.id == meeting.projectId || $0.archived != true }) == true {
+                Button("Выбрать проекты для анализа") { chooseProjects = true }
+            }
             if meeting.analysis?.saved != nil {
                 Button("Заново запросить у провайдера") {
                     Task {
@@ -126,7 +130,10 @@ struct ProcessingControls: View {
         } message: {
             Text(meeting.projectId == nil
                  ? "Облачный анализ отправляет протокол провайдеру и переиспользует сохранённый результат, если данные совпадают."
-                 : "Локальный разбор понимает явные команды, например «По задаче #42: перенести срок на 24 ноября». Облачный анализ использует протокол и подходящие данные проекта. При совпадении контекста и модели используется сохранённый результат.")
+                 : "Локальный разбор понимает явные команды, например «По задаче #42: перенести срок на 24 ноября». Облачный анализ использует протокол, подходящие задачи, отдельные прежние значения и решения проекта. При совпадении контекста и модели используется сохранённый результат.")
+        }
+        .sheet(isPresented: $chooseProjects) {
+            MeetingAnalysisProjects(model: model, meeting: meeting).sheetCloseButton(disabled: model.saving)
         }
     }
 
@@ -158,6 +165,55 @@ struct ProcessingControls: View {
         .buttonStyle(.bordered)
         .disabled(meeting.processing?.status != "completed" || meeting.analysis?.running == true
                   || model.saving || model.loading || model.capture?.active?.meetingId == meeting.id)
+    }
+}
+
+private struct MeetingAnalysisProjects: View {
+    @Environment(\.dismiss) private var dismiss
+    @ObservedObject var model: WorkspaceModel
+    let meeting: Meeting
+    @State private var selected: Set<Int> = []
+    @State private var force = false
+    @State private var shareMaterialLinks = false
+
+    private var canAdd: Bool { selected.count + (meeting.projectId == nil ? 0 : 1) < 4 }
+
+    var body: some View {
+        let projects = model.workspace?.projects ?? []
+        Form {
+            Section("Проекты анализа") {
+                if let primary = projects.first(where: { $0.id == meeting.projectId }) {
+                    Label(primary.title, systemImage: "checkmark.circle.fill")
+                }
+                ForEach(projects.filter { $0.id != meeting.projectId && $0.archived != true }) { project in
+                    Toggle(project.title, isOn: Binding(get: { selected.contains(project.id) }, set: { enabled in
+                        if enabled { selected.insert(project.id) } else { selected.remove(project.id) }
+                    }))
+                    .disabled(!canAdd && !selected.contains(project.id))
+                }
+                Text("Провайдер получит протокол и связанные данные только отмеченных проектов. Можно выбрать до четырёх проектов.")
+                    .font(.caption).foregroundStyle(.secondary)
+                Toggle("Включить ссылки из материалов проекта", isOn: $shareMaterialLinks)
+                Text("Анализ подберёт ссылки по подписям и репликам. При отправке берётся адрес без параметров и фрагмента.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            if meeting.analysis?.saved != nil { Toggle("Запросить анализ заново", isOn: $force) }
+            if let error = model.error { Text(error).foregroundStyle(.red) }
+            Button("Отправить и проанализировать") {
+                Task {
+                    if await model.command(["meeting_id":meeting.id,"project_ids":selected.sorted(),
+                                            "consent":true,"force":force,
+                                            "include_material_links":shareMaterialLinks], path:"api/groq/analyze") {
+                        dismiss()
+                    }
+                }
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(selected.isEmpty && meeting.projectId == nil)
+        }
+        .formStyle(.grouped)
+        .frame(width: 480, height: 420)
+        .disabled(model.saving)
     }
 }
 
@@ -193,7 +249,7 @@ struct RecordingPlayer: View {
     }
 }
 
-private struct RecordingPlayerView: NSViewRepresentable {
+struct RecordingPlayerView: NSViewRepresentable {
     let player: AVPlayer
 
     func makeNSView(context: Context) -> AVPlayerView {
@@ -231,6 +287,7 @@ struct TaskEditor: View {
     @ObservedObject var model: WorkspaceModel
     let task: TaskItem
     let openMeeting: (Int) -> Void
+    let openRelatedTask: (Int) -> Void
     let draftChanged: (Bool) -> Void
     let returnToMeeting: (() -> Void)?
     @State private var confirmDiscard = false
@@ -250,12 +307,13 @@ struct TaskEditor: View {
     @State private var historyError: String?
     @State private var historyOpen = false
 
-    init(model: WorkspaceModel, task: TaskItem, openMeeting: @escaping (Int) -> Void,
+    init(model: WorkspaceModel, task: TaskItem, openMeeting: @escaping (Int) -> Void, openRelatedTask: @escaping (Int) -> Void,
          draftChanged: @escaping (Bool) -> Void,
          returnToMeeting: (() -> Void)? = nil) {
         self.model = model
         self.task = task
         self.openMeeting = openMeeting
+        self.openRelatedTask = openRelatedTask
         self.draftChanged = draftChanged
         self.returnToMeeting = returnToMeeting
         _title = State(initialValue: task.title)
@@ -354,11 +412,25 @@ struct TaskEditor: View {
                     ForEach(sources.indices, id: \.self) { index in
                         let source = sources[index]
                         if let quote = source.quote, !quote.isEmpty { Text(quote).textSelection(.enabled) }
+                        ForEach(source.materialLinks ?? []) { item in
+                            if let target = item.target { Link(item.label, destination: target) }
+                        }
                         if let id = source.meetingId, returnToMeeting == nil {
                             Button(workspace?.meetings.first { $0.id == id }?.title ?? "Открыть встречу") {
                                 openMeeting(id)
                             }
                             .buttonStyle(.link)
+                        }
+                    }
+                }
+            }
+            if let workspace, let related = task.relatedTaskIds, !related.isEmpty {
+                let tasks = workspace.visibleTasks.filter { related.contains($0.id) }
+                if !tasks.isEmpty {
+                    Section("Связанные задачи") {
+                        ForEach(tasks) { task in
+                            Button(task.title) { openRelatedTask(task.id) }.buttonStyle(.link)
+                                .disabled(hasDraft || model.saving)
                         }
                     }
                 }

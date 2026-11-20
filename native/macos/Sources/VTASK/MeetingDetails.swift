@@ -163,6 +163,9 @@ struct MeetingAnalysisView: View {
                     ForEach(observations) { item in
                         DisclosureGroup {
                             if let quote = item.source?.quote { Text(quote).textSelection(.enabled) }
+                            ForEach(item.source?.materialLinks ?? []) { link in
+                                if let target = link.target { Link(link.label, destination: target) }
+                            }
                             if let id = item.taskId, let task = model.workspace?.visibleTasks.first(where: { $0.id == id }) {
                                 Button(task.title) { openTask(id) }.buttonStyle(.link)
                             }
@@ -272,6 +275,9 @@ struct MeetingDecisions: View {
                                 .accessibilityLabel(decision.statusLabel)
                             VStack(alignment: .leading, spacing: 4) {
                                 ProtocolProse(text: decision.text)
+                                ForEach(decision.source?.materialLinks ?? []) { link in
+                                    if let target = link.target { Link(link.label, destination: target) }
+                                }
                                 if !decision.active {
                                     Text(decision.statusLabel).font(.caption).foregroundStyle(.secondary)
                                 }

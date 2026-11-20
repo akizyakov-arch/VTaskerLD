@@ -47,6 +47,8 @@ struct Dashboard: View {
     let openAssistant: () -> Void
     let meetings: [Meeting]
     let pending: [Proposal]
+    let notifications: [TaskNotification]
+    let openNotification: (TaskNotification) -> Void
     let openProject: (Int) -> Void
     let openMeeting: (Int) -> Void
     let openApprovals: () -> Void
@@ -65,6 +67,16 @@ struct Dashboard: View {
                         .font(.callout)
                 }
                 metrics
+                if !notifications.isEmpty {
+                    MeetingDisclosure(title: "Уведомления", icon: "bell",
+                                      count: notifications.filter { $0.readAt == nil }.count) {
+                        ForEach(notifications) { item in
+                            dashboardRow(item.payload.title, icon: item.readAt == nil ? "bell.badge" : "bell",
+                                         subtitle: item.label) { openNotification(item) }
+                        }
+                    }
+                    .panelCard()
+                }
                 ScheduleView(tasks: tasks, projects: projects, people: people, today: today, openTask: openTask)
                     .panelCard()
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 320), spacing: 16, alignment: .top)], alignment: .leading, spacing: 16) {

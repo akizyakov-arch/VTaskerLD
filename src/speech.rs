@@ -40,6 +40,10 @@ impl SpeechConfig {
     }
 
     pub fn from_env() -> Result<Self> {
+        Self::from_env_with_speaker_detection(true)
+    }
+
+    pub fn from_env_with_speaker_detection(enabled: bool) -> Result<Self> {
         Ok(Self {
             engine: resolve(
                 &std::env::var_os("VTRACKER_WHISPER_BIN")
@@ -55,7 +59,7 @@ impl SpeechConfig {
                     .map(PathBuf::from)
                     .unwrap_or_else(|| "ffmpeg".into()),
             )?,
-            diarization: crate::diarization::DiarizationConfig::from_env()?,
+            diarization: if enabled { crate::diarization::DiarizationConfig::from_env()? } else { None },
             vad_model: std::env::var_os("VTRACKER_VAD_MODEL")
                 .map(std::fs::canonicalize)
                 .transpose()?,
@@ -98,6 +102,14 @@ pub fn resolve(path: &Path) -> Result<PathBuf> {
     bail!("executable not found: {}", path.display())
 }
 impl Store {
+    pub fn speaker_detection_enabled(&self) -> Result<bool> {
+        Ok(self.0.query_row(
+            "SELECT coalesce((SELECT json_extract(data_json,'$.speaker_detection')
+             FROM workspace_settings WHERE key='speech'),1)",
+            [], |row| row.get(0),
+        )?)
+    }
+
     /// Claim one pending job atomically; failed attempts never overwrite earlier results.
     pub fn run_next(&self, config: &SpeechConfig) -> Result<Option<i64>> {
         self.run_meeting(config, None)
@@ -110,8 +122,7 @@ impl Store {
         config.validate()?;
         let cloud = std::env::var_os("VTRACKER_CLOUD_URL").is_some();
         let block_engine = (!cloud).then(blocks::engine).flatten();
-        let speaker_engine = block_engine.as_ref().and_then(|_| speaker_blocks::engine())
-            .filter(|_| config.diarization.as_ref().is_some_and(|config| config.speakers == 0));
+        let speaker_threads = speaker_blocks::final_threads();
         let engine_path = block_engine.as_deref().unwrap_or(&config.engine);
         let model_hash = if cloud {
             "remote-model-no-local-checksum".into()
@@ -128,6 +139,7 @@ impl Store {
             std::thread::available_parallelism().map_or(1, |n| n.get().min(4))
         };
         let mut parameters = json!({"provider":if cloud {"cloud"} else {"local"},"cloud_model":std::env::var("VTRACKER_CLOUD_MODEL").ok(),"cloud_url":std::env::var("VTRACKER_CLOUD_URL").ok(),"local_model_path":config.model,"threads":threads,"sample_rate":16000,"channels":1,"diarization":config.diarization.as_ref().map(|c|c.parameters()).transpose()?,
+            "speaker_detection":self.speaker_detection_enabled()?,
             "max_text_context":(!cloud).then_some(0),
             "vad":config.vad_model.as_ref().filter(|_| !cloud).map(|path|json!({"model_path":path,"sha256":vad_hash,"threshold":0.5,"min_speech_ms":250,"min_silence_ms":100,"pad_ms":30,"overlap_seconds":0.1}))});
         let tx = self.0.unchecked_transaction()?;
@@ -168,6 +180,19 @@ impl Store {
         let mut run_id = None;
         let outcome = std::thread::scope(|scope| {
             let preparation_started = Instant::now();
+            let mut diarization = config.diarization.clone();
+            if let Some(voices) = diarization.as_mut().filter(|voices| voices.speakers == 0) {
+                let participants: u32 = self.0.query_row(
+                    "SELECT count(*) FROM meeting_people WHERE meeting_id=?1", [meeting], |row| row.get(0),
+                )?;
+                if (1..=64).contains(&participants) {
+                    voices.speakers = participants;
+                    parameters["diarization"]["num_speakers"] = json!(participants);
+                    parameters["diarization"]["speaker_count_source"] = json!("meeting_participants");
+                }
+            }
+            let speaker_engine = block_engine.as_ref().and_then(|_| speaker_blocks::engine())
+                .filter(|_| diarization.as_ref().is_some_and(|voices| voices.speakers == 0));
             let state: String =
                 self.0
                     .query_row("SELECT status FROM meetings WHERE id=?1", [meeting], |r| {
@@ -232,12 +257,28 @@ impl Store {
                 rusqlite::params![run, serde_json::to_string(&inputs)?],
             )?;
             let duration = hound::WavReader::open(&wav)?.duration() as u64 * 1000 / 16000;
-            // Whisper uses Metal on macOS while Sherpa uses CPU. Each task owns its output.
-            let diarization_task = config.diarization.as_ref().filter(|_| !cloud && speaker_engine.is_none()).map(|config| {
+            let diarization_started = Instant::now();
+            let diarization_task = diarization.as_ref().filter(|_| !cloud).map(|config| {
                 let config = config.clone();
                 let input = wav.clone();
-                let output = scratch.path().join("speakers.json");
-                scope.spawn(move || run_diarization(&config, &input, &output))
+                let scratch = scratch.path().to_path_buf();
+                let engine = speaker_engine.clone();
+                let database = self.0.path().filter(|path| !path.is_empty()).map(PathBuf::from);
+                let sources = inputs.clone();
+                scope.spawn(move || -> Result<(Vec<Value>, u64, Option<f64>)> {
+                    if let Some(engine) = engine {
+                        let database = database.context("Block diarization requires a database file")?;
+                        let store = Store::open(&database)?;
+                        let turns = speaker_blocks::separate_file(
+                            &store, meeting, &config, &engine, &input, &scratch, &sources, speaker_threads,
+                        )?;
+                        Ok((turns, diarization_started.elapsed().as_millis() as u64, Some(0.2)))
+                    } else {
+                        let (data, elapsed) = run_diarization(&config, &input, &scratch.join("speakers.json"))?;
+                        let ratio = data["window_shift_ratio"].as_f64();
+                        Ok((crate::diarization::parse_turns(&data, duration)?, elapsed, ratio))
+                    }
+                })
             });
             parameters["parallel_diarization"] = json!(diarization_task.is_some());
             self.speech_stage(job, if diarization_task.is_some() { "transcribing_and_separating" } else { "transcribing" })?;
@@ -288,8 +329,8 @@ impl Store {
             if let Some(timed) = output["cloud_segment_timestamps"].as_bool() {
                 parameters["segment_timestamps"] = json!(timed);
             }
-            let diarization_started = Instant::now();
-            let separate_voices = config.diarization.is_some()
+            let transcription_finished = Instant::now();
+            let separate_voices = diarization.is_some()
                 && output["cloud_segment_timestamps"] != false
                 && (cloud || config.vad_model.is_none() || !segments.is_empty());
             if separate_voices || diarization_task.as_ref().is_some_and(|task| !task.is_finished()) {
@@ -301,40 +342,35 @@ impl Store {
                     .map_err(|_| anyhow::anyhow!("diarization worker panicked"))
                     .and_then(|result| result)
             });
-            let turns = if let Some(diarization) = config
-                .diarization
+            let turns = if let Some(diarization) = diarization
                 .as_ref()
                 .filter(|_| output["cloud_segment_timestamps"] != false)
                 .filter(|_| cloud || config.vad_model.is_none() || !segments.is_empty())
             {
-                if let Some(engine) = &speaker_engine {
-                    let turns = speaker_blocks::separate_file(
-                        self, meeting, diarization, engine, &wav, scratch.path(), &inputs,
-                    )?;
-                    parameters["diarization"]["block_processing"] = json!(true);
-                    parameters["diarization"]["window_shift_ratio"] = json!(0.2);
-                    parameters["diarization"]["threads"] = json!(2);
-                    parameters["diarization"]["engine_sha256"] = json!(checksum(engine)?);
-                    parameters["diarization_ms"] = json!(diarization_started.elapsed().as_millis());
-                    turns
-                } else {
-                    let (data, elapsed_ms) = match parallel_result {
-                        Some(result) => result?,
-                        None => run_diarization(diarization, &wav, &scratch.path().join("speakers.json"))?,
-                    };
-                    if let Some(ratio) = data["window_shift_ratio"].as_f64() {
-                        parameters["diarization"]["window_shift_ratio"] = json!(ratio);
+                let (turns, elapsed_ms, ratio) = match parallel_result {
+                    Some(result) => result?,
+                    None => {
+                        let (data, elapsed_ms) = run_diarization(diarization, &wav, &scratch.path().join("speakers.json"))?;
+                        (crate::diarization::parse_turns(&data, duration)?, elapsed_ms, data["window_shift_ratio"].as_f64())
                     }
-                    parameters["diarization_ms"] = json!(elapsed_ms);
-                    crate::diarization::parse_turns(&data, duration)?
+                };
+                if let Some(engine) = &speaker_engine {
+                    parameters["diarization"]["block_processing"] = json!(true);
+                    parameters["diarization"]["threads"] = json!(speaker_threads);
+                    parameters["diarization"]["engine_sha256"] = json!(checksum(engine)?);
                 }
+                if let Some(ratio) = ratio {
+                    parameters["diarization"]["window_shift_ratio"] = json!(ratio);
+                }
+                parameters["diarization_ms"] = json!(elapsed_ms);
+                turns
             } else {
                 Vec::new()
             };
             parameters["preparation_ms"] =
                 json!((transcription_started - preparation_started).as_millis());
             parameters["transcription_ms"] =
-                json!((diarization_started - transcription_started).as_millis());
+                json!((transcription_finished - transcription_started).as_millis());
             self.speech_stage(job, "saving")?;
             let tx = self.0.unchecked_transaction()?;
             for turn in turns {
@@ -353,26 +389,13 @@ impl Store {
             )?;
             tx.commit()?;
             // Identification is optional and never turns a successful transcription into a failure.
-            if self
-                .voice_matching_settings()
-                .is_ok_and(|settings| settings["enabled"] == true)
-            {
-                let has_profiles: bool = self
-                    .0
-                    .query_row("SELECT EXISTS(SELECT 1 FROM voice_profiles) AND EXISTS(SELECT 1 FROM speaker_turns WHERE model_run_id=?1)", [run], |r| {
-                        r.get(0)
-                    })
-                    .unwrap_or(false);
-                if has_profiles {
-                    if let Err(error) = self.queue_voice_matching(run) {
-                        let mut updated = parameters.clone();
-                        updated["voice_matching_error"] = json!(error.to_string());
-                        let _ = self.0.execute(
-                            "UPDATE model_runs SET parameters_json=?2 WHERE id=?1",
-                            rusqlite::params![run, updated.to_string()],
-                        );
-                    }
-                }
+            if let Err(error) = self.ensure_automatic_voice_matching(run) {
+                let mut updated = parameters.clone();
+                updated["voice_matching_error"] = json!(error.to_string());
+                let _ = self.0.execute(
+                    "UPDATE model_runs SET parameters_json=?2 WHERE id=?1",
+                    rusqlite::params![run, updated.to_string()],
+                );
             }
             Ok(())
         });
@@ -419,6 +442,11 @@ impl Store {
         let assignments = self.speaker_assignments(run, false)?;
         let mut matches = self.voice_matches(run)?;
         let parameters: Value = serde_json::from_str(&parameters)?;
+        let live_hints = if parameters["speaker_detection"] == false {
+            Vec::new()
+        } else {
+            self.transcript_live_voice_hints(meeting, run)?
+        };
         if parameters["diarization"]["num_speakers"] == 0 {
             crate::diarization::suppress_transient_clusters(&mut turns, &assignments);
             if let Some(matches) = matches.as_array_mut() {
@@ -432,6 +460,9 @@ impl Store {
         for turn in &mut turns {
             crate::people::overlay_person(turn, &assignments);
         }
+        let reviewed_groups = self.reviewed_speaker_groups(run, &turns)?;
+        let automatic_profiles = self.voice_matching_settings()?["enabled"] == true
+            && parameters["speaker_detection"] != false;
         let mut stmt = self.0.prepare("SELECT start_ms,end_ms,text,sources_json,id FROM segments WHERE model_run_id=?1 ORDER BY start_ms,id")?;
         let rows = stmt.query_map([run], |r| {
             Ok((
@@ -456,14 +487,79 @@ impl Store {
                 crate::people::overlay_person(candidate, &assignments);
             }
             self.segment_overlay(run, segment_id, &mut segment)?;
+            if segment["overlapping_speakers"].as_array().is_some_and(|ids| !ids.is_empty()) {
+                let overlapping: Vec<_> = segment["speaker_candidates"].as_array().unwrap().iter()
+                    .filter(|candidate| segment["overlapping_speakers"].as_array().unwrap().contains(&candidate["speaker_id"]))
+                    .map(|candidate| {
+                        let speaker = candidate["speaker_id"].as_str().unwrap();
+                        let profile = matches.as_array().into_iter().flatten()
+                            .find(|entry| entry["speaker_id"] == speaker && entry["status"] == "candidate");
+                        let (person, name) = if candidate["assignment_source"] == "manual_speaker" {
+                            (&candidate["person_id"], &candidate["person_name"])
+                        } else if let Some((person, name)) = reviewed_groups.get(speaker) {
+                            if profile.is_none_or(|entry| entry["person_id"] == *person) {
+                                return json!({"speaker_id":speaker,"person_id":person,"person_name":name});
+                            }
+                            (&Value::Null, &Value::Null)
+                        } else if let Some(profile) = profile {
+                            (&profile["person_id"], &profile["person_name"])
+                        } else {
+                            (&Value::Null, &Value::Null)
+                        };
+                        json!({"speaker_id":speaker,"person_id":person,"person_name":name})
+                    }).collect();
+                if let Some(label) = overlap_label(&segment, &overlapping) {
+                    segment["overlap_label"] = json!(label);
+                }
+            }
             if segment["assignment_source"] != "manual_segment"
                 && segment["assignment_source"] != "manual_speaker"
             {
-                if let Some(candidate) = matches.as_array().and_then(|rows| {
+                let dominant = crate::diarization::dominant_speaker_candidate(start, end, &segment);
+                let profile_match = dominant.filter(|candidate| candidate["assignment_source"] != "manual_speaker")
+                    .and_then(|candidate| matches.as_array().and_then(|rows| {
                     rows.iter()
-                        .find(|v| v["speaker_id"] == segment["speaker_id"])
-                }) {
-                    segment["voice_suggestion"] = candidate.clone();
+                        .find(|v| v["speaker_id"] == candidate["speaker_id"])
+                }));
+                let reviewed = dominant
+                    .filter(|candidate| candidate["assignment_source"] != "manual_speaker")
+                    .and_then(|candidate| candidate["speaker_id"].as_str())
+                    .and_then(|speaker| reviewed_groups.get(speaker));
+                if let Some((person, name)) = reviewed {
+                    if profile_match.is_none_or(|entry| entry["status"] != "candidate" || entry["person_id"] == *person) {
+                        segment["person_id"] = json!(person);
+                        segment["person_name"] = json!(name);
+                        segment["assignment_source"] = json!("auto_reviewed_group");
+                    }
+                } else if let Some(candidate) = profile_match {
+                    if automatic_profiles && candidate["status"] == "candidate" {
+                        segment["person_id"] = candidate["person_id"].clone();
+                        segment["person_name"] = candidate["person_name"].clone();
+                        segment["assignment_source"] = json!("auto_profile");
+                    } else {
+                        segment["voice_suggestion"] = candidate.clone();
+                    }
+                }
+                if automatic_profiles && reviewed.is_none() && segment["person_id"].is_null() {
+                    if let Some(identity) = crate::live_voice::suggestion_for_segment(
+                        start, end, &[], &turns,
+                        segment["speaker_candidates"].as_array().unwrap(),
+                        matches.as_array().map_or(&[], Vec::as_slice),
+                    ) {
+                        segment["person_id"] = identity["person_id"].clone();
+                        segment["person_name"] = identity["person_name"].clone();
+                        segment["assignment_source"] = json!("auto_profile");
+                        segment["voice_suggestion"] = Value::Null;
+                    }
+                }
+                if reviewed.is_none() && segment["person_id"].is_null() && segment["voice_suggestion"]["status"] != "candidate" {
+                    if let Some(suggestion) = crate::live_voice::suggestion_for_segment(
+                        start, end, &live_hints, &turns,
+                        segment["speaker_candidates"].as_array().unwrap(),
+                        matches.as_array().map_or(&[], Vec::as_slice),
+                    ) {
+                        segment["voice_suggestion"] = suggestion;
+                    }
                 }
             }
             segments.push(segment);
@@ -482,6 +578,34 @@ impl Store {
         tx.commit()?;
         Ok(())
     }
+}
+fn overlap_label(segment: &Value, voices: &[Value]) -> Option<String> {
+    if segment["assignment_source"] == "manual_segment" && segment["person_id"].is_null() {
+        return None;
+    }
+    let mut names = std::collections::BTreeMap::new();
+    let mut unknown = 0;
+    for voice in voices {
+        if let (Some(id), Some(name)) = (voice["person_id"].as_i64(), voice["person_name"].as_str()) {
+            names.insert(id, name);
+        } else {
+            unknown += 1;
+        }
+    }
+    if let (Some(id), Some(name)) = (segment["person_id"].as_i64(), segment["person_name"].as_str()) {
+        if !names.contains_key(&id) {
+            if unknown == 0 { return None; }
+            names.insert(id, name);
+            unknown -= 1;
+        }
+    }
+    if names.is_empty() {
+        return Some("Голоса пересекаются".into());
+    }
+    if names.len() == 1 && unknown == 0 { return None; }
+    let mut labels: Vec<_> = names.into_values().collect();
+    if unknown > 0 { labels.push(if unknown == 1 { "неопознанный голос" } else { "неопознанные голоса" }); }
+    Some(format!("{} · одновременно", labels.join(" и ")))
 }
 fn run_diarization(
     config: &crate::diarization::DiarizationConfig,

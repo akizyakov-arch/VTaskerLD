@@ -48,11 +48,19 @@ struct MeetingTranscript: View {
         var id: Int { segment.id }
     }
 
+    private struct VoiceSelectionRequest: Identifiable {
+        let paragraph: Paragraph
+        let run: Int
+        var id: Int { paragraph.id }
+    }
+
     @State private var speakerFilter = SpeakerFilter.all
     @State private var speakerAssignment: SpeakerAssignmentRequest?
+    @State private var fragmentSelection: VoiceSelectionRequest?
     @State private var query = ""
     @State private var confirmingVoice: Transcript.VoiceMatch?
-    @State private var listeningSegment: Transcript.Segment?
+    @State private var matchingRevision = 0
+    @State private var listeningParagraph: Paragraph?
     @State private var enrollingSpeaker: MeetingVoiceSource?
     @State private var draftingProposal: Proposal?
 
@@ -61,7 +69,9 @@ struct MeetingTranscript: View {
         var length = 0
         for segment in segments where !segment.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             if let previous = result.last?.last,
-               previous.resolvedSpeakerID == segment.resolvedSpeakerID, previous.speakerId == segment.speakerId,
+               previous.overlapLabel == segment.overlapLabel,
+               previous.resolvedSpeakerID == segment.resolvedSpeakerID,
+               (segment.resolvedSpeakerID != nil || previous.speakerId == segment.speakerId),
                segment.startMs - previous.endMs < 1600, length < 600,
                length < 300 || previous.text.trimmingCharacters(in: .whitespacesAndNewlines).last.map({ !".!?…".contains($0) }) == true {
                 result[result.count - 1].append(segment)
@@ -95,12 +105,33 @@ struct MeetingTranscript: View {
                 speakerFilter = .all
             }
         }
-        .sheet(item: $speakerAssignment) { request in
-            TranscriptSpeakerPicker(model: model, meeting: meeting, segment: request.segment) { person, wholeVoice in
-                await assign(person, segment: request.segment, run: request.run,
-                             speaker: wholeVoice ? request.segment.speakerId : nil)
+        .sheet(item: $speakerAssignment, onDismiss: { matchingRevision += 1 }) { request in
+            TranscriptSpeakerPicker(model: model, meeting: meeting, segment: request.segment,
+                                    run: request.run,
+                                    canMatch: transcript?.speakerTurns?.isEmpty == false) { person, wholeVoice, rematch in
+                let saved = await assign(person, segment: request.segment, run: request.run,
+                                         speaker: wholeVoice ? request.segment.speakerId : nil)
+                if saved && rematch && person != nil {
+                    await startMatching(request.run)
+                }
+                return saved
             }
             .sheetCloseButton(disabled: model.saving)
+        }
+        .sheet(item: $fragmentSelection) { request in
+            if let transcript, transcript.modelRunId == request.run {
+                TranscriptVoiceSelection(model: model, meeting: meeting, segments: transcript.segments,
+                                         anchor: request.paragraph.first,
+                                         initialSelection: Set(request.paragraph.segments.map(\.id)),
+                                         run: request.run) {
+                    refreshCount += 1
+                    matchingRevision += 1
+                }
+                .sheetCloseButton(disabled: model.saving)
+            } else {
+                Text("Расшифровка обновилась. Откройте выбор реплик снова.").padding()
+                    .sheetCloseButton()
+            }
         }
         .sheet(item: $draftingProposal) { proposal in
             Group {
@@ -110,11 +141,13 @@ struct MeetingTranscript: View {
             }
             .sheetCloseButton(disabled: model.saving)
         }
-        .sheet(item: $listeningSegment) { segment in
-            MeetingAudioPreview(model: model, meetingID: meeting.id, segment: segment)
+        .sheet(item: $listeningParagraph) { paragraph in
+            MeetingAudioPreview(model: model, meetingID: meeting.id, segment: paragraph.first,
+                                endMs: paragraph.segments.map(\.endMs).max(),
+                                previewText: paragraph.text, autoplay: true)
                 .sheetCloseButton()
         }
-        .sheet(item: $enrollingSpeaker) { source in
+        .sheet(item: $enrollingSpeaker, onDismiss: { matchingRevision += 1 }) { source in
             MeetingVoiceEnrollment(model: model, meeting: meeting, source: source)
                 .sheetCloseButton(disabled: model.saving)
         }
@@ -166,24 +199,31 @@ struct MeetingTranscript: View {
             readingPage = 0
             editPage = 0
         }
-        .task(id: matchingQueued) {
-            guard matchingQueued, let run = transcript?.modelRunId else { return }
+        .task(id: [transcript?.modelRunId ?? 0, matchingRevision]) {
+            guard let run = transcript?.modelRunId, transcript?.speakerTurns?.isEmpty == false else {
+                matchingQueued = false
+                return
+            }
             while !Task.isCancelled {
                 do {
-                    let status = try await model.voiceStatus()
-                    let job = status.voiceData.matchJobs?.first { $0.modelRunId == run }
+                    let progress = try await model.transcriptVoiceMatchProgress(run)
                     guard !Task.isCancelled else { return }
-                    if let job, !["pending", "running"].contains(job.state) {
+                    if progress.enrollmentPending == true {
+                        matchingQueued = true
+                        try await Task.sleep(for: .seconds(2))
+                        continue
+                    }
+                    guard let job = progress.job else {
+                        matchingQueued = false
+                        return
+                    }
+                    if !["pending", "running"].contains(job.state) {
                         matchingError = job.error
                         matchingQueued = false
                         refreshCount += 1
                         return
                     }
-                    if job == nil {
-                        matchingError = "Задание сопоставления отсутствует в очереди."
-                        matchingQueued = false
-                        return
-                    }
+                    matchingQueued = true
                     try await Task.sleep(for: .seconds(2))
                 } catch {
                     guard !Task.isCancelled else { return }
@@ -302,12 +342,13 @@ struct MeetingTranscript: View {
         let first = paragraph.first
         return VStack(alignment: .leading, spacing: 7) {
             HStack(spacing: 12) {
-                Text(first.speakerLabel)
+                Button(first.speakerLabel) { selectVoiceFragments(paragraph) }
+                    .buttonStyle(.link)
                     .font(.headline)
-                    .accessibilityAddTraits(.isHeader)
+                    .help("Выбрать реплики и назначить говорящего")
                 Spacer(minLength: 8)
                 if !meeting.recordings.isEmpty {
-                    Button { listeningSegment = first } label: {
+                    Button { listeningParagraph = paragraph } label: {
                         Label(meetingTime(first.startMs), systemImage: "play.circle")
                             .font(.caption.monospacedDigit())
                     }
@@ -325,10 +366,12 @@ struct MeetingTranscript: View {
     private func fragmentRow(_ segment: Transcript.Segment, run: Int) -> some View {
         VStack(alignment: .leading) {
             HStack {
-                Text(segment.speakerLabel).font(.caption).foregroundStyle(.secondary)
+                Button(segment.speakerLabel) { selectVoiceFragments(Paragraph(segments: [segment])) }
+                    .buttonStyle(.link).font(.caption)
+                    .help("Выбрать реплики и назначить говорящего")
                 Spacer()
                 if !meeting.recordings.isEmpty {
-                    Button { listeningSegment = segment } label: {
+                    Button { listeningParagraph = Paragraph(segments: [segment]) } label: {
                         Label("Прослушать · " + meetingTime(segment.startMs), systemImage: "play.circle")
                             .font(.caption.monospacedDigit())
                     }
@@ -336,6 +379,15 @@ struct MeetingTranscript: View {
                 }
             }
             Text(segment.text).textSelection(.enabled)
+            if segment.personId == nil, let suggestion = segment.voiceSuggestion,
+               suggestion.status == "candidate",
+               suggestion.source == "live_voice" || suggestion.source == "segment_consensus",
+               let person = suggestion.personId, let name = suggestion.personName {
+                Button("Подтвердить: \(name)") {
+                    Task { _ = await assign(person, segment: segment, run: run, speaker: nil) }
+                }
+                .disabled(model.saving || model.loading)
+            }
             Button("Назначить говорящего") {
                 speakerAssignment = SpeakerAssignmentRequest(segment: segment, run: run)
             }
@@ -406,12 +458,7 @@ struct MeetingTranscript: View {
     private func voiceMatching(_ transcript: Transcript) -> some View {
         if transcript.speakerTurns?.isEmpty == false {
             Button("Сопоставить голоса с профилями") {
-                Task {
-                    matchingError = nil
-                    if await model.command(["model_run_id": transcript.modelRunId], path: "api/voice/match") {
-                        matchingQueued = true
-                    }
-                }
+                Task { await startMatching(transcript.modelRunId) }
             }
             .disabled(model.saving || model.capture?.active != nil || matchingQueued)
             if matchingQueued {
@@ -431,11 +478,24 @@ struct MeetingTranscript: View {
                 }
                 .disabled(model.saving)
             }
+        } else {
+            Text("В этой версии расшифровки голоса не разделены. Можно назначить говорящего вручную в редакторе реплик.")
+                .font(.caption).foregroundStyle(.secondary)
         }
     }
 
     @State private var matchingQueued = false
     @State private var matchingError: String?
+
+    private func startMatching(_ run: Int) async {
+        matchingError = nil
+        if await model.command(["model_run_id": run], path: "api/voice/match") {
+            matchingQueued = true
+            matchingRevision += 1
+        } else {
+            matchingError = model.error
+        }
+    }
 
     private func propose(_ kind: String, from segment: Transcript.Segment) {
         draftingProposal = Proposal(id: 0, kind: kind, status: "draft", title: nil,
@@ -445,9 +505,15 @@ struct MeetingTranscript: View {
                                     taskId: nil, proposed: nil)
     }
 
+    private func selectVoiceFragments(_ paragraph: Paragraph) {
+        guard let run = transcript?.modelRunId else { return }
+        fragmentSelection = VoiceSelectionRequest(paragraph: paragraph, run: run)
+    }
+
     private func assign(_ person: Int?, segment: Transcript.Segment, run: Int, speaker: String?) async -> Bool {
-        var payload: [String: Any] = ["model_run_id": run, "person_id": person.map { $0 as Any } ?? NSNull()]
-        if let speaker { payload["speaker_id"] = speaker } else { payload["segment_id"] = segment.id }
+        var payload: [String: Any] = ["model_run_id": run, "segment_id": segment.id,
+                                      "person_id": person.map { $0 as Any } ?? NSNull()]
+        if let speaker { payload["speaker_id"] = speaker }
         guard await model.command(payload, path: "api/speaker/assign") else { return false }
         refreshCount += 1
         return true

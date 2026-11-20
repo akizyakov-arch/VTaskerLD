@@ -182,7 +182,7 @@ pub fn serve(path: &Path) -> Result<()> {
         if let Err(error) = live_voice.poll(
             path,
             &store,
-            &capture_status["active"],
+            if worker.speaker_detection_enabled() { &capture_status["active"] } else { &Value::Null },
             !store.live_busy()?
                 && !voice.busy()
                 && worker.status()["running"] != true
@@ -605,12 +605,15 @@ pub fn serve(path: &Path) -> Result<()> {
                     "/api/voice/capture/accept" => Ok(
                         json!({"job_id":voice_capture.accept(&store,data["draft_id"].as_str().context("Выберите образец")?,data["person_id"].as_i64().context("Выберите участника")?,&voice_root,data["consent"].as_bool().unwrap_or(false),data["single_speaker"].as_bool().unwrap_or(false))?}),
                     ),
-                    "/api/voice/source" => store.voice_source_plan(
-                        data["model_run_id"]
-                            .as_i64()
-                            .context("Выберите версию встречи")?,
-                        data["speaker_id"].as_str().context("Выберите говорящего")?,
-                    ),
+                    "/api/voice/source" => {
+                        let run = data["model_run_id"].as_i64().context("Выберите версию встречи")?;
+                        let speaker = data["speaker_id"].as_str().context("Выберите говорящего")?;
+                        if data["preview"] == true {
+                            store.voice_source_preview(run, speaker)
+                        } else {
+                            store.voice_source_plan(run, speaker)
+                        }
+                    }
                     "/api/voice/from-meeting" => {
                         if !capture.status()["active"].is_null() || voice_capture.busy() {
                             bail!("Завершите запись перед регистрацией голосового профиля");
@@ -620,6 +623,9 @@ pub fn serve(path: &Path) -> Result<()> {
                         )
                     }
                     "/api/voice/match" => {
+                        if voice.status()["configured"] != true {
+                            bail!("Локальная модель голосового сопоставления не настроена");
+                        }
                         if !capture.status()["active"].is_null()
                             || voice_capture.busy()
                             || worker.status()["running"] == true
@@ -629,6 +635,15 @@ pub fn serve(path: &Path) -> Result<()> {
                         Ok(
                             json!({"job_id":store.queue_voice_matching(data["model_run_id"].as_i64().context("Выберите версию встречи")?)?}),
                         )
+                    }
+                    "/api/voice/match/progress" => {
+                        let run = data["model_run_id"].as_i64().context("Выберите версию встречи")?;
+                        let job = if voice.status()["configured"] == true {
+                            store.ensure_automatic_voice_matching(run)?
+                        } else {
+                            None
+                        };
+                        Ok(json!({"job":job,"enrollment_pending":store.voice_enrollment_pending_for_run(run)?}))
                     }
                     "/api/voice/matching/settings" => store.save_voice_matching_settings(&data),
                     "/api/voice/match/retry" => {
@@ -722,7 +737,8 @@ pub fn serve(path: &Path) -> Result<()> {
                         {
                             bail!("Завершите запись и обработку перед сменой модели");
                         }
-                        let settings = validate_speech_settings(&data)?;
+                        let mut settings = validate_speech_settings(&data)?;
+                        settings["speaker_detection"] = json!(worker.speaker_detection_enabled());
                         store.0.execute("INSERT INTO workspace_settings(key,data_json) VALUES ('speech',?1) ON CONFLICT(key) DO UPDATE SET data_json=excluded.data_json", [settings.to_string()])?;
                         if worker.settings["url"] != settings["url"] {
                             worker.api_key.clear();
@@ -734,6 +750,14 @@ pub fn serve(path: &Path) -> Result<()> {
                         if data["clear_key"] == true {
                             worker.api_key.clear();
                         }
+                        Ok(worker.status())
+                    }
+                    "/api/speech/speakers" => {
+                        let enabled = data["enabled"].as_bool().context("Выберите режим определения говорящих")?;
+                        let mut settings = worker.settings.clone();
+                        settings["speaker_detection"] = json!(enabled);
+                        store.0.execute("INSERT INTO workspace_settings(key,data_json) VALUES ('speech',?1) ON CONFLICT(key) DO UPDATE SET data_json=excluded.data_json", [settings.to_string()])?;
+                        worker.settings = settings;
                         Ok(worker.status())
                     }
                     "/api/people" => Ok(
@@ -885,6 +909,23 @@ pub fn serve(path: &Path) -> Result<()> {
                             + store.recover_capture(mid()?, &root)?;
                         Ok(json!({"recovered":count}))
                     }
+                    "/api/speaker/assign-fragments" => {
+                        let run = data["model_run_id"].as_i64().context("Не выбрана версия")?;
+                        let person = data["person_id"].as_i64().context("Выберите участника")?;
+                        let ids = data["segment_ids"].as_array().context("Выберите реплики")?
+                            .iter().map(|id| id.as_i64().context("Некорректный номер реплики"))
+                            .collect::<Result<Vec<_>>>()?;
+                        let enrollment = data.get("enrollment").filter(|value| !value.is_null());
+                        if enrollment.is_some() {
+                            if !capture.status()["active"].is_null() || voice_capture.busy() {
+                                bail!("Завершите запись перед регистрацией голосового профиля");
+                            }
+                            if voice.status()["configured"] != true {
+                                bail!("Локальная модель голосового сопоставления не настроена");
+                            }
+                        }
+                        store.assign_voice_fragments(run, &ids, person, data["assign"] != false, enrollment)
+                    }
                     "/api/speaker/assign" => {
                         let run = data["model_run_id"].as_i64().context("Не выбрана версия")?;
                         let person = match data.get("person_id") {
@@ -894,14 +935,12 @@ pub fn serve(path: &Path) -> Result<()> {
                             }
                             None => bail!("person_id обязателен; null снимает назначение"),
                         };
-                        let assignment = if let Some(segment) = data["segment_id"].as_i64() {
+                        let assignment = if let Some(speaker) = data["speaker_id"].as_str() {
+                            store.assign_speaker_from_segment(run, speaker, person, data["segment_id"].as_i64())?
+                        } else if let Some(segment) = data["segment_id"].as_i64() {
                             store.assign_segment(run, segment, person)?
                         } else {
-                            store.assign_speaker(
-                                run,
-                                data["speaker_id"].as_str().context("Говорящий не выбран")?,
-                                person,
-                            )?
+                            bail!("Говорящий не выбран");
                         };
                         Ok(json!({"assignment_id":assignment}))
                     }

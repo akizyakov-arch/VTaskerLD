@@ -37,7 +37,7 @@ impl Store {
             .as_ref()
             .filter(|config| config.speakers == 0)
             .zip(speaker_blocks::engine())
-            .map(|(config, engine)| SpeakerSession::new(config, &engine))
+            .map(|(config, engine)| SpeakerSession::new(config, &engine, speaker_blocks::LIVE_THREADS))
             .transpose()?;
         let mut voices = MeetingVoices::default();
         if let Some(speaker) = &speaker {
@@ -154,7 +154,13 @@ impl Store {
                         std::fs::remove_file(&normalized)?;
                     }
                     let duration = samples.len() as u64 * 1000 / 16000;
-                    let output = json!({"transcription":worker.transcribe_group(self, meeting, &samples, scratch, 0)?});
+                    let mut rows = worker.transcribe_group(self, meeting, &samples, scratch, start)?;
+                    for row in &mut rows {
+                        for key in ["from","to"] {
+                            row["offsets"][key] = json!(row["offsets"][key].as_u64().unwrap().saturating_sub(start));
+                        }
+                    }
+                    let output = json!({"transcription":rows});
                     let mut segments = parse_segments(&output, duration, &inputs[..count])?;
                     for segment in &mut segments {
                         for key in ["start_ms", "end_ms"] {

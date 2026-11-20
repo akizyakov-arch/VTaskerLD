@@ -41,6 +41,34 @@ fn setup() -> (tempfile::TempDir, Store, i64, SpeechConfig) {
     (tmp, store, meeting, config)
 }
 #[test]
+fn disabling_speaker_detection_keeps_text_processing_with_missing_diarization_assets() {
+    let (tmp, store, meeting, config) = setup();
+    assert!(store.speaker_detection_enabled().unwrap());
+    let conn = rusqlite::Connection::open(tmp.path().join("db")).unwrap();
+    conn.execute(
+        "INSERT INTO workspace_settings(key,data_json) VALUES ('speech',?1)",
+        [r#"{"speaker_detection":false}"#],
+    )
+    .unwrap();
+    store.enqueue(meeting).unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_vtracker"))
+        .arg("--db").arg(tmp.path().join("db")).args(["jobs", "run"])
+        .env("VTRACKER_WHISPER_BIN", config.engine)
+        .env("VTRACKER_WHISPER_MODEL", config.model)
+        .env("VTRACKER_FFMPEG_BIN", config.ffmpeg)
+        .env("VTRACKER_DIARIZATION_BIN", tmp.path().join("missing-diarization"))
+        .env_remove("VTRACKER_WHISPER_WORKER")
+        .env_remove("VTRACKER_VAD_MODEL")
+        .env_remove("VTRACKER_CLOUD_URL")
+        .output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let transcript = store.transcript(meeting).unwrap();
+    assert_eq!(transcript["segments"][0]["text"], "Тестовый результат");
+    assert_eq!(transcript["parameters"]["speaker_detection"], false);
+    assert_eq!(transcript["speaker_turns"], serde_json::json!([]));
+}
+
+#[test]
 fn transcript_has_timing_sources_and_failed_reprocessing_preserves_old_results() {
     let (_tmp, store, meeting, mut config) = setup();
     let job = store.enqueue(meeting).unwrap();

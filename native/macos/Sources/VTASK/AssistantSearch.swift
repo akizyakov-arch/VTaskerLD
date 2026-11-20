@@ -63,7 +63,7 @@ struct AssistantSearch: View {
     private var speakReplies = true
     @StateObject private var voice = VoiceSearch()
     @StateObject private var speech = AssistantSpeech()
-    @State private var voiceEnabled = true
+    @State private var voiceEnabled = false
     @State private var listenTurn = 0
     @State private var interpretation: Task<Void, Never>?
     @AppStorage("assistantSemanticInterpretation") private var semanticInterpretation = true
@@ -353,7 +353,10 @@ struct AssistantSearch: View {
             if error != nil { voiceEnabled = false }
         }
         .onChange(of: canUseMicrophone) { available in
-            if !available { voice.stop() }
+            if !available {
+                voiceEnabled = false
+                voice.stop()
+            }
         }
         .onAppear(perform: handleLiveRequests)
         .onChange(of: currentTask?.id) { _ in clearStatusRequest() }
@@ -365,6 +368,7 @@ struct AssistantSearch: View {
             if !enabled { speech.stop() }
         }
         .onDisappear {
+            voiceEnabled = false
             interpretation?.cancel()
             interpretation = nil
             voice.stop()

@@ -97,7 +97,7 @@ fn hints_are_local_tentative_and_never_assign_transcript_or_create_tasks() {
             .unwrap(),
         0
     );
-    assert_eq!(status["hint"]["start_ms"], 0);
+    assert_eq!(status["hint"]["start_ms"], 5000);
     assert_eq!(status["hint"]["end_ms"], 10000);
 }
 #[test]

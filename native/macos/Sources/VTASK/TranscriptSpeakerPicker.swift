@@ -14,7 +14,9 @@ struct TranscriptSpeakerPicker: View {
     @ObservedObject var model: WorkspaceModel
     let meeting: Meeting
     let segment: Transcript.Segment
-    let onAssign: (Int?, Bool) async -> Bool
+    let run: Int
+    let canMatch: Bool
+    let onAssign: (Int?, Bool, Bool) async -> Bool
 
     @State private var showEveryone = false
     @State private var query = ""
@@ -23,6 +25,7 @@ struct TranscriptSpeakerPicker: View {
     @State private var projectID: Int?
     @State private var selectedID: Int?
     @State private var wholeVoice = false
+    @State private var enrollment: MeetingVoiceSource?
 
     private var people: [Person] { model.workspace?.people ?? [] }
     private var projects: [Project] { model.workspace?.projects ?? [] }
@@ -89,12 +92,24 @@ struct TranscriptSpeakerPicker: View {
                     Text("Участники не найдены").foregroundStyle(.secondary).allowsHitTesting(false)
                 }
             }
-            if segment.speakerId != nil {
+            if let speaker = segment.speakerId {
                 Toggle("Применить ко всем репликам этого голоса", isOn: $wholeVoice)
+                Button("Назначить и сохранить образец голоса") {
+                    guard let selectedID else { return }
+                    save(selectedID, enrollment: MeetingVoiceSource(run: run, speaker: speaker,
+                                                                  personID: selectedID))
+                }
+                .disabled(!results.contains { $0.id == selectedID } || model.capture?.active != nil)
+            }
+            if canMatch {
+                Button("Назначить и сопоставить остальные голоса") {
+                    save(selectedID, rematch: true)
+                }
+                .disabled(!results.contains { $0.id == selectedID } || model.capture?.active != nil)
             }
             if let error = model.error { Text(error).foregroundStyle(.red) }
             HStack {
-                Button("Снять назначение") { save(nil) }
+                Button("Оставить говорящего неизвестным") { save(nil) }
                 Spacer()
                 Button("Отмена") { dismiss() }.keyboardShortcut(.cancelAction)
                 Button("Назначить") { save(selectedID) }
@@ -103,20 +118,37 @@ struct TranscriptSpeakerPicker: View {
             }
         }
         .padding(18)
-        .frame(width: 490, height: 435)
+        .frame(width: 490, height: 465)
         .disabled(model.saving || model.loading)
         .interactiveDismissDisabled(model.saving)
+        .sheet(item: $enrollment, onDismiss: { dismiss() }) { source in
+            MeetingVoiceEnrollment(model: model, meeting: meeting, source: source)
+                .sheetCloseButton(disabled: model.saving)
+        }
+        .onAppear {
+            if let person = segment.resolvedSpeakerID {
+                showEveryone = !meeting.participants.contains(person)
+                selectedID = person
+            }
+        }
         .onChange(of: showEveryone) { _ in
-            selectedID = nil
+            if !showEveryone, let selectedID, !meeting.participants.contains(selectedID) {
+                self.selectedID = nil
+            }
             organization = ""
             department = ""
             projectID = nil
         }
     }
 
-    private func save(_ personID: Int?) {
+    private func save(_ personID: Int?, rematch: Bool = false, enrollment: MeetingVoiceSource? = nil) {
         Task {
-            if await onAssign(personID, wholeVoice) { dismiss() }
+            guard await onAssign(personID, wholeVoice, rematch) else { return }
+            if let enrollment {
+                self.enrollment = enrollment
+            } else {
+                dismiss()
+            }
         }
     }
 }

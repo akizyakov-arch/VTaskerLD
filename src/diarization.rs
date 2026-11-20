@@ -2,7 +2,7 @@
 use crate::{audio::checksum, speech::resolve};
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 #[derive(Clone)]
@@ -137,6 +137,20 @@ pub fn attribution(start: u64, end: u64, turns: &[Value]) -> Value {
                 .push((a, b));
         }
     }
+    let mut concurrent = BTreeSet::new();
+    let mut spans: Vec<_> = by_speaker.iter().flat_map(|(speaker, ranges)| {
+        ranges.iter().map(move |&(start, end)| (start, end, speaker.as_str()))
+    }).collect();
+    spans.sort_unstable();
+    for (index, &(start, end, speaker)) in spans.iter().enumerate() {
+        for &(other_start, other_end, other) in spans[index + 1..].iter().take_while(|span| span.0 < end) {
+            if speaker != other && start.max(other_start) < end.min(other_end) {
+                concurrent.insert(speaker);
+                concurrent.insert(other);
+            }
+        }
+    }
+    let overlapping_speakers = json!(concurrent);
     let mut candidates = Vec::new();
     for (speaker, mut intervals) in by_speaker {
         intervals.sort();
@@ -156,5 +170,19 @@ pub fn attribution(start: u64, end: u64, turns: &[Value]) -> Value {
     let single = candidates.len() == 1
         && end > start
         && candidates[0]["overlap_ms"].as_u64().unwrap() >= (end - start).div_ceil(2);
-    json!({"speaker_id":if single {candidates[0]["speaker_id"].clone()} else {Value::Null},"speaker_status":if single {"single"} else if candidates.len()>1 {"multiple"} else {"unknown"},"speaker_candidates":candidates})
+    json!({"speaker_id":if single {candidates[0]["speaker_id"].clone()} else {Value::Null},"speaker_status":if single {"single"} else if candidates.len()>1 {"multiple"} else {"unknown"},"speaker_candidates":candidates,"overlapping_speakers":overlapping_speakers})
+}
+
+pub(crate) fn dominant_speaker_candidate(
+    start: u64, end: u64, attribution: &Value,
+) -> Option<&Value> {
+    let duration = end.checked_sub(start)?;
+    if duration == 0 { return None; }
+    let candidates = attribution["speaker_candidates"].as_array()?;
+    let main = candidates.iter().max_by_key(|candidate| candidate["overlap_ms"].as_u64())?;
+    let main_ms = main["overlap_ms"].as_u64()?;
+    let other_ms: u64 = candidates.iter().filter(|item| item["speaker_id"] != main["speaker_id"])
+        .filter_map(|item| item["overlap_ms"].as_u64()).sum();
+    (main_ms.saturating_mul(5) >= duration.saturating_mul(4)
+        && other_ms.saturating_mul(5) <= duration).then_some(main)
 }

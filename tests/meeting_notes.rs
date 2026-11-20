@@ -111,7 +111,7 @@ fn v13_upgrade_keeps_existing_meetings() {
     drop(store);
     let c = rusqlite::Connection::open(&path).unwrap();
     c.execute_batch(
-        "DROP TABLE decision_tasks; DROP TABLE decision_context; DROP TABLE ai_extraction_cache; DROP TABLE ai_usage; DROP TABLE meeting_analyses; DROP TABLE meeting_notes; DROP TABLE person_profiles; ALTER TABLE meetings DROP COLUMN scheduled_at; DROP TABLE speech_blocks; DROP TABLE speaker_blocks; ALTER TABLE live_chunks DROP COLUMN last_sequence; ALTER TABLE live_sessions DROP COLUMN speaker_turns_json; ALTER TABLE live_sessions DROP COLUMN speaker_profiles_json; ALTER TABLE processing_jobs DROP COLUMN stage; ALTER TABLE processing_jobs DROP COLUMN started_at; ALTER TABLE processing_jobs DROP COLUMN finished_at; PRAGMA user_version=13;",
+        "DROP TABLE live_voice_hints; DROP TABLE task_notifications; DROP TABLE task_links; DROP TABLE decision_tasks; DROP TABLE decision_context; DROP TABLE ai_extraction_cache; DROP TABLE ai_usage; DROP TABLE meeting_analyses; DROP TABLE meeting_notes; DROP TABLE person_profiles; ALTER TABLE meetings DROP COLUMN scheduled_at; DROP TABLE speech_blocks; DROP TABLE speaker_blocks; ALTER TABLE live_chunks DROP COLUMN last_sequence; ALTER TABLE live_sessions DROP COLUMN speaker_turns_json; ALTER TABLE live_sessions DROP COLUMN speaker_profiles_json; ALTER TABLE processing_jobs DROP COLUMN stage; ALTER TABLE processing_jobs DROP COLUMN started_at; ALTER TABLE processing_jobs DROP COLUMN finished_at; PRAGMA user_version=13;",
     )
     .unwrap();
     drop(c);

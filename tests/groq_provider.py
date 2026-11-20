@@ -113,4 +113,23 @@ class AIBudgetTests(unittest.TestCase):
   self.assertEqual(tasks, [{'id': 11, 'title': 'Заказать ткань для штор'}])
   self.assertEqual(decisions, [{'task_id': 11, 'text': 'Проверить образцы'}])
 
+ def test_history_and_materials_are_selected_per_fragment(self):
+  snapshot = {
+   'project_tasks': [{'id': 11, 'title': 'Согласовать смету ткани',
+                      'recent_change': {'due_date': {'before': '2026-11-30', 'after': '2026-11-24'}}}],
+   'project_materials': [{'id': 1, 'label': 'Смета ткани', 'url': 'https://example.test/fabric',
+                          'local_url': 'https://example.test/fabric?signature=synthetic'},
+                         {'id': 2, 'label': 'Склад мебели', 'url': 'https://example.test/furniture'}]
+  }
+  initial = [{'id': 42, 'text': 'Обсудить смету ткани'}]
+  history = [{'id': 42, 'text': 'Вернём прежний срок сметы ткани'}]
+  self.assertNotIn('recent_change', g.relevant_context(snapshot, initial, [])[0][0])
+  self.assertIn('recent_change', g.relevant_context(snapshot, history, [])[0][0])
+  materials = g.relevant_materials(snapshot, history)
+  self.assertEqual([link['id'] for link in materials], [1])
+  self.assertNotIn('local_url', materials[0])
+  result = {'tasks': [{'source_segment_ids': [42], 'material_ids': [1, 2]}], 'decisions': []}
+  verified = g.verified_proposals(result, {'segments': history, 'project_materials': materials})
+  self.assertEqual(verified['tasks'][0]['material_ids'], [1])
+
 if __name__=='__main__':unittest.main()

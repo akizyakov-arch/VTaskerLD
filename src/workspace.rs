@@ -77,6 +77,7 @@ fn clean(v: &mut Value) {
         "stage_title",
         "stage_kind",
         "task_counts",
+        "related_task_ids",
     ] {
         v.as_object_mut().unwrap().remove(key);
     }
@@ -496,6 +497,26 @@ struct TaskCounts {
     overdue: usize,
     done: usize,
 }
+
+fn task_links(c: &Connection, demo: bool, project: Option<i64>) -> Result<HashMap<i64, Vec<i64>>> {
+    let mut links = HashMap::<i64, Vec<i64>>::new();
+    let mut statement = c.prepare(
+        "SELECT l.task_id,l.related_task_id FROM task_links l JOIN tasks a ON a.id=l.task_id
+         JOIN tasks b ON b.id=l.related_task_id WHERE a.is_demo=?1 AND b.is_demo=?1
+         AND (?2 IS NULL OR (json_extract(a.data_json,'$.project_id')=?2 AND json_extract(b.data_json,'$.project_id')=?2))
+         ORDER BY l.task_id,l.related_task_id",
+    )?;
+    for relation in statement.query_map(params![demo,project], |row| Ok((row.get::<_,i64>(0)?,row.get::<_,i64>(1)?)))? {
+        let (task, related) = relation?;
+        links.entry(task).or_default().push(related);
+        links.entry(related).or_default().push(task);
+    }
+    for related in links.values_mut() {
+        related.sort_unstable();
+        related.dedup();
+    }
+    Ok(links)
+}
 impl TaskCounts {
     fn add(&mut self, task: &Value) {
         self.total += 1;
@@ -513,11 +534,15 @@ impl Store {
              WHERE is_demo=0 AND json_extract(data_json,'$.project_id')=?1",
         )?;
         let tasks = statement.query_map([project_id], decode_entity)?;
+        let mut links = task_links(&self.0, false, Some(project_id))?;
         let stages: HashMap<_, _> = project["stages"].as_array().into_iter().flatten()
             .filter_map(|stage| stage["id"].as_str().map(|id| (id, stage))).collect();
         let mut annotated = Vec::new();
         for task in tasks {
             let mut task = task?;
+            if let Some(related) = id(&task,"id").and_then(|id| links.remove(&id)) {
+                task["related_task_ids"] = json!(related);
+            }
             if let Some(stage) = task["stage_id"].as_str().and_then(|id| stages.get(id)) {
                 task["stage_title"] = stage["title"].clone();
                 task["stage_kind"] = stage["kind"].clone();
@@ -543,6 +568,7 @@ impl Store {
             .parse()
             .context("Неизвестный часовой пояс")?;
         let mut tasks = entities(&self.0, "tasks", demo)?;
+        let mut links = task_links(&self.0, demo, None)?;
         let mut projects = entities(&self.0, "projects", demo)?;
         let default_stages = default_stages();
         let stages_by_project: HashMap<_, _> = projects
@@ -551,6 +577,9 @@ impl Store {
             .collect();
         let mut task_counts = HashMap::<i64, TaskCounts>::new();
         for task in &mut tasks {
+            if let Some(related) = id(task,"id").and_then(|id| links.remove(&id)) {
+                task["related_task_ids"] = json!(related);
+            }
             let project_id = id(task, "project_id");
             let stages = match project_id {
                 Some(key) => stages_by_project
@@ -655,9 +684,26 @@ impl Store {
                 "task_ids":serde_json::from_str::<Value>(&row.get::<_,String>(10)?)?
             }));
         }
-        Ok(
-            json!({"schema_version":1,"mode":if demo {"demo"}else{"real"},"now":now.to_rfc3339(),"today":now.with_timezone(&tz).date_naive().to_string(),"settings":prefs,"default_stages":default_stages,"people":people,"projects":projects,"tasks":tasks,"meetings":meetings,"proposals":proposals,"decisions":decisions}),
-        )
+        let mut inbox = self.0.prepare(
+            "SELECT n.id,n.task_id,n.decision_id,n.payload_json,n.created_at,n.read_at
+             FROM task_notifications n JOIN tasks t ON t.id=n.task_id
+             WHERE n.recipient_id=?1 AND t.is_demo=?2
+             ORDER BY n.read_at IS NULL DESC,n.id DESC LIMIT 40",
+        )?;
+        let mut rows = inbox.query(params![id(&prefs, if demo {"demo_me_id"} else {"me_id"}),demo])?;
+        let mut notifications = Vec::new();
+        while let Some(row) = rows.next()? {
+            notifications.push(json!({
+                "id":row.get::<_,i64>(0)?,"task_id":row.get::<_,i64>(1)?,
+                "decision_id":row.get::<_,Option<i64>>(2)?,
+                "payload":serde_json::from_str::<Value>(&row.get::<_,String>(3)?)?,
+                "created_at":row.get::<_,String>(4)?,"read_at":row.get::<_,Option<String>>(5)?
+            }));
+        }
+        Ok(json!({"schema_version":1,"mode":if demo {"demo"}else{"real"},"now":now.to_rfc3339(),
+            "today":now.with_timezone(&tz).date_naive().to_string(),"settings":prefs,"default_stages":default_stages,
+            "people":people,"projects":projects,"tasks":tasks,"meetings":meetings,"proposals":proposals,
+            "decisions":decisions,"notifications":notifications}))
     }
     pub fn workspace_action(&self, body: &Value) -> Result<Value> {
         if body.get("demo").is_some_and(|v| !v.is_boolean()) {
@@ -669,6 +715,17 @@ impl Store {
         }
         let tx = self.0.unchecked_transaction()?;
         let result = match text(body, "op") {
+            "read_task_notification" => {
+                let me = id(&settings(&tx)?, if demo { "demo_me_id" } else { "me_id" });
+                let changed = tx.execute(
+                    "UPDATE task_notifications SET read_at=coalesce(read_at,strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+                     WHERE id=?1 AND recipient_id=?2 AND EXISTS
+                       (SELECT 1 FROM tasks WHERE tasks.id=task_notifications.task_id AND is_demo=?3)",
+                    params![id(body,"id"),me,demo],
+                )?;
+                if changed == 0 { bail!("Уведомление недоступно"); }
+                json!({"read":true})
+            }
             "save_meeting_notes" => {
                 let prefs = settings(&tx)?;
                 crate::meeting_notes::save(
@@ -986,7 +1043,11 @@ impl Store {
                 if changed != 1 { bail!("Предложение уже рассмотрено или недоступно"); }
                 json!({"saved":true})
             }
-            "review" => review(&tx, body, demo, None)?,
+            "review" => {
+                let result = review(&tx, body, demo, None)?;
+                notify_decision_only(&tx, body, &result)?;
+                result
+            }
             "review_batch" => {
                 let items = body["items"].as_array().context("Выберите предложения")?;
                 if items.is_empty() || items.len() > 100 {
@@ -1012,6 +1073,7 @@ impl Store {
                     ordered.insert(0, decision);
                 }
                 let mut results = Vec::with_capacity(items.len());
+                let mut notifications = std::collections::BTreeMap::new();
                 let mut revisions = std::collections::HashMap::<i64, (i64, i64)>::new();
                 for (index, item) in ordered.into_iter().enumerate() {
                     let mut request = item.clone();
@@ -1030,8 +1092,14 @@ impl Store {
                     }
                     let result = review(&tx, &request, demo, decision_id)
                         .map_err(|error| anyhow::anyhow!("Предложение №{}: {error}", item["id"]))?;
+                    if !associate { notify_decision_only(&tx, item, &result)?; }
                     if associate && index == 0 {
                         decision_id = Some(id(&result, "decision_id").context("Решение не сохранено")?);
+                    }
+                    if associate && result["task_changed"] == true {
+                        if let Some(task_id) = id(&result["task"],"id") {
+                            notifications.insert(task_id, (id(item,"id").unwrap(), result["task"].clone(),result["source"].clone()));
+                        }
                     }
                     if let (Some(task), Some(expected), Some(current)) =
                         (task, expected, id(&result["task"], "revision"))
@@ -1043,6 +1111,9 @@ impl Store {
                         }
                     }
                     results.push(result);
+                }
+                for (_, (proposal_id,task,source)) in notifications {
+                    notify_task_change(&tx, proposal_id, decision_id, &task, "decision", &source)?;
                 }
                 json!({"applied":results})
             }
@@ -1126,6 +1197,39 @@ fn save_decision(c: &Connection, project: Option<i64>, decision: &str, source: &
     Ok(decision_id)
 }
 
+fn notify_task_change(c: &Connection, proposal_id: i64, decision_id: Option<i64>,
+                      task: &Value, kind: &str, source: &Value) -> Result<()> {
+    let (Some(task_id), Some(recipient)) = (id(task, "id"), id(task, "assignee_id")) else {
+        return Ok(());
+    };
+    let event_key = decision_id.map_or_else(|| format!("proposal:{proposal_id}"), |id| format!("decision:{id}"));
+    let payload = json!({"kind":kind,"title":task["title"],"project_id":task["project_id"],
+        "due_date":task["due_date"],"due_time":task["due_time"],"stage_id":task["stage_id"],
+        "blocked":task["blocked"],"source":source});
+    c.execute(
+        "INSERT INTO task_notifications(event_key,task_id,recipient_id,proposal_id,decision_id,payload_json)
+         VALUES (?1,?2,?3,?4,?5,?6)
+         ON CONFLICT(event_key,task_id,recipient_id) DO UPDATE SET payload_json=excluded.payload_json",
+        params![event_key,task_id,recipient,proposal_id,decision_id,payload.to_string()],
+    )?;
+    Ok(())
+}
+
+fn notify_decision_only(c: &Connection, request: &Value, result: &Value) -> Result<()> {
+    let (Some(proposal), Some(decision)) = (id(request,"id"), id(result,"decision_id")) else {
+        return Ok(());
+    };
+    if !result["task"].is_null() { return Ok(()); }
+    let mut statement = c.prepare("SELECT task_id FROM decision_tasks WHERE decision_id=?1 ORDER BY task_id")?;
+    let tasks = statement.query_map([decision], |row| row.get::<_,i64>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for task_id in tasks {
+        let task = entity(c,"tasks",task_id)?;
+        notify_task_change(c,proposal,Some(decision),&task,"decision",&result["source"])?;
+    }
+    Ok(())
+}
+
 fn review(c: &Connection, body: &Value, demo: bool, linked_decision: Option<i64>) -> Result<Value> {
     let pid = id(body, "id").context("Предложение не выбрано")?;
     let (raw, status, scope): (String, String, bool) = c.query_row(
@@ -1159,7 +1263,13 @@ fn review(c: &Connection, body: &Value, demo: bool, linked_decision: Option<i64>
     let approved = &body["data"];
     let mut result = Value::Null;
     let mut applied_decision_id = linked_decision;
-    match text(&proposal, "kind") {
+    let kind = text(&proposal, "kind");
+    let mut task_changed = false;
+    if proposal["project_required"] == true && id(approved, "project_id").is_none()
+        && (kind == "decision" || (kind == "create_task" && id(body, "existing_task_id").is_none())) {
+        bail!("Выберите проект для этого пункта встречи");
+    }
+    match kind {
         "decision" => {
             let decision = text(approved, "title").trim();
             if decision.is_empty() {
@@ -1169,7 +1279,12 @@ fn review(c: &Connection, body: &Value, demo: bool, linked_decision: Option<i64>
             if let Some(p) = project {
                 same_scope(&entity(c, "projects", p)?, demo)?;
             }
-            applied_decision_id = Some(save_decision(c, project, decision, source, approved, demo)?);
+            let mut details = approved.clone();
+            if details.get("task_ids").is_none() && project == id(&proposal,"project_id")
+                && proposal["decision_task_ids"].is_array() {
+                details["task_ids"] = proposal["decision_task_ids"].clone();
+            }
+            applied_decision_id = Some(save_decision(c, project, decision, source, &details, demo)?);
         }
         "create_task" => {
             if let Some(existing) = id(body, "existing_task_id") {
@@ -1195,6 +1310,7 @@ fn review(c: &Connection, body: &Value, demo: bool, linked_decision: Option<i64>
                 }
                 if body["apply_due"] == true || body["apply_assignee"] == true {
                     validate_task(c, &mut data, demo, Some(existing))?;
+                    task_changed = ["assignee_id", "due_date", "due_time"].iter().any(|key| data[*key] != old[*key]);
                 }
                 result = save(c, "tasks", data, Some(&old), demo, None)?;
             } else {
@@ -1212,6 +1328,17 @@ fn review(c: &Connection, body: &Value, demo: bool, linked_decision: Option<i64>
                     }
                 }
                 let mut data = approved.clone();
+                let related = approved.get("related_task_id").unwrap_or(&proposal["related_task_id"]);
+                let related_task = if related.is_null() { None } else {
+                    let task_id = related.as_i64().context("Некорректная связанная задача")?;
+                    let related = entity(c, "tasks", task_id)?;
+                    same_scope(&related, demo)?;
+                    if id(&related, "project_id") != id(approved, "project_id") {
+                        bail!("Связанная задача должна относиться к выбранному проекту");
+                    }
+                    Some(task_id)
+                };
+                data.as_object_mut().context("Нужны поля задачи")?.remove("related_task_id");
                 let mut sources = vec![source.clone()];
                 let mut merged = std::collections::HashSet::new();
                 if let Some(related) = body.get("related_proposal_ids") {
@@ -1246,6 +1373,11 @@ fn review(c: &Connection, body: &Value, demo: bool, linked_decision: Option<i64>
                 }
                 data["sources"] = json!(sources);
                 result = task_save(c, &json!({"data":data}), demo, None)?;
+                task_changed = true;
+                if let Some(related) = related_task {
+                    c.execute("INSERT INTO task_links(task_id,related_task_id,source_json) VALUES (?1,?2,?3)",
+                        params![id(&result,"id"), related, source.to_string()])?;
+                }
                 for related_id in merged {
                     c.execute(
                         "UPDATE proposals SET status='accepted',data_json=json_remove(
@@ -1261,21 +1393,29 @@ fn review(c: &Connection, body: &Value, demo: bool, linked_decision: Option<i64>
                 .context("Выберите существующую задачу")?;
             let old = entity(c, "tasks", tid)?;
             same_scope(&old, demo)?;
+            if matches!(text(&proposal,"origin"),"groq" | "local_analysis")
+                && id(&proposal,"task_id") == Some(tid) && !proposal["project_id"].is_null()
+                && id(&proposal,"project_id") != id(&old,"project_id") {
+                bail!("Задачу перенесли в другой проект. Выберите её заново после повторного анализа");
+            }
             if body["task_revision"] != old["revision"] {
                 bail!("Задача изменилась после открытия предложения. Проверьте новые значения");
             }
             let fields = change_fields(kind);
-            let base = &proposal["base_task"];
-            if id(&proposal, "task_id") == Some(tid)
-                && body["acknowledge_task_conflict"] != true
-                && base.is_object()
-                && fields.iter().any(|key| base[*key] != old[*key])
+            let baseline = if id(&proposal, "task_id") == Some(tid) {
+                proposal.get("base_task")
+            } else {
+                proposal["candidate_baselines"].as_array().into_iter().flatten()
+                    .find(|candidate| id(candidate,"task_id") == Some(tid)).map(|candidate| &candidate["base"])
+            };
+            if body["acknowledge_task_conflict"] != true
+                && baseline.is_some_and(|base| base.is_object() && fields.iter().any(|key| base[*key] != old[*key]))
             {
                 bail!("Поля задачи изменились после анализа. Сверьте текущие значения и подтвердите замену");
             }
             if kind == "change_task" {
                 if old["project_id"] != proposal["project_id"] {
-                    bail!("Выберите задачу из проекта совещания");
+                    bail!("Выберите задачу из проекта предложения");
                 }
                 let project = entity(c, "projects", id(&old, "project_id").context("Задача без проекта")?)?;
                 if project["archived"] == true || !project["stages"].as_array().into_iter().flatten()
@@ -1291,6 +1431,7 @@ fn review(c: &Connection, body: &Value, demo: bool, linked_decision: Option<i64>
                 data[*key] = approved[*key].clone();
             }
             validate_task(c, &mut data, demo, Some(tid))?;
+            task_changed = fields.iter().any(|key| data[*key] != old[*key]);
             let mut sources = data["sources"].as_array().cloned().unwrap_or_default();
             let mut evidence = source.clone();
             evidence["proposal_id"] = json!(pid);
@@ -1317,6 +1458,9 @@ fn review(c: &Connection, body: &Value, demo: bool, linked_decision: Option<i64>
     if let Some(decision) = linked_decision {
         link_decision_task(c, decision, id(&result, "id").context("Выберите предложение по задаче")?, linked_project, demo)?;
     }
+    if task_changed && linked_decision.is_none() {
+        notify_task_change(c, pid, applied_decision_id, &result, kind, source)?;
+    }
     let mut saved = proposal.clone();
     saved.as_object_mut().context("Некорректное предложение")?.remove("review_draft");
     saved["confirmed_task_id"] = result["id"].clone();
@@ -1331,7 +1475,8 @@ fn review(c: &Connection, body: &Value, demo: bool, linked_decision: Option<i64>
         "UPDATE proposals SET status='accepted',data_json=?2 WHERE id=?1",
         params![pid, saved.to_string()],
     )?;
-    Ok(json!({"accepted":true,"task":result,"decision_id":applied_decision_id}))
+    Ok(json!({"accepted":true,"task":result,"decision_id":applied_decision_id,
+        "task_changed":task_changed,"source":source}))
 }
 impl Store {
     fn seed_demo(&self) -> Result<Value> {

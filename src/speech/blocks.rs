@@ -71,6 +71,26 @@ pub(crate) struct WhisperSession {
     fingerprint: String,
     pub(crate) model_hash: String,
     pub(crate) engine_hash: String,
+    tail: Vec<i16>,
+    tail_text: String,
+    window_end_ms: Option<u64>,
+}
+
+pub(crate) const OVERLAP_FRAMES: usize = 16000;
+
+pub(crate) fn trim_overlap_text(previous: &str, text: &str) -> String {
+    fn key(word: &str) -> String {
+        word.trim_matches(|ch: char| !ch.is_alphanumeric()).to_lowercase().replace('ё', "е")
+    }
+    let before: Vec<_> = previous.split_whitespace().map(key).collect();
+    let words: Vec<_> = text.split_whitespace().collect();
+    let after: Vec<_> = words.iter().map(|word| key(word)).collect();
+    let shared = (1..=before.len().min(after.len()).min(12)).rev().find(|&n| {
+        let suffix = &before[before.len()-n..];
+        (n > 1 || suffix[0].chars().count() >= 4)
+            && !suffix.iter().any(String::is_empty) && suffix == &after[..n]
+    });
+    shared.map_or_else(|| text.to_owned(), |n| words[n..].join(" "))
 }
 impl WhisperSession {
     pub(crate) fn start(config: &SpeechConfig, engine: &Path) -> Result<Self> {
@@ -92,6 +112,9 @@ impl WhisperSession {
             fingerprint,
             model_hash,
             engine_hash,
+            tail: Vec::new(),
+            tail_text: String::new(),
+            window_end_ms: None,
         })
     }
 
@@ -170,6 +193,12 @@ pub(crate) fn capture_block_len(inputs: &[Value]) -> usize {
 }
 
 impl WhisperSession {
+    fn clear_context(&mut self) {
+        self.tail.clear();
+        self.tail_text.clear();
+        self.window_end_ms = None;
+    }
+
     pub(crate) fn transcribe_group(
         &mut self,
         store: &Store,
@@ -187,17 +216,41 @@ impl WhisperSession {
             } else {
                 30 * 16000
             };
-            let result = self.transcribe(store, meeting, &remaining[..size], scratch)?;
             let shift = offset_ms + cursor as u64 * 1000 / 16000;
-            for segment in parse_segments(&result, size as u64 * 1000 / 16000, &[])? {
+            if !self.window_end_ms.is_some_and(|end| end.abs_diff(shift) <= 2) {
+                self.clear_context();
+            }
+            let block = &remaining[..size];
+            let prefix_ms = self.tail.len() as u64 * 1000 / 16000;
+            let window_start = shift.saturating_sub(prefix_ms);
+            let mut window = Vec::with_capacity(self.tail.len() + size);
+            window.extend_from_slice(&self.tail);
+            window.extend_from_slice(block);
+            let result = self.transcribe(store, meeting, &window, scratch)?;
+            let end = shift + size as u64 * 1000 / 16000;
+            let first_row = rows.len();
+            for segment in parse_segments(&result, window.len() as u64 * 1000 / 16000, &[])? {
+                let from = window_start + segment["start_ms"].as_u64().unwrap();
+                let to = (window_start + segment["end_ms"].as_u64().unwrap()).min(end);
+                if to <= shift { continue; }
+                let recognized = segment["text"].as_str().unwrap_or_default();
+                let text = if from < shift {
+                    let trimmed = trim_overlap_text(&self.tail_text, recognized);
+                    if trimmed.is_empty() && to.saturating_sub(shift) > 550 {
+                        recognized.to_owned()
+                    } else { trimmed }
+                } else { recognized.to_owned() };
+                if text.trim().is_empty() { continue; }
                 rows.push(json!({
-                    "text":segment["text"],
-                    "offsets":{
-                        "from":segment["start_ms"].as_u64().unwrap() + shift,
-                        "to":segment["end_ms"].as_u64().unwrap() + shift,
-                    },
+                    "text":text,"offsets":{"from":from.max(shift),"to":to},
                 }));
             }
+            self.tail_text = rows[first_row..].iter()
+                .filter(|row| row["offsets"]["to"].as_u64().is_some_and(|to| to > end.saturating_sub(1000)))
+                .filter_map(|row| row["text"].as_str()).collect::<Vec<_>>().join(" ");
+            self.tail.clear();
+            self.tail.extend_from_slice(&block[block.len().saturating_sub(OVERLAP_FRAMES)..]);
+            self.window_end_ms = Some(end);
             cursor += size;
         }
         Ok(rows)
@@ -219,7 +272,12 @@ pub(crate) fn transcribe_file(
     let mut offset = 0u64;
     let mut rows = Vec::new();
     let mut pending = inputs;
+    let mut previous_session = Value::Null;
     while !pending.is_empty() {
+        if pending[0]["session_id"].is_null() || pending[0]["session_id"] != previous_session {
+            session.clear_context();
+        }
+        previous_session = pending[0]["session_id"].clone();
         let count = capture_block_len(pending);
         let frames = pending[..count]
             .iter()
@@ -257,4 +315,56 @@ pub(crate) fn transcribe_file(
         pending = &pending[count..];
     }
     Ok(json!({"transcription":rows}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::trim_overlap_text;
+
+    #[test]
+    fn audio_prefix_removes_only_the_matching_words_at_the_boundary() {
+        assert_eq!(trim_overlap_text("Мы закупим ткань для", "Ткань для штор и скатертей"),"штор и скатертей");
+        assert_eq!(trim_overlap_text("Срок в пятницу.", "Пятницу, как договорились."),"как договорились.");
+        assert_eq!(trim_overlap_text("Ткань уже закупили", "Закупку перенесём на завтра"),"Закупку перенесём на завтра");
+        assert_eq!(trim_overlap_text("Согласуем и", "И начнём работу"),"И начнём работу");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn contiguous_decoder_windows_include_audio_context_and_keep_one_copy_of_the_boundary() {
+        use super::{json, SpeechConfig, Store, WhisperSession};
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let model = dir.path().join("model");
+        let engine = dir.path().join("whisper");
+        std::fs::write(&model, b"fixture").unwrap();
+        std::fs::write(&engine, r#"#!/usr/bin/env python3
+import json, sys
+from pathlib import Path
+for line in sys.stdin:
+    frames = Path(json.loads(line)['pcm']).stat().st_size // 4
+    if frames == 32000:
+        rows = [{'text':'Проверим ткань для','offsets':{'from':0,'to':2000}}]
+    elif frames == 48000:
+        rows = [
+            {'text':'Перед стыком','offsets':{'from':0,'to':500}},
+            {'text':'Ткань для штор','offsets':{'from':500,'to':2500}},
+        ]
+    else:
+        raise ValueError(frames)
+    print(json.dumps({'transcription':rows},ensure_ascii=False),flush=True)
+"#).unwrap();
+        std::fs::set_permissions(&engine,std::fs::Permissions::from_mode(0o700)).unwrap();
+        let store = Store::open(&dir.path().join("db")).unwrap();
+        let meeting = store.create_meeting("Стык блоков").unwrap();
+        let config = SpeechConfig {
+            engine:engine.clone(),model,ffmpeg:"ffmpeg".into(),language:"ru".into(),vad_model:None,diarization:None,
+        };
+        let mut session = WhisperSession::start(&config,&engine).unwrap();
+        assert_eq!(session.transcribe_group(&store,meeting,&[1;32000],dir.path(),0).unwrap()[0]["text"],"Проверим ткань для");
+        let rows = session.transcribe_group(&store,meeting,&[2;32000],dir.path(),2000).unwrap();
+        assert_eq!(rows,vec![json!({"text":"штор","offsets":{"from":2000,"to":3500}})]);
+        let rows = session.transcribe_group(&store,meeting,&[2;32000],dir.path(),5000).unwrap();
+        assert_eq!(rows[0]["text"],"Проверим ткань для");
+    }
 }

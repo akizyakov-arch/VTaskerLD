@@ -1,15 +1,15 @@
-//! Ephemeral, local voice hints. Never writes identities or transcript assignments.
+//! Local voice hints. Stored as evidence separately from confirmed speaker assignments.
 use crate::{
     audio::checksum,
     speech::run_command,
-    voice::{normalize, quality, VoiceConfig},
+    voice::{normalize, voice_quality, VoiceConfig},
     Store,
 };
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OpenFlags};
 use serde_json::{json, Value};
 use std::{
-    path::{Path, PathBuf},
+    path::Path,
     process::Command,
     sync::mpsc::{self, Receiver},
     thread,
@@ -17,6 +17,147 @@ use std::{
 };
 
 type Outcome = std::result::Result<Value, String>;
+
+impl Store {
+    fn save_live_voice_hint(&self, hint: &Value) -> Result<()> {
+        let (Some(occurrence), Some(meeting), Some(profile), Some(person), Some(start), Some(end), Some(score)) = (
+            hint["occurrence_id"].as_i64(), hint["meeting_id"].as_i64(), hint["profile_id"].as_i64(),
+            hint["person_id"].as_i64(), hint["start_ms"].as_i64(), hint["end_ms"].as_i64(), hint["similarity"].as_f64(),
+        ) else { return Ok(()); };
+        if end <= start || start < 0 { return Ok(()); }
+        self.0.execute(
+            "INSERT OR REPLACE INTO live_voice_hints(occurrence_id,meeting_id,profile_id,person_id,start_ms,end_ms,similarity)
+             SELECT a.id,a.meeting_id,v.id,v.person_id,?5,?6,?7
+             FROM audio_timeline a JOIN voice_profiles v ON v.id=?3 AND v.person_id=?4
+             JOIN meeting_people mp ON mp.meeting_id=a.meeting_id AND mp.person_id=v.person_id
+             WHERE a.id=?1 AND a.meeting_id=?2 AND EXISTS(
+               SELECT 1 FROM voice_samples s JOIN voice_consents c ON c.id=s.consent_id
+               WHERE s.person_id=v.person_id AND s.model_sha256=v.model_sha256 AND c.revoked_at IS NULL)",
+            params![occurrence,meeting,profile,person,start,end,score],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn transcript_live_voice_hints(&self, meeting: i64, run: i64) -> Result<Vec<Value>> {
+        let mut statement = self.0.prepare(
+            "SELECT h.start_ms,h.end_ms,h.person_id,p.name,h.profile_id,h.similarity
+             FROM model_runs r JOIN json_each(r.inputs_json) i
+             JOIN live_voice_hints h ON h.occurrence_id=json_extract(i.value,'$.occurrence_id') AND h.meeting_id=r.meeting_id
+             JOIN people p ON p.id=h.person_id
+             JOIN voice_profiles v ON v.id=h.profile_id AND v.person_id=h.person_id
+             JOIN meeting_people mp ON mp.meeting_id=h.meeting_id AND mp.person_id=h.person_id
+             WHERE r.meeting_id=?1 AND r.id=?2
+               AND EXISTS(SELECT 1 FROM voice_samples s JOIN voice_consents c ON c.id=s.consent_id
+                 WHERE s.person_id=v.person_id AND s.model_sha256=v.model_sha256 AND c.revoked_at IS NULL)
+             ORDER BY h.start_ms,h.end_ms",
+        )?;
+        let rows = statement.query_map(params![meeting,run], |r| Ok(json!({
+            "start_ms":r.get::<_,u64>(0)?,"end_ms":r.get::<_,u64>(1)?,"person_id":r.get::<_,i64>(2)?,
+            "person_name":r.get::<_,String>(3)?,"profile_id":r.get::<_,i64>(4)?,"similarity":r.get::<_,f64>(5)?
+        })))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+}
+
+pub(crate) fn suggestion_from_live(start: u64, end: u64, hints: &[Value]) -> Option<Value> {
+    if start >= end { return None; }
+    let mut person = None;
+    let mut best: Option<(&Value,u64)> = None;
+    let mut spans = Vec::new();
+    for hint in hints {
+        let from = hint["start_ms"].as_u64()?.max(start);
+        let to = hint["end_ms"].as_u64()?.min(end);
+        let overlap = to.saturating_sub(from);
+        if overlap < (end - start).min(400) { continue; }
+        let id = hint["person_id"].as_i64()?;
+        if person.is_some_and(|previous| previous != id) { return None; }
+        person = Some(id);
+        spans.push((from,to));
+        if best.is_none_or(|(_,duration)| overlap > duration) { best = Some((hint,overlap)); }
+    }
+    let (hint, _) = best?;
+    spans.sort_unstable();
+    let mut covered = 0u64;
+    let mut through = start;
+    for (from,to) in spans {
+        covered += to.saturating_sub(from.max(through));
+        through = through.max(to);
+    }
+    if covered.saturating_mul(5) < (end - start).saturating_mul(3) { return None; }
+    Some(json!({"status":"candidate","person_id":hint["person_id"],"person_name":hint["person_name"],
+        "profile_id":hint["profile_id"],"similarity":hint["similarity"],"source":"live_voice",
+        "reason":"Совпадение с голосовым профилем во время записи"}))
+}
+
+pub(crate) fn suggestion_for_segment(
+    start: u64,
+    end: u64,
+    hints: &[Value],
+    turns: &[Value],
+    candidates: &[Value],
+    matches: &[Value],
+) -> Option<Value> {
+    let live = suggestion_from_live(start, end, hints);
+    if candidates.len() < 2 {
+        return live;
+    }
+
+    let mut consensus: Option<Value> = None;
+    for candidate in candidates {
+        let matched = matches.iter().find(|entry| {
+            entry["speaker_id"] == candidate["speaker_id"] && entry["status"] == "candidate"
+        });
+        let evidence = if candidate["assignment_source"] == "manual_speaker" {
+            candidate["person_id"].as_i64()?;
+            json!({"person_id":candidate["person_id"],"person_name":candidate["person_name"]})
+        } else if let Some(matched) = matched {
+            matched.clone()
+        } else {
+            let live = live.as_ref()?;
+            for turn in turns.iter().filter(|turn| turn["speaker_id"] == candidate["speaker_id"]) {
+                let from = start.max(turn["start_ms"].as_u64()?);
+                let to = end.min(turn["end_ms"].as_u64()?);
+                if from < to && suggestion_from_live(from, to, hints)
+                    .is_none_or(|hint| hint["person_id"] != live["person_id"])
+                {
+                    return None;
+                }
+            }
+            live.clone()
+        };
+        if consensus.as_ref().is_some_and(|previous| previous["person_id"] != evidence["person_id"])
+            || live.as_ref().is_some_and(|hint| hint["person_id"] != evidence["person_id"])
+        {
+            return None;
+        }
+        if consensus.as_ref().is_none_or(|previous| {
+            previous["similarity"].is_null() && !evidence["similarity"].is_null()
+        }) {
+            consensus = Some(evidence);
+        }
+    }
+    consensus.map(|evidence| json!({
+        "status":"candidate", "person_id":evidence["person_id"], "person_name":evidence["person_name"],
+        "similarity":evidence["similarity"], "source":"segment_consensus",
+        "reason":"Группы голоса в этой реплике совпали с одним участником"
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn uses_coverage_without_counting_equal_windows_twice_or_overriding_conflicts() {
+        let hint = |person,start,end| json!({"person_id":person,"start_ms":start,"end_ms":end,
+            "person_name":"Участник","profile_id":person,"similarity":0.9});
+        let a = hint(1,0,4500);
+        let b = hint(1,3500,8500);
+        assert_eq!(suggestion_from_live(0,10000,&[a.clone(),b]).unwrap()["person_id"],1);
+        assert!(suggestion_from_live(0,10000,&[a.clone(),a.clone()]).is_none());
+        assert!(suggestion_from_live(0,10000,&[a,hint(2,3500,10000)]).is_none());
+    }
+}
 pub struct LiveVoiceWorker {
     config: Option<VoiceConfig>,
     rx: Option<Receiver<Outcome>>,
@@ -56,7 +197,7 @@ impl LiveVoiceWorker {
                 .map(|t| t.elapsed().as_millis() as u64)
                 .unwrap_or(0));
         }
-        json!({"configured":self.config.is_some(),"running":self.busy(),"hint":v,"mode":"tentative-last-10-seconds"})
+        json!({"configured":self.config.is_some(),"running":self.busy(),"hint":v,"mode":"tentative-latest-fragment"})
     }
     pub fn poll(
         &mut self,
@@ -113,6 +254,7 @@ impl LiveVoiceWorker {
                         }
                         self.challenger = None;
                     }
+                    if value["status"] == "candidate" { store.save_live_voice_hint(&value)?; }
                     self.value = value;
                     self.received = Some(Instant::now());
                 }
@@ -162,11 +304,11 @@ impl LiveVoiceWorker {
             return Ok(());
         };
         let occurrence = last["occurrence_id"].as_i64().unwrap_or(0);
-        if occurrence == self.last_occurrence || inputs.len() < 2 {
+        if occurrence == self.last_occurrence {
             return Ok(());
         }
         self.last_occurrence = occurrence;
-        let window = inputs[inputs.len() - 2..].to_vec();
+        let fragment = last.clone();
         let settings = store.voice_matching_settings()?;
         let config = self.config.as_ref().unwrap();
         let config = VoiceConfig {
@@ -179,7 +321,7 @@ impl LiveVoiceWorker {
         let (tx, rx) = mpsc::channel();
         self.rx = Some(rx);
         thread::spawn(move || {
-            let result = analyze(&db, mid, &session, &window, &settings, &config)
+            let result = analyze(&db, mid, &session, &fragment, &settings, &config)
                 .map_err(|e| format!("Подсказка недоступна: {e}"));
             let _ = tx.send(result);
         });
@@ -190,7 +332,7 @@ fn analyze(
     db: &Path,
     mid: i64,
     session: &str,
-    inputs: &[Value],
+    fragment: &Value,
     settings: &Value,
     config: &VoiceConfig,
 ) -> Result<Value> {
@@ -209,50 +351,27 @@ fn analyze(
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    let mut result = json!({"session_id":session,"meeting_id":mid,"status":"unknown","person_id":null,"profile_id":null,"start_ms":inputs[0]["start_ms"],"end_ms":inputs.last().unwrap()["end_ms"],"reason":"Нет совместимых профилей с действующим согласием"});
+    let mut result = json!({"session_id":session,"meeting_id":mid,"status":"unknown","person_id":null,"profile_id":null,
+        "start_ms":fragment["start_ms"],"end_ms":fragment["end_ms"],
+        "occurrence_id":fragment["occurrence_id"],"reason":"Нет совместимых профилей с действующим согласием"});
     if profiles.is_empty() {
         return Ok(result);
     }
     let wav = dir.path().join("window.wav");
-    let mut writer = hound::WavWriter::create(
-        &wav,
-        hound::WavSpec {
-            channels: 1,
-            sample_rate: 16000,
-            bits_per_sample: 16,
-            sample_format: hound::SampleFormat::Int,
-        },
+    let path = Path::new(fragment["path"].as_str().context("Нет WAV")?);
+    anyhow::ensure!(
+        checksum(path)? == fragment["sha256"].as_str().unwrap_or(""),
+        "Повреждён фрагмент"
+    );
+    run_command(
+        Command::new(&config.ffmpeg)
+            .args(["-nostdin", "-hide_banner", "-loglevel", "error", "-i"])
+            .arg(path)
+            .args(["-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", "-threads", "1"])
+            .arg(&wav),
+        Duration::from_secs(4),
     )?;
-    for (i, input) in inputs.iter().enumerate() {
-        let path = PathBuf::from(input["path"].as_str().context("Нет WAV")?);
-        anyhow::ensure!(
-            checksum(&path)? == input["sha256"].as_str().unwrap_or(""),
-            "Повреждён фрагмент"
-        );
-        let part = dir.path().join(format!("{i}.wav"));
-        run_command(
-            Command::new(&config.ffmpeg)
-                .args(["-nostdin", "-hide_banner", "-loglevel", "error", "-i"])
-                .arg(path)
-                .args([
-                    "-ac",
-                    "1",
-                    "-ar",
-                    "16000",
-                    "-c:a",
-                    "pcm_s16le",
-                    "-threads",
-                    "1",
-                ])
-                .arg(&part),
-            Duration::from_secs(4),
-        )?;
-        for sample in hound::WavReader::open(part)?.samples::<i16>() {
-            writer.write_sample(sample?)?;
-        }
-    }
-    writer.finalize()?;
-    if let Err(e) = quality(&wav) {
+    if let Err(e) = voice_quality(&wav, 4.0) {
         result["reason"] = json!(e.to_string());
         return Ok(result);
     }
@@ -294,7 +413,7 @@ fn analyze(
             result["status"] = json!("candidate");
             result["person_id"] = json!(best.2);
             result["profile_id"] = json!(best.1);
-            result["reason"]=json!("Предварительная подсказка по последним 10 секундам. Несколько голосов могут смешиваться; имя требует проверки.");
+            result["reason"] = json!("Совпадение с профилем по последнему фрагменту записи");
         } else {
             result["reason"] = if best.0 < threshold {
                 json!(format!(

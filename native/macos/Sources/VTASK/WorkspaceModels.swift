@@ -10,6 +10,7 @@ struct Workspace: Decodable {
     let today: String
     let proposals: [Proposal]
     let decisions: [Decision]
+    let notifications: [TaskNotification]?
 
     var visibleTasks: [TaskItem] {
         let archivedIDs = Set(projects.filter { $0.archived == true }.map(\.id))
@@ -54,6 +55,7 @@ struct TaskItem: Decodable, Identifiable {
     let blockedReason: String?
     let authorId: Int?
     let dependencies: [Int]?
+    let relatedTaskIds: [Int]?
     let sources: [TaskSource]?
     let createdAt: String?
     let updatedAt: String?
@@ -61,10 +63,46 @@ struct TaskItem: Decodable, Identifiable {
     let dueTime: String?
 }
 
+struct TaskNotification: Decodable, Identifiable {
+    struct Payload: Decodable {
+        let title: String
+        let kind: String
+    }
+
+    let id: Int
+    let taskId: Int
+    let payload: Payload
+    let readAt: String?
+
+    var label: String {
+        switch payload.kind {
+        case "create_task": return "Поручение утверждено"
+        case "change_due": return "Срок изменён"
+        case "change_assignee": return "Вам назначена задача"
+        case "change_blocked": return "Блокировка изменена"
+        case "change_status": return "Статус изменён"
+        default: return "Изменения утверждены"
+        }
+    }
+}
+
+struct AnalysisMaterialLink: Decodable, Equatable, Identifiable {
+    let id: Int
+    let label: String
+    let url: String
+
+    var target: URL? {
+        guard let target = URL(string: url), let scheme = target.scheme,
+              ["https", "http"].contains(scheme), target.host != nil else { return nil }
+        return target
+    }
+}
+
 struct TaskSource: Decodable, Equatable {
     let meetingId: Int?
     let quote: String?
     let topic: String?
+    let materialLinks: [AnalysisMaterialLink]?
 }
 
 struct Meeting: Decodable, Identifiable {
@@ -124,10 +162,11 @@ struct CaptureStatus: Decodable, Equatable {
     let hint: SpeakerHint?
 
     struct SpeakerHint: Decodable, Equatable {
-        let sessionId: String
+        let sessionId: String?
         let personId: Int?
         let status: String
         let ageMs: Int?
+        let endMs: Int?
     }
 
     struct Session: Decodable, Equatable {

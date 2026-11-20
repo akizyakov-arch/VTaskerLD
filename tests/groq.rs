@@ -412,6 +412,61 @@ fn review_combines_pending_purchase_and_deadline_with_an_accepted_decision() {
 }
 
 #[test]
+fn retranscribing_an_overlapping_excerpt_does_not_reopen_an_accepted_task() {
+    let (dir, store, meeting, segment) = setup();
+    let conn = Connection::open(dir.path().join("db")).unwrap();
+    conn.execute("UPDATE segments SET start_ms=32000,end_ms=35000 WHERE id=?1", [segment]).unwrap();
+    let (first, _, _) = store.groq_prepare(meeting, MODELS[0], true).unwrap();
+    let mut initial = output(segment);
+    initial["decisions"] = json!([]);
+    store.groq_complete(first, &initial).unwrap();
+    let proposal = store.workspace(false, None).unwrap()["proposals"][0]["id"].clone();
+    let accepted = store.workspace_action(&json!({"op":"review","id":proposal,"data":{
+        "title":"Prepare report","stage_id":"todo","blocked":false,"priority":"normal"
+    }})).unwrap();
+
+    conn.execute(
+        "INSERT INTO processing_jobs(meeting_id,kind,status) VALUES (?1,'transcribe','completed')",
+        [meeting],
+    ).unwrap();
+    let job = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO model_runs(job_id,meeting_id,model_path,model_sha256,engine_path,engine_sha256,language,status,inputs_json)
+         VALUES (?1,?2,'fixture',?3,'fixture',?3,'ru','completed','[]')",
+        params![job, meeting, "0".repeat(64)],
+    ).unwrap();
+    let run = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO segments(model_run_id,start_ms,end_ms,text,sources_json)
+         VALUES (?1,20000,35000,'We still need to prepare the report by Friday','[]')",
+        [run],
+    ).unwrap();
+    let overlapping = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO segments(model_run_id,start_ms,end_ms,text,sources_json)
+         VALUES (?1,90000,94000,'Prepare a separate report','[]')",
+        [run],
+    ).unwrap();
+    let separate = conn.last_insert_rowid();
+
+    let (second, input, _) = store.groq_prepare(meeting, MODELS[0], true).unwrap();
+    assert_eq!(input["model_run_id"], run);
+    initial["tasks"][0]["source_segment_ids"] = json!([overlapping]);
+    let mut later = initial["tasks"][0].clone();
+    later["source_segment_ids"] = json!([separate]);
+    initial["tasks"].as_array_mut().unwrap().push(later);
+    store.groq_complete(second, &initial).unwrap();
+
+    let snapshot = store.workspace(false, None).unwrap();
+    assert_eq!(snapshot["tasks"].as_array().unwrap().len(), 1);
+    assert_eq!(snapshot["tasks"][0]["id"], accepted["task"]["id"]);
+    let proposals = snapshot["proposals"].as_array().unwrap();
+    assert_eq!(proposals.len(), 2);
+    let pending = proposals.iter().find(|item| item["status"] == "pending").unwrap();
+    assert_eq!(pending["source"]["segment_ids"], json!([separate]));
+}
+
+#[test]
 fn purchases_with_different_purposes_survive_reanalysis() {
     let (_dir, store, meeting, segment) = setup();
     let (first, _, _) = store.groq_prepare(meeting, MODELS[0], true).unwrap();
@@ -671,4 +726,200 @@ fn local_analysis_resolves_an_explicit_task_without_an_api_key() {
     let findings = &store.groq_analysis(meeting).unwrap()["saved"]["result"]["findings"];
     assert_eq!(findings[0]["source"]["segment_ids"], json!([segment]));
     assert_eq!(store.ai_budget(None).unwrap()["today_tokens"], 0);
+}
+
+#[test]
+fn multi_project_meetings_keep_scope_follow_up_links_and_review_drafts() {
+    let (dir, store, first_meeting, segment) = setup();
+    let recipient = store.add_person("Давид").unwrap();
+    store.workspace_action(&json!({"op":"settings","data":{"me_id":recipient}})).unwrap();
+    let project = |title| store.workspace_action(&json!({"op":"save_project","data":{
+        "title":title,"status":"active","stages":vtracker::workspace::default_stages()
+    }})).unwrap()["id"].as_i64().unwrap();
+    let tents = project("Тенты");
+    let stage = project("Сцена");
+    let unselected = project("Отдельный проект");
+    let task = |project_id| store.workspace_action(&json!({"op":"save_task","data":{
+        "title":"Закупить ткань","project_id":project_id,"stage_id":"todo","priority":"normal","blocked":false
+    }})).unwrap();
+    let tent_task = task(tents);
+    let stage_task = task(stage);
+    let private_task = task(unselected);
+    store.workspace_action(&json!({"op":"save_meeting","id":first_meeting,"data":{
+        "title":"Тенты и сцена","project_id":tents,"participants":[]
+    }})).unwrap();
+    assert!(store.groq_prepare_projects(first_meeting, MODELS[0], false, false, &[stage], false).is_err());
+    let (analysis, snapshot, _) = store.groq_prepare_projects(first_meeting, MODELS[0], true, false, &[stage], false).unwrap();
+    assert_eq!(snapshot["analysis_projects"][1]["id"], stage);
+    assert_eq!(snapshot["project_tasks"].as_array().unwrap().len(), 2);
+    let mut response = output(segment);
+    response["decisions"] = json!([]);
+    response["tasks"] = json!([
+        {"kind":"change_due","title":"Закупить ткань","description":"","task_id":tent_task["id"],
+         "project_id":tents,"due_date":"2026-11-24","source_segment_ids":[segment]},
+        {"kind":"create_task","title":"Проверить остатки на складе","description":"","related_task_id":stage_task["id"],
+         "project_id":stage,"assignee_name":"Давид","source_segment_ids":[segment]},
+        {"kind":"change_due","title":"Закупить ткань","description":"","task_id":private_task["id"],
+         "project_id":unselected,"due_date":"2026-11-25","source_segment_ids":[segment]},
+        {"kind":"create_task","title":"Подготовить отчёт","description":"","source_segment_ids":[segment]}
+    ]);
+    store.groq_complete(analysis, &response).unwrap();
+    let workspace = store.workspace(false, None).unwrap();
+    let proposals = workspace["proposals"].as_array().unwrap();
+    let due = proposals.iter().find(|item| item["task_id"] == tent_task["id"]).unwrap();
+    assert_eq!(due["project_id"], tents);
+    let unknown = proposals.iter().find(|item| item["due_date"] == "2026-11-25").unwrap();
+    assert!(unknown["project_id"].is_null() && unknown["task_id"].is_null());
+    assert_eq!(unknown["needs_clarification"], true);
+    let unassigned_project = proposals.iter().find(|item| item["title"] == "Подготовить отчёт").unwrap();
+    assert!(store.workspace_action(&json!({"op":"review","id":unassigned_project["id"],"data":{
+        "title":"Подготовить отчёт","stage_id":"todo","priority":"normal","blocked":false
+    }})).is_err());
+
+    let followup = proposals.iter().find(|item| item["related_task_id"] == stage_task["id"]).unwrap();
+    assert_eq!(followup["project_id"], stage);
+    let draft = json!({"id":followup["id"],"data":{"title":"Проверить ткань на складе","project_id":stage}});
+    store.workspace_action(&json!({"op":"save_review_draft","id":followup["id"],"draft":draft})).unwrap();
+    let (same, _, cached) = store.groq_prepare_projects(first_meeting, MODELS[0], true, false, &[stage], false).unwrap();
+    assert_eq!(same, analysis);
+    assert!(cached);
+    let (fresh, _, _) = store.groq_prepare_projects(first_meeting, MODELS[0], true, true, &[stage], false).unwrap();
+    store.groq_complete(fresh, &response).unwrap();
+    let current = store.workspace(false, None).unwrap();
+    assert_eq!(current["proposals"].as_array().unwrap().iter()
+        .find(|item| item["id"] == followup["id"]).unwrap()["review_draft"], draft);
+    assert_eq!(current["notifications"], json!([]));
+    let (one_project, _, _) = store.groq_prepare_projects(first_meeting, MODELS[0], true, true, &[], false).unwrap();
+    let mut narrower_response = response.clone();
+    narrower_response["tasks"] = json!([response["tasks"][0]]);
+    store.groq_complete(one_project, &narrower_response).unwrap();
+    let current = store.workspace(false,None).unwrap();
+    let preserved = current["proposals"].as_array().unwrap().iter()
+        .find(|item| item["id"] == followup["id"]).unwrap();
+    assert_eq!(preserved["status"], "pending");
+    assert_eq!(preserved["review_draft"], draft);
+    let approval = json!({"op":"review","id":followup["id"],"data":{
+        "title":"Проверить остатки на складе","project_id":stage,"assignee_id":recipient,
+        "stage_id":"todo","priority":"normal","blocked":false
+    }});
+    let applied = store.workspace_action(&approval).unwrap();
+    let followup_id = &applied["task"]["id"];
+    assert!(store.workspace_action(&approval).is_err());
+    let state = store.workspace(false, None).unwrap();
+    assert_eq!(state["notifications"].as_array().unwrap().len(), 1);
+    assert_eq!(&state["notifications"][0]["task_id"], followup_id);
+    store.workspace_action(&json!({"op":"read_task_notification","id":state["notifications"][0]["id"]})).unwrap();
+    assert!(store.workspace(false, None).unwrap()["notifications"][0]["read_at"].is_string());
+    assert_eq!(state["tasks"].as_array().unwrap().iter().find(|task| task["id"] == stage_task["id"]).unwrap()["related_task_ids"],
+        json!([followup_id]));
+
+    let conn = Connection::open(dir.path().join("db")).unwrap();
+    let (second, _) = meeting_with_transcript(&store, &conn, "Склад", "Сверили остатки ткани");
+    store.workspace_action(&json!({"op":"save_meeting","id":second,"data":{
+        "title":"Склад","project_id":stage,"participants":[]
+    }})).unwrap();
+    let context = store.groq_snapshot(second).unwrap();
+    let original = context["project_tasks"].as_array().unwrap().iter().find(|task| task["id"] == stage_task["id"]).unwrap();
+    assert_eq!(original["related_task_ids"], json!([followup_id]));
+    assert_eq!(state["tasks"].as_array().unwrap().iter().find(|task| task["id"] == private_task["id"]).unwrap()["due_date"], Value::Null);
+}
+
+#[test]
+fn material_links_require_opt_in_and_exclude_url_parameters() {
+    let (_dir, store, meeting, segment) = setup();
+    let project = store.workspace_action(&json!({"op":"save_project","data":{
+        "title":"Материалы","status":"active","stages":vtracker::workspace::default_stages(),
+        "materials":"Смета ткани https://example.test/fabric?signature=synthetic#preview\nЗакрытый каталог https://user:pass@example.test/private\nТолько внутренний комментарий"
+    }})).unwrap();
+    store.workspace_action(&json!({"op":"save_meeting","id":meeting,"data":{
+        "title":"Смета ткани","project_id":project["id"],"participants":[]
+    }})).unwrap();
+    let original = store.workspace_action(&json!({"op":"save_task","data":{
+        "title":"Согласовать смету","project_id":project["id"],"stage_id":"todo",
+        "priority":"normal","blocked":false,"due_date":"2026-11-30"
+    }})).unwrap();
+    let mut changed = original.clone();
+    changed["due_date"] = json!("2026-11-24");
+    store.workspace_action(&json!({"op":"save_task","id":original["id"],"revision":original["revision"],"data":changed})).unwrap();
+    let default = store.groq_snapshot(meeting).unwrap();
+    assert_eq!(default["project_materials"],json!([]));
+    assert_eq!(default["project_tasks"][0]["recent_change"]["due_date"],json!({"before":"2026-11-30","after":"2026-11-24"}));
+    let (analysis, shared, _) = store.groq_prepare_projects(meeting,MODELS[0],true,false,&[],true).unwrap();
+    assert_eq!(shared["project_materials"],json!([{
+        "id":1,"project_id":project["id"],"label":"Смета ткани","url":"https://example.test/fabric",
+        "local_url":"https://example.test/fabric?signature=synthetic#preview"
+    }]));
+    let mut result = output(segment);
+    result["tasks"][0]["material_ids"] = json!([1,999]);
+    store.groq_complete(analysis,&result).unwrap();
+    let workspace = store.workspace(false,None).unwrap();
+    let proposals = workspace["proposals"].as_array().unwrap();
+    let task = proposals.iter().find(|item| item["kind"] == "create_task").unwrap();
+    assert_eq!(task["source"]["material_links"],json!([{
+        "id":1,"project_id":project["id"],"label":"Смета ткани",
+        "url":"https://example.test/fabric?signature=synthetic#preview"
+    }]));
+}
+
+#[test]
+fn old_change_cards_cannot_capture_the_deadline_and_assignee_of_the_original_task() {
+    let (dir, store, meeting, segment) = setup();
+    let person = store.add_person("Давид").unwrap();
+    let project = store.workspace_action(&json!({"op":"save_project","data":{
+        "title":"Тенты","status":"active","stages":vtracker::workspace::default_stages()
+    }})).unwrap();
+    store.workspace_action(&json!({"op":"save_meeting","id":meeting,"data":{
+        "title":"Закупка","project_id":project["id"],"participants":[]
+    }})).unwrap();
+    let task = |title| store.workspace_action(&json!({"op":"save_task","data":{
+        "title":title,"project_id":project["id"],"stage_id":"todo","due_date":"2026-11-30",
+        "priority":"normal","blocked":false
+    }})).unwrap();
+    let original = task("Закупить ткань");
+    let old_due = task("Перенести закупку ткани на 24-е число");
+    let old_owner = task("Назначить Давида ответственным за закупку ткани");
+    let connection = Connection::open(dir.path().join("db")).unwrap();
+    connection.execute("UPDATE segments SET text='По закупке ткани срок 24 ноября, ответственный Давид' WHERE id=?1",
+        [segment]).unwrap();
+    for legacy in [&old_due,&old_owner] {
+        let data = json!({"project_id":project["id"],"kind":"create_task","origin":"groq",
+            "title":legacy["title"],"confirmed_task_id":legacy["id"],"source":{"meeting_id":meeting,"start_ms":0}});
+        connection.execute("INSERT INTO proposals(data_json,is_demo,status) VALUES (?1,0,'accepted')",
+            [data.to_string()]).unwrap();
+    }
+    let (run, context, _) = store.groq_prepare(meeting, MODELS[0], true).unwrap();
+    assert_eq!(context["project_tasks"][0]["id"], original["id"]);
+    assert_eq!(context["project_tasks"][0]["legacy_change_card"], false);
+    assert_eq!(context["project_tasks"][1]["legacy_change_card"], true);
+    assert_eq!(context["project_tasks"][2]["legacy_change_card"], true);
+    let mut response = output(segment);
+    response["decisions"] = json!([]);
+    response["tasks"] = json!([
+        {"kind":"change_due","title":old_due["title"],"task_id":old_due["id"],"description":"",
+         "due_date":"2026-11-24","source_segment_ids":[segment]},
+        {"kind":"change_assignee","title":old_owner["title"],"task_id":old_owner["id"],"description":"",
+         "assignee_name":"Давид","source_segment_ids":[segment]}
+    ]);
+    store.groq_complete(run,&response).unwrap();
+    let state = store.workspace(false,None).unwrap();
+    let pending:Vec<_> = state["proposals"].as_array().unwrap().iter()
+        .filter(|p| p["status"] == "pending").collect();
+    assert_eq!(pending.len(),1);
+    let bundle = pending[0];
+    assert_eq!(bundle["kind"], "change_task");
+    assert!(bundle["task_id"].is_null());
+    assert_eq!(bundle["candidate_task_ids"],json!([original["id"]]));
+    assert_eq!(bundle["proposed"]["assignee_id"],person);
+    let mut edited = original.clone();
+    edited["due_date"] = json!("2026-11-26");
+    let edited = store.workspace_action(&json!({"op":"save_task","id":original["id"],"revision":original["revision"],"data":edited})).unwrap();
+    let mut review = json!({"op":"review","id":bundle["id"],"existing_task_id":original["id"],
+        "task_revision":edited["revision"],"data":bundle["proposed"]});
+    assert!(store.workspace_action(&review).unwrap_err().to_string().contains("после анализа"));
+    review["acknowledge_task_conflict"] = json!(true);
+    let applied = store.workspace_action(&review).unwrap();
+    assert_eq!(applied["task"]["id"],original["id"]);
+    assert_eq!(applied["task"]["assignee_id"],person);
+    assert_eq!(applied["task"]["due_date"],"2026-11-24");
+    assert_eq!(store.workspace(false,None).unwrap()["tasks"].as_array().unwrap().len(),3);
 }

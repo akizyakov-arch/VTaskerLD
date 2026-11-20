@@ -17,7 +17,12 @@ use std::{
 };
 
 pub(crate) const GROUPS_PER_BLOCK: usize = 4;
+pub(crate) const LIVE_THREADS: usize = 2;
 const MAX_BLOCK_FRAMES: usize = 120 * 16000;
+
+pub(crate) fn final_threads() -> usize {
+    std::thread::available_parallelism().map_or(2, |count| count.get().min(4))
+}
 
 pub(crate) fn engine() -> Option<PathBuf> {
     std::env::var_os("VTRACKER_SPEAKER_WORKER")
@@ -32,7 +37,7 @@ pub(crate) struct SpeakerSession {
 }
 
 impl SpeakerSession {
-    pub(crate) fn new(config: &DiarizationConfig, engine: &Path) -> Result<Self> {
+    pub(crate) fn new(config: &DiarizationConfig, engine: &Path, threads: usize) -> Result<Self> {
         let threshold = config.cluster_threshold.unwrap_or(0.5);
         let fingerprint = json!({
             "revision":1, "worker":checksum(engine)?,
@@ -43,7 +48,8 @@ impl SpeakerSession {
         command
             .arg(&config.segmentation)
             .arg(&config.embedding)
-            .arg(threshold.to_string());
+            .arg(threshold.to_string())
+            .arg(threads.to_string());
         Ok(Self {
             fingerprint,
             command,
@@ -177,7 +183,13 @@ impl MeetingVoices {
                     .collect::<Vec<_>>();
                 scores.sort_by(|a, b| b.1.total_cmp(&a.1));
                 let &(id, best) = scores.first()?;
-                let margin = best - scores.get(1).map_or(-1.0, |score| score.1);
+                let (primary, _) = self.profiles[id].as_ref()?;
+                let competitor = scores.iter().skip(1).find(|(other_id, _)| {
+                    let (other, _) = self.profiles[*other_id].as_ref().unwrap();
+                    let same_family = primary.iter().zip(other).map(|(a, b)| a * b).sum::<f64>() >= 0.86;
+                    used.contains(other_id) || !same_family
+                });
+                let margin = best - competitor.map_or(-1.0, |score| score.1);
                 (best >= 0.72 && margin >= 0.08 && !used.contains(&id)).then_some(id)
             });
             let id = if let Some(id) = matched {
@@ -210,6 +222,28 @@ impl MeetingVoices {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn duplicate_centroids_do_not_spawn_another_voice() {
+        let mut voices = MeetingVoices {
+            profiles: vec![
+                Some((vec![1.0, 0.0], 1.0)),
+                Some((normalize(&[0.98, 0.18]).unwrap(), 1.0)),
+                Some((vec![0.0, 1.0], 1.0)),
+            ],
+        };
+        let output = json!({
+            "turns":[{"start_ms":0,"end_ms":6000,"speaker":0}],
+            "voices":{"0":[1.0,0.0]}
+        });
+        assert_eq!(voices.merge(&output, 6000, 0).unwrap()[0]["speaker_id"], "speaker_0");
+        assert_eq!(voices.profiles.len(), 3);
+    }
+}
+
 pub(crate) fn separate_file(
     store: &Store,
     meeting: i64,
@@ -218,8 +252,9 @@ pub(crate) fn separate_file(
     wav: &Path,
     scratch: &Path,
     inputs: &[Value],
+    threads: usize,
 ) -> Result<Vec<Value>> {
-    let mut session = SpeakerSession::new(config, engine)?;
+    let mut session = SpeakerSession::new(config, engine, threads)?;
     let mut reader = hound::WavReader::open(wav)?;
     let mut samples = reader.samples::<i16>();
     let mut pending = inputs;
