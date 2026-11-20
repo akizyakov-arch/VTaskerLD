@@ -137,6 +137,9 @@ for line in sys.stdin:
     assert_eq!(final_text["segments"].as_array().unwrap().len(), 5);
     assert_eq!(final_text["segments"][4]["speaker_id"], "speaker_0");
     assert_eq!(final_text["segments"][4]["end_ms"], 135_000);
+    assert_eq!(final_text["parameters"]["audio_duration_ms"], 135_000);
+    assert_eq!(final_text["parameters"]["cached_speech_blocks"], 5);
+    assert_eq!(final_text["parameters"]["processed_speech_blocks"], 0);
     assert_eq!(
         std::fs::read_to_string(scratch.path().join("calls")).unwrap(),
         calls
@@ -148,6 +151,8 @@ for line in sys.stdin:
     command(&["jobs", "run", "--meeting", &meeting.to_string()]);
     let parallel = store.transcript(meeting).unwrap();
     assert_eq!(parallel["parameters"]["parallel_diarization"], true);
+    assert_eq!(parallel["parameters"]["cached_speech_blocks"], 0);
+    assert_eq!(parallel["parameters"]["processed_speech_blocks"], 5);
     let expected_threads = std::thread::available_parallelism().map_or(2, |count| count.get().min(4));
     assert_eq!(parallel["parameters"]["diarization"]["threads"], expected_threads);
     assert_eq!(std::fs::read_to_string(scratch.path().join("speaker-threads")).unwrap(), expected_threads.to_string());

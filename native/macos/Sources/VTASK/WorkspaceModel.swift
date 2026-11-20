@@ -202,7 +202,8 @@ final class WorkspaceModel: ObservableObject {
                        "revision": project.revision, "archived": archived])
     }
 
-    func interpretAssistant(_ text: String, hasSearch: Bool, hasProject: Bool) async throws -> AssistantIntent {
+    func interpretAssistant(_ text: String, hasSearch: Bool, hasProject: Bool, hasTask: Bool,
+                            followup: AssistantTaskUpdate?) async throws -> AssistantIntent {
         struct Reply: Decodable {
             let state: String
             let intent: AssistantIntent?
@@ -210,9 +211,15 @@ final class WorkspaceModel: ObservableObject {
         }
         let path = "api/assistant/interpret"
         let id = UUID().uuidString
-        _ = try await request(path, payload: ["id": id, "text": text, "has_search": hasSearch, "has_project": hasProject,
-                                                "today": workspace?.today as Any? ?? NSNull()])
-        for _ in 0..<80 {
+        var payload: [String: Any] = ["id": id, "text": text, "has_search": hasSearch, "has_project": hasProject,
+                                      "has_task": hasTask, "today": workspace?.today as Any? ?? NSNull()]
+        if let followup {
+            payload["task_update_followup"] = true
+            payload["prior_due_date"] = followup.dueDate
+        }
+        struct Accepted: Decodable { let local: Bool? }
+        let accepted = try decode(Accepted.self, from: await request(path, payload: payload))
+        for _ in 0..<(accepted.local == true ? 150 : 80) {
             try await Task.sleep(for: .milliseconds(400))
             let data = try await request(path, query: [URLQueryItem(name: "id", value: id)])
             let reply = try decode(Reply.self, from: data)
@@ -429,7 +436,9 @@ final class WorkspaceModel: ObservableObject {
         var payload: [String: Any] = ["meeting_id": meetingID]
         if let mode { payload["processing_mode"] = mode }
         let data = try await request("api/recording/" + action, payload: payload)
-        capture = try decode(CaptureStatus.self, from: data)
+        var result = try decode(CaptureStatus.self, from: data)
+        result.liveDisplay = capture?.liveDisplay
+        capture = result
     }
 
 }

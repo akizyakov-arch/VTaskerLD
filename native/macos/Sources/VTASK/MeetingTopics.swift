@@ -13,10 +13,16 @@ struct MeetingTopics {
         let words: [String]?
         let phrases: [String]
         let actions: [String]?
+        let searchPrefixes: [String]?
+        let searchWords: [String]?
 
         func matches(_ wordsInText: [Substring], phrase: String) -> Bool {
-            wordsInText.contains { word in
-                prefixes.contains { word.hasPrefix($0) } || words?.contains(String(word)) == true
+            let mentionsTime = title == "Финансы" && wordsInText.contains {
+                $0.hasPrefix("врем") || $0.hasPrefix("час") || $0.hasPrefix("минут")
+            }
+            return wordsInText.contains { word in
+                if mentionsTime && (word.hasPrefix("потрат") || word.hasPrefix("трат")) { return false }
+                return prefixes.contains { word.hasPrefix($0) } || words?.contains(String(word)) == true
             } || phrases.contains { phrase.contains(" " + $0 + " ") }
         }
     }
@@ -25,11 +31,42 @@ struct MeetingTopics {
         let url = Bundle.main.url(forResource: "meeting-topics", withExtension: "json")
             ?? Bundle.module.url(forResource: "meeting-topics", withExtension: "json")
         guard let url, let data = try? Data(contentsOf: url) else { return [] }
-        return (try? JSONDecoder().decode([Topic].self, from: data)) ?? []
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        return (try? decoder.decode([Topic].self, from: data)) ?? []
     }()
 
     private static func words(in text: String) -> [Substring] {
         text.lowercased().replacingOccurrences(of: "ё", with: "е").split { !$0.isLetter }
+    }
+
+    static func searchTerms(_ terms: [String]) -> (words: [String], topics: Set<String>) {
+        var literal: [String] = []
+        var categories = Set<String>()
+        for term in terms {
+            if let topic = workTopics.first(where: {
+                $0.title.lowercased() == term || $0.searchWords?.contains(term) == true ||
+                    $0.searchPrefixes?.contains(where: term.hasPrefix) == true
+            }) {
+                categories.insert(topic.title)
+            } else {
+                literal.append(term)
+            }
+        }
+        return (literal, categories)
+    }
+
+    static func matchesSearchTopics(_ categories: Set<String>, fields: [String?]) -> Bool {
+        guard !categories.isEmpty else { return true }
+        let texts = fields.compactMap { $0 }.map { text in
+            let terms = words(in: text)
+            return (terms, " " + terms.joined(separator: " ") + " ")
+        }
+        return workTopics.filter { categories.contains($0.title) }.allSatisfy { topic in
+            texts.contains { terms, phrase in
+                return topic.matches(terms, phrase: phrase) || phrase == " " + topic.title.lowercased() + " "
+            }
+        }
     }
 
     static func title(topic: String?, text: String, context: String? = nil) -> String {
@@ -56,14 +93,7 @@ struct MeetingTopics {
     private static func fallback(_ text: String) -> String? {
         let tokens = words(in: text)
         let phrase = " " + tokens.joined(separator: " ") + " "
-        let mentionsTime = tokens.contains { word in
-            word.hasPrefix("врем") || word.hasPrefix("час") || word.hasPrefix("минут")
-        }
-        var matches = workTopics.filter { topic in
-            let terms = topic.title == "Финансы" && mentionsTime
-                ? tokens.filter { !$0.hasPrefix("потрат") } : tokens
-            return topic.matches(terms, phrase: phrase)
-        }
+        var matches = workTopics.filter { $0.matches(tokens, phrase: phrase) }
         if matches.contains(where: { $0.title == "Финансы" }) { return "Финансы" }
         if let match = zone?.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)) {
             for group in 1..<match.numberOfRanges {

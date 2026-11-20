@@ -178,11 +178,15 @@ pub fn serve(path: &Path) -> Result<()> {
         voice_capture.poll()?;
         capture.poll(&store)?;
         let capture_status = capture.status();
-        groq.poll_live(&store, &capture_status["active"])?;
+        let active = &capture_status["active"];
+        let live_preview_active = worker.live_display_enabled()
+            && active["session_id"].as_str().is_some_and(|id| live.session.as_deref() == Some(id));
+        let preview_capture = if live_preview_active { active } else { &Value::Null };
+        groq.poll_live(&store, preview_capture)?;
         if let Err(error) = live_voice.poll(
             path,
             &store,
-            if worker.speaker_detection_enabled() { &capture_status["active"] } else { &Value::Null },
+            if worker.speaker_detection_enabled() { preview_capture } else { &Value::Null },
             !store.live_busy()?
                 && !voice.busy()
                 && worker.status()["running"] != true
@@ -445,7 +449,8 @@ pub fn serve(path: &Path) -> Result<()> {
                 Ok(json!({"devices":inventory,"selected":microphone}))
             }
             (&Method::Get, "/api/recording/activity") => {
-                Ok(json!({"active":capture.status()["active"],"hint":live_voice.status()["hint"]}))
+                Ok(json!({"active":capture.status()["active"],"hint":live_voice.status()["hint"],
+                    "live_display":worker.live_display_enabled()}))
             }
             (&Method::Get, "/api/voice/status") => {
                 Ok(json!({"voice_capture":voice_capture.status(),"voice_data":store.voice_snapshot()?}))
@@ -739,6 +744,7 @@ pub fn serve(path: &Path) -> Result<()> {
                         }
                         let mut settings = validate_speech_settings(&data)?;
                         settings["speaker_detection"] = json!(worker.speaker_detection_enabled());
+                        settings["live_display"] = json!(data["live_display"].as_bool().unwrap_or(worker.live_display_enabled()));
                         store.0.execute("INSERT INTO workspace_settings(key,data_json) VALUES ('speech',?1) ON CONFLICT(key) DO UPDATE SET data_json=excluded.data_json", [settings.to_string()])?;
                         if worker.settings["url"] != settings["url"] {
                             worker.api_key.clear();
@@ -759,6 +765,14 @@ pub fn serve(path: &Path) -> Result<()> {
                         store.0.execute("INSERT INTO workspace_settings(key,data_json) VALUES ('speech',?1) ON CONFLICT(key) DO UPDATE SET data_json=excluded.data_json", [settings.to_string()])?;
                         worker.settings = settings;
                         Ok(worker.status())
+                    }
+                    "/api/speech/live-display" => {
+                        let enabled = data["enabled"].as_bool().context("Выберите режим живого предпросмотра")?;
+                        let mut settings = worker.settings.clone();
+                        settings["live_display"] = json!(enabled);
+                        store.0.execute("INSERT INTO workspace_settings(key,data_json) VALUES ('speech',?1) ON CONFLICT(key) DO UPDATE SET data_json=excluded.data_json", [settings.to_string()])?;
+                        worker.settings = settings;
+                        Ok(json!({"live_display":enabled}))
                     }
                     "/api/people" => Ok(
                         json!({"id":store.add_person(data["name"].as_str().unwrap_or_default())?}),

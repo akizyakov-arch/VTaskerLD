@@ -204,11 +204,24 @@ fn diarization_turns_are_versioned_and_failure_keeps_the_previous_result() {
     assert!(first["segments"][0]["speaker_id"].is_null());
     assert_eq!(first["parameters"]["diarization"]["num_speakers"], 0);
     assert!(vtracker::speech::transcript_text(&first).contains("[multiple]"));
+    assert_eq!(first["parameters"]["cached_final_diarization"], false);
+    store.enqueue(meeting).unwrap();
+    store.run_next(&config).unwrap();
+    let cached = store.transcript(meeting).unwrap();
+    assert_eq!(cached["parameters"]["cached_final_diarization"], true);
+    assert_eq!(cached["speaker_turns"], first["speaker_turns"]);
+
+    config.diarization.as_mut().unwrap().speakers = 2;
+    store.enqueue(meeting).unwrap();
+    store.run_next(&config).unwrap();
+    let changed_count = store.transcript(meeting).unwrap();
+    assert_eq!(changed_count["parameters"]["diarization"]["num_speakers"], 2);
+    assert_eq!(changed_count["parameters"]["cached_final_diarization"], false);
     std::fs::write(segmentation, b"FAIL").unwrap();
     store.enqueue(meeting).unwrap();
     assert!(store.run_next(&config).is_err());
-    assert_eq!(store.transcript(meeting).unwrap(), first);
-    assert_eq!(store.jobs().unwrap()[1]["status"], "failed");
+    assert_eq!(store.transcript(meeting).unwrap(), changed_count);
+    assert_eq!(store.jobs().unwrap()[3]["status"], "failed");
 }
 
 #[test]

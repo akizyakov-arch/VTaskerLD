@@ -12,6 +12,66 @@ class Response:
  def __exit__(self,*args):pass
  def read(self,n):return json.dumps(self.value).encode()
 class Provider(unittest.TestCase):
+ def test_ollama_flags_bad_dates_without_discarding_other_tasks(self):
+  result = {'tasks':[{'due_date':'2026-02-30','due_time':'18:00'},
+                     {'due_date':'2026-12-01','due_time':'18:00'}]}
+  g.normalize_local_deadlines(result)
+  bad, good = result['tasks']
+  self.assertIsNone(bad['due_date'])
+  self.assertIsNone(bad['due_time'])
+  self.assertTrue(bad['needs_clarification'])
+  self.assertEqual(good['due_time'], '18:00')
+
+ def test_ollama_uses_loopback_schema_and_no_api_key(self):
+  class Opener:
+   def open(self, req, timeout):
+    self_test.assertEqual(req.full_url, 'http://127.0.0.1:11434/api/chat')
+    self_test.assertIsNone(req.get_header('Authorization'))
+    body = json.loads(req.data)
+    self_test.assertEqual(body['format'], g.ASSISTANT_SCHEMA)
+    self_test.assertEqual(body['keep_alive'], '5m')
+    self_test.assertEqual(body['model'], 'qwen3:4b-instruct-2507-q4_K_M')
+    return Response({'done':True,'done_reason':'stop','message':{'content':'{"action":"clarify"}'}})
+  self_test = self
+  with patch.object(g.urllib.request, 'build_opener', return_value=Opener()):
+   out = g.request({'model':'ollama:qwen3:4b-instruct-2507-q4_K_M'}, {'text':'Привет'}, g.ASSISTANT_SCHEMA)
+  self.assertEqual(out, {'action':'clarify'})
+
+ def test_assistant_extracts_updates_without_sending_records(self):
+  intent = dict.fromkeys(g.ASSISTANT_SCHEMA['properties'])
+  intent.update(action='update_task', title='сетка', due_date='2026-12-01', assignee='Давид')
+  text = 'Пусть Давид спросит про сетку к первому декабря'
+  with patch.object(g, 'request', return_value=intent) as request:
+   self.assertEqual(g.interpret({'text':text, 'has_project':True, 'today':'2026-11-20',
+                                 'segments':['private'], 'project_tasks':['private']}), intent)
+  request.assert_called_once()
+  self.assertEqual(request.call_args.args[1], {
+   'text':text, 'has_search':None, 'has_project':True, 'today':'2026-11-20'
+  })
+  self.assertEqual(request.call_args.args[4], 512)
+  self.assertFalse(request.call_args.kwargs['allow_retry'])
+
+ def test_assistant_followup_only_sends_relevant_date_and_cannot_create(self):
+  intent = dict.fromkeys(g.TASK_UPDATE_SCHEMA['properties'])
+  intent.update(action='update_task', due_date='2026-12-02')
+  data = {'task_update_followup':True, 'text':'Да, только на второе',
+          'today':'2026-11-20', 'prior_due_date':'2026-12-01', 'assignee':'private'}
+  with patch.object(g, 'request', return_value=intent) as request:
+   self.assertEqual(g.interpret(data), intent)
+  self.assertEqual(request.call_args.args[1], {
+   'text':data['text'], 'today':data['today'], 'prior_due_date':data['prior_due_date']
+  })
+  with patch.object(g, 'request', return_value={**intent, 'action':'create_task'}):
+   with self.assertRaises(g.ProviderError):
+    g.interpret(data)
+
+ def test_assistant_rejects_creation_on_the_main_route(self):
+  intent = dict.fromkeys(g.ASSISTANT_SCHEMA['properties'])
+  intent.update(action='create_task', title='Новая задача')
+  with patch.object(g, 'request', return_value=intent):
+   with self.assertRaises(g.ProviderError):
+    g.interpret({'text':'Создай новую задачу'})
+
  def test_strict_schema_and_secret_only_in_authorization(self):
   captured=[]
   class Opener:
@@ -39,6 +99,26 @@ class Provider(unittest.TestCase):
    return {'summary':'part','open_questions':[],'tasks':[{'title':'same','source_segment_ids':[0]}],'decisions':[]}
   with patch.object(g,'request',side_effect=request):r=g.analyze({'input':{'segments':[{'id':i,'text':'x'*30000} for i in range(3)]}})
   self.assertEqual(len(calls),4);self.assertEqual(r['summary'],'combined');self.assertEqual(len(r['tasks']),1)
+ def test_ollama_automatic_analysis_keeps_short_protocol_together(self):
+  model = 'ollama:qwen3:4b-instruct-2507-q4_K_M'
+  result = {'summary':'Итоги', 'tasks':[], 'decisions':[], 'open_questions':[]}
+  short = [{'id':i, 'text':'Согласовали стоимость и дату доставки.'} for i in range(94)]
+  with patch.object(g, 'request', return_value=result) as request:
+   g.analyze({'model':model, 'input':{'segments':short}, 'automatic':True})
+   request.assert_called_once()
+   self.assertEqual(request.call_args.args[1]['segments'], short)
+   fields = request.call_args.kwargs['schema']['properties']['tasks']['items']['required']
+   self.assertTrue({'assignee_name', 'due_date', 'source_segment_ids'}.issubset(fields))
+   self.assertNotIn('material_ids', fields)
+   self.assertIn('material_ids', g.SCHEMA['properties']['tasks']['items']['required'])
+
+ def test_ollama_automatic_analysis_still_splits_large_text(self):
+  model = 'ollama:qwen3:4b-instruct-2507-q4_K_M'
+  result = {'summary':'Итоги', 'tasks':[], 'decisions':[], 'open_questions':[]}
+  segments = [{'id':i, 'text':'x'*30000} for i in range(3)]
+  with patch.object(g, 'request', return_value=result) as request:
+   g.analyze({'model':model, 'input':{'segments':segments}, 'automatic':True})
+   self.assertEqual(request.call_count, 4)
  def test_empty_and_oversized_transcripts_do_not_call_provider(self):
   with patch.object(g,'request') as call:
    for segments in ([],[{'text':'x'*45001}]):
@@ -101,6 +181,22 @@ class AIBudgetTests(unittest.TestCase):
    with self.assertRaisesRegex(g.ProviderError, 'дневного'):
     g.analyze({**data, 'force': True})
    http.assert_not_called()
+
+ def test_ollama_analysis_reuses_results_without_charging_external_budget(self):
+  self.limit(1, 1)
+  model = 'ollama:qwen3:4b-instruct-2507-q4_K_M'
+  meter = g.UsageMeter(self.db, model, 'manual')
+  data = {'model':model, 'input':{'segments':[{'id':1,'text':'Согласовали сроки'}]}, '_meter':meter}
+  value = {'done':True, 'done_reason':'stop', 'message':{'content':
+    '{"summary":"Согласовали сроки","open_questions":[],"tasks":[],"decisions":[]}' }}
+  class Opener:
+   def open(self, req, timeout): return Response(value)
+  with patch.object(g.urllib.request, 'build_opener', return_value=Opener()) as open_http:
+   self.assertEqual(g.analyze(data)['summary'], 'Согласовали сроки')
+   self.assertEqual(g.analyze(data)['summary'], 'Согласовали сроки')
+   open_http.assert_called_once()
+  with sqlite3.connect(self.db) as connection:
+   self.assertEqual(connection.execute('SELECT count(*) FROM ai_usage').fetchone(), (0,))
 
  def test_context_uses_only_matching_task_and_latest_linked_decision(self):
   snapshot = {

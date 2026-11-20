@@ -310,6 +310,11 @@ struct WorkspaceView: View {
     }
 
     private func openTask(_ id: Int) {
+        if let project, visibleTasks.contains(where: { $0.id == id && $0.projectId == project.id }) {
+            navigate(.project(project.id), itemID: id)
+            projectSections.tab = .items
+            return
+        }
         navigate(.tasks, itemID: id)
         savedView = nil
         query = ""
@@ -317,6 +322,11 @@ struct WorkspaceView: View {
         assigneeFilter = nil
         unassignedOnly = false
         taskStatus = visibleTasks.first { $0.id == id }?.stageKind == "cancelled" ? .cancelled : .all
+    }
+
+    private func showProjectCard(_ project: Project) {
+        if self.project?.id != project.id { navigate(.project(project.id)) }
+        editingProject = project
     }
 
     private var taskFilters: some View {
@@ -662,7 +672,7 @@ struct WorkspaceView: View {
                 } else if selection == .projectList, let workspace = model.workspace {
                     ProjectDirectory(workspace: workspace, archived: $archivedProjects, filters: $projectDirectoryFilters,
                                      openProject: { navigate(.project($0)) }, openTask: openTask,
-                                     editProject: { editingProject = $0 }, changeArchive: { projectArchiveRequest = $0 },
+                                     editProject: showProjectCard, changeArchive: { projectArchiveRequest = $0 },
                                      actionsDisabled: model.saving || model.loading)
                 } else if selection == .settings, let workspace = model.workspace {
                     ScrollView {
@@ -697,6 +707,12 @@ struct WorkspaceView: View {
                         Text(selection == .people ? "Участник" : "Карточка задачи").font(.headline)
                             .accessibilityAddTraits(.isHeader)
                         Spacer()
+                        if let task = inspectedTask {
+                            Text("#\(task.id)").font(.callout.monospacedDigit())
+                                .foregroundStyle(.secondary)
+                                .textSelection(.enabled)
+                                .accessibilityLabel("Номер задачи \(task.id)")
+                        }
                     }
                     .padding(10)
                     Divider()
@@ -932,7 +948,7 @@ struct WorkspaceView: View {
                 MeetingOrbit(title: meeting.title,
                              projectName: projects.first { $0.id == meeting.projectId }?.title ?? "Без проекта",
                              participants: participants, photoURL: model.personPhotoURL,
-                             session: session, hint: model.capture?.hint) {
+                             session: session, hint: model.capture?.liveDisplay == true ? model.capture?.hint : nil) {
                     orbitControls(meeting, session: session)
                 }
                 if let level = session?.level {
@@ -971,7 +987,7 @@ struct WorkspaceView: View {
                     } ?? [],
                     review: reviewMeetingProposal
                 ).id(meeting.id)
-                if liveMeetingID != meeting.id {
+                if model.capture?.liveDisplay == true && liveMeetingID != meeting.id {
                     LiveTranscriptView(model: model, meetingID: meeting.id).id(meeting.id)
                 }
                 MeetingTranscript(model: model, meeting: meeting).id(meeting.id)
@@ -1104,43 +1120,6 @@ struct WorkspaceView: View {
         creation = kind
     }
 
-    private func prepareCreation(_ command: AssistantCreation, projectID: Int?) {
-        beginCreation(command.kind)
-        newTitle = command.title
-        creationProjectID = projectID
-        creationNewProjectName = command.projectName
-        creationNeedsProject = command.kind == .decision || projectID != nil || command.projectName != nil
-        if let fields = command.taskFields {
-            newTaskDescription = fields.description ?? ""
-            newTaskDueDate = fields.dueDate ?? ""
-            newTaskDueTime = fields.dueTime ?? ""
-            if let priority = fields.priority, ["low", "normal", "high", "critical"].contains(priority) {
-                newTaskPriority = priority
-            }
-            if let name = fields.assignee, !name.isEmpty {
-                let matches = model.workspace?.people.filter {
-                    AssistantCreation.normalize($0.name) == AssistantCreation.normalize(name)
-                } ?? []
-                if matches.count == 1 { newTaskAssigneeID = matches.first?.id }
-                else { unresolvedTaskAssignee = name }
-            }
-        }
-        if let fields = command.projectFields {
-            newProjectStart = fields.start ?? ""
-            newProjectEnd = fields.end ?? ""
-            if let name = fields.owner {
-                let key = AssistantCreation.normalize(name)
-                let people = model.workspace?.people ?? []
-                let exact = people.filter { AssistantCreation.normalize($0.name) == key }
-                let matching = exact.isEmpty ? people.filter {
-                    AssistantCreation.normalize($0.name).split(separator: " ").first.map(String.init) == key
-                } : exact
-                if matching.count == 1 { newProjectOwnerID = matching.first?.id }
-                else { unresolvedProjectOwner = name }
-            }
-        }
-    }
-
     private var topbar: some View {
         ViewThatFits(in: .horizontal) {
             HStack(spacing: 16) { pageHeading; Spacer(minLength: 8); headerActions }
@@ -1185,7 +1164,7 @@ struct WorkspaceView: View {
                     .buttonStyle(.bordered)
                     .disabled(model.saving || model.capture?.active?.meetingId == meeting.id)
             } else if let project {
-                Button("Карточка проекта") { editingProject = project }.disabled(model.saving)
+                Button("Карточка проекта") { showProjectCard(project) }.disabled(model.saving)
                 Button {
                     projectArchiveRequest = project
                 } label: {
@@ -1268,9 +1247,15 @@ struct WorkspaceView: View {
     }
 
     private var liveMeetingID: Int? {
-        guard let session = model.capture?.active, let sessionID = session.sessionId,
+        guard model.capture?.liveDisplay == true,
+              let session = model.capture?.active, let sessionID = session.sessionId,
               assistantLive?.sessionId == sessionID else { return nil }
         return session.meetingId
+    }
+
+    private var livePreviewContext: String? {
+        guard model.capture?.liveDisplay == true else { return nil }
+        return model.capture?.active?.sessionId ?? selectedMeeting.map { "meeting-\($0.id)" }
     }
 
     private let assistantWidth: CGFloat = 355
@@ -1303,7 +1288,10 @@ struct WorkspaceView: View {
                 }
                 VStack(alignment: .leading, spacing: 0) {
                     AssistantSearch(tasks: visibleTasks, today: workspace.today, projects: projects,
-                                    currentProject: project, currentTask: inspectedTask,
+                                    currentProject: project ?? projects.first { $0.id == selectedMeeting?.projectId },
+                                    searchProject: project,
+                                    currentTask: project != nil && projectSections.tab != .items && taskDraftID != selectedItemID
+                                        ? nil : inspectedTask,
                                     taskStages: { task in
                                         workspace.projects.first { $0.id == task.projectId }?.stages
                                             ?? workspace.defaultStages
@@ -1323,14 +1311,23 @@ struct WorkspaceView: View {
                                     openProposal: {
                                         assistantVisible = false
                                         reviewingProposal = $0
-                                        navigate(.approvals)
-                                    }, openMeeting: { assistantVisible = false; openMeeting($0) },
+                                        if project == nil { navigate(.approvals) }
+                                        else { projectSections.tab = .items }
+                                    },
                                     canUseMicrophone: model.capture?.active == nil && creation == nil,
                                     meetingRecording: model.capture?.active != nil,
-                                    liveTranscript: assistantLive,
+                                    liveTranscript: selection == .meetings && model.capture?.liveDisplay == true &&
+                                        (liveMeetingID == nil || liveMeetingID == selectedMeeting?.id) ? assistantLive : nil,
                                     liveRequests: $liveAssistantRequests,
-                                    prepareCreation: prepareCreation,
                                     interpret: model.interpretAssistant,
+                                    submitLocalCommand: { text, taskID, proposalID, update in
+                                        var payload: [String: Any] = ["op":"assistant_command","text":text]
+                                        if let taskID { payload["task_id"] = taskID }
+                                        if let proposalID { payload["proposal_id"] = proposalID }
+                                        if let update { payload["changes"] = update.fields }
+                                        let id = await model.createEntity(payload)
+                                        return (id, model.error)
+                                    },
                                     close: { assistantVisible = false })
                 }
                 .frame(width: assistantWidth)
@@ -1365,9 +1362,10 @@ struct WorkspaceView: View {
         }
         .task { await model.reload() }
         .task { await model.pollCapture() }
-        .task(id: model.capture?.active?.sessionId ?? selectedMeeting.map { "meeting-\($0.id)" }) {
+        .task(id: livePreviewContext) {
             assistantLive = nil
             liveAssistantRequests.removeAll()
+            guard livePreviewContext != nil else { return }
             if let session = model.capture?.active {
                 await pollAssistantLive(session)
             } else if let meeting = selectedMeeting,

@@ -95,6 +95,8 @@ struct ProcessingControls: View {
     var showsCancel = false
     @State private var confirmGroq = false
     @State private var chooseProjects = false
+    @State private var localAI = false
+    @State private var profileError: String?
 
     var body: some View {
         if showsStatus, let job = meeting.processing {
@@ -105,35 +107,42 @@ struct ProcessingControls: View {
             VStack(alignment: .leading, spacing: 8) { actions }
         }
         .controlSize(.large)
+        .alert("Не удалось открыть настройки анализа", isPresented: Binding(
+            get: { profileError != nil }, set: { if !$0 { profileError = nil } }
+        )) {
+            Button("Закрыть", role: .cancel) { profileError = nil }
+        } message: {
+            Text(profileError ?? "")
+        }
         .confirmationDialog("Как проанализировать протокол?", isPresented: $confirmGroq) {
             Button("Выделить явные команды на Mac") {
                 Task {
                     await model.command(["meeting_id": meeting.id, "local": true], path: "api/groq/analyze")
                 }
             }
-            Button("Получить облачный анализ") {
+            Button(localAI ? "Проанализировать локально через Qwen" : "Получить облачный анализ") {
                 Task {
-                    await model.command(["meeting_id": meeting.id, "consent": true], path: "api/groq/analyze")
+                    await model.command(["meeting_id": meeting.id, "consent": !localAI], path: "api/groq/analyze")
                 }
             }
             if model.workspace?.projects.contains(where: { $0.id == meeting.projectId || $0.archived != true }) == true {
                 Button("Выбрать проекты для анализа") { chooseProjects = true }
             }
             if meeting.analysis?.saved != nil {
-                Button("Заново запросить у провайдера") {
+                Button("Проанализировать заново") {
                     Task {
-                        await model.command(["meeting_id": meeting.id, "consent": true, "force": true],
+                        await model.command(["meeting_id": meeting.id, "consent": !localAI, "force": true],
                                             path: "api/groq/analyze")
                     }
                 }
             }
         } message: {
-            Text(meeting.projectId == nil
-                 ? "Облачный анализ отправляет протокол провайдеру и переиспользует сохранённый результат, если данные совпадают."
-                 : "Локальный разбор понимает явные команды, например «По задаче #42: перенести срок на 24 ноября». Облачный анализ использует протокол, подходящие задачи, отдельные прежние значения и решения проекта. При совпадении контекста и модели используется сохранённый результат.")
+            Text(localAI
+                 ? "Qwen анализирует протокол и контекст проекта на этом Mac. Результат появится в итогах встречи."
+                 : "Облачный анализ передаёт протокол и подходящий контекст проекта выбранному провайдеру.")
         }
         .sheet(isPresented: $chooseProjects) {
-            MeetingAnalysisProjects(model: model, meeting: meeting).sheetCloseButton(disabled: model.saving)
+            MeetingAnalysisProjects(model: model, meeting: meeting, localAI: localAI).sheetCloseButton(disabled: model.saving)
         }
     }
 
@@ -158,7 +167,14 @@ struct ProcessingControls: View {
             .disabled(meeting.recordings.isEmpty || model.saving || model.loading || model.capture?.active != nil)
         }
         Button {
-            confirmGroq = true
+            Task {
+                do {
+                    localAI = try await model.engineSettings().groq.local == true
+                    confirmGroq = true
+                } catch {
+                    profileError = error.localizedDescription
+                }
+            }
         } label: {
             Label("Анализ ИИ", systemImage: "sparkles")
         }
@@ -172,6 +188,7 @@ private struct MeetingAnalysisProjects: View {
     @Environment(\.dismiss) private var dismiss
     @ObservedObject var model: WorkspaceModel
     let meeting: Meeting
+    let localAI: Bool
     @State private var selected: Set<Int> = []
     @State private var force = false
     @State private var shareMaterialLinks = false
@@ -191,18 +208,18 @@ private struct MeetingAnalysisProjects: View {
                     }))
                     .disabled(!canAdd && !selected.contains(project.id))
                 }
-                Text("Провайдер получит протокол и связанные данные только отмеченных проектов. Можно выбрать до четырёх проектов.")
+                Text("В анализ войдут протокол и связанные данные отмеченных проектов. Можно выбрать до четырёх проектов.")
                     .font(.caption).foregroundStyle(.secondary)
                 Toggle("Включить ссылки из материалов проекта", isOn: $shareMaterialLinks)
-                Text("Анализ подберёт ссылки по подписям и репликам. При отправке берётся адрес без параметров и фрагмента.")
+                Text("Анализ подберёт ссылки по подписям и репликам. Адреса используются без параметров и фрагмента.")
                     .font(.caption).foregroundStyle(.secondary)
             }
             if meeting.analysis?.saved != nil { Toggle("Запросить анализ заново", isOn: $force) }
             if let error = model.error { Text(error).foregroundStyle(.red) }
-            Button("Отправить и проанализировать") {
+            Button(localAI ? "Проанализировать на Mac" : "Отправить и проанализировать") {
                 Task {
                     if await model.command(["meeting_id":meeting.id,"project_ids":selected.sorted(),
-                                            "consent":true,"force":force,
+                                            "consent":!localAI,"force":force,
                                             "include_material_links":shareMaterialLinks], path:"api/groq/analyze") {
                         dismiss()
                     }

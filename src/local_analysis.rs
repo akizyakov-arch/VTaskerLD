@@ -1,7 +1,7 @@
-use chrono::{Datelike, Days, NaiveDate};
+use chrono::{Datelike, Days, NaiveDate, NaiveTime};
 use serde_json::{json, Value};
 
-pub(crate) const MODEL: &str = "local:rules";
+pub(crate) const MODEL: &str = "local:rules-v3";
 
 fn parse_date(text: &str, today: NaiveDate) -> Option<NaiveDate> {
     let text = text.trim_end_matches(['.', '!', ';']).trim();
@@ -35,10 +35,81 @@ fn parse_date(text: &str, today: NaiveDate) -> Option<NaiveDate> {
     Some(date)
 }
 
-fn command(text: &str) -> Option<(i64, &str)> {
-    let (target, command) = text.split_once(':')?;
-    let target = target.strip_prefix("по задаче #").or_else(|| target.strip_prefix("задача #"))?;
-    Some((target.trim().parse().ok()?, command.trim()))
+fn parse_deadline(text: &str, today: NaiveDate) -> Option<(NaiveDate, Option<NaiveTime>)> {
+    let text = text.trim_end_matches(['.', '!', ';']).trim();
+    if let Some((date, time)) = text.rsplit_once(char::is_whitespace).filter(|(_, time)| time.contains(':')) {
+        let date = date.trim_end();
+        let date = date.strip_suffix(" в").or_else(|| date.strip_suffix(" к")).unwrap_or(date);
+        return Some((parse_date(date, today)?, Some(NaiveTime::parse_from_str(time, "%H:%M").ok()?)));
+    }
+    Some((parse_date(text, today)?, None))
+}
+
+pub(crate) fn parse_command(text: &str, today: Option<NaiveDate>) -> Option<(i64, Value)> {
+    let (target, action) = text.trim().split_once(':')?;
+    let target = target.to_lowercase();
+    let id: i64 = target.strip_prefix("по задаче #").or_else(|| target.strip_prefix("задача #"))?
+        .trim().parse().ok()?;
+    let mut proposal = parse_action(action, today)?;
+    if proposal["kind"] == "create_task" {
+        proposal["related_task_id"] = json!(id);
+    }
+    Some((id, proposal))
+}
+
+pub(crate) fn parse_action(text: &str, today: Option<NaiveDate>) -> Option<Value> {
+    let normalized = text.to_lowercase().replace('ё', "е");
+    let action = normalized.trim();
+    let mut proposal = json!({});
+    if let Some(date) = ["перенести срок на ", "перенеси срок на ", "поставь срок на ", "срок до "]
+        .iter().find_map(|prefix| action.strip_prefix(*prefix)) {
+        return deadline_action(date, today?);
+    } else if action.trim_end_matches(['.', '!']) == "снять блокировку" {
+        proposal["kind"] = json!("change_blocked");
+        proposal["blocked"] = json!(false);
+    } else if let Some(name) = action.strip_prefix("назначить ") {
+        let name = name.trim_end_matches(['.', '!']).trim();
+        if name.is_empty() || name.chars().count() > 120 { return None; }
+        proposal["kind"] = json!("change_assignee");
+        proposal["assignee_name"] = json!(name);
+    } else if let Some(stage) = action.strip_prefix("статус ") {
+        let stage = stage.trim_end_matches(['.', '!']).trim();
+        if stage.is_empty() || stage.chars().count() > 120 { return None; }
+        proposal["kind"] = json!("change_status");
+        proposal["stage_title"] = json!(stage);
+    } else if action.starts_with("заблокировать:") {
+        let reason = text.split_once(':')?.1.trim();
+        if reason.is_empty() || reason.chars().count() > 2000 { return None; }
+        proposal["kind"] = json!("change_blocked");
+        proposal["blocked"] = json!(true);
+        proposal["blocked_reason"] = json!(reason);
+    } else if action.starts_with("создать связанную задачу:") {
+        let title = text.split_once(':')?.1.trim();
+        if title.is_empty() || title.chars().count() > 500 { return None; }
+        proposal["kind"] = json!("create_task");
+        proposal["title"] = json!(title);
+    } else {
+        return None;
+    }
+    Some(proposal)
+}
+
+fn deadline_action(text: &str, today: NaiveDate) -> Option<Value> {
+    let text = text.trim_end_matches(['.', '!', ';', '?']).trim();
+    let (date, time, assignee) = if let Some((date, time)) = parse_deadline(text, today) {
+        (date, time, None)
+    } else {
+        let (deadline, assignee) = text.rsplit_once(char::is_whitespace)?;
+        if !assignee.chars().all(|c| c.is_alphabetic() || c == '-') { return None; }
+        let (date, time) = parse_deadline(deadline.trim_end_matches(',').trim_end(), today)?;
+        (date, time, Some(assignee))
+    };
+    Some(json!({
+        "kind": if assignee.is_some() { "change_task" } else { "change_due" },
+        "due_date": date.format("%Y-%m-%d").to_string(),
+        "due_time": time.map(|time| time.format("%H:%M").to_string()),
+        "assignee_name": assignee,
+    }))
 }
 
 pub(crate) fn analyze(input: &Value) -> Value {
@@ -48,37 +119,15 @@ pub(crate) fn analyze(input: &Value) -> Value {
     let mut proposals = Vec::new();
     for segment in input["segments"].as_array().into_iter().flatten() {
         let Some(text) = segment["text"].as_str() else { continue; };
-        let normalized = text.to_lowercase().replace('ё', "е");
-        let Some((id, action)) = command(normalized.trim()) else { continue; };
+        let Some((id, mut proposal)) = parse_command(text, today) else { continue; };
         let Some(task) = input["project_tasks"].as_array().into_iter().flatten().find(|task| task["id"] == id) else { continue; };
-        let mut proposal = json!({"title":task["title"],"task_id":id,"description":"",
-            "source_segment_ids":[segment["id"]],"needs_clarification":false});
-        if let Some(date) = action.strip_prefix("перенести срок на ").or_else(|| action.strip_prefix("срок до ")) {
-            let Some(date) = today.and_then(|today| parse_date(date, today)) else { continue; };
-            proposal["kind"] = json!("change_due");
-            proposal["due_date"] = json!(date.format("%Y-%m-%d").to_string());
-        } else if action.trim_end_matches(['.', '!']) == "снять блокировку" {
-            proposal["kind"] = json!("change_blocked");
-            proposal["blocked"] = json!(false);
-        } else if let Some(name) = action.strip_prefix("назначить ") {
-            let name = name.trim_end_matches(['.', '!']).trim();
-            if name.is_empty() || name.chars().count() > 120 { continue; }
-            proposal["kind"] = json!("change_assignee");
-            proposal["assignee_name"] = json!(name);
-        } else if let Some(stage) = action.strip_prefix("статус ") {
-            let stage = stage.trim_end_matches(['.', '!']).trim();
-            if stage.is_empty() || stage.chars().count() > 120 { continue; }
-            proposal["kind"] = json!("change_status");
-            proposal["stage_title"] = json!(stage);
-        } else if action.starts_with("заблокировать:") {
-            let reason = text.splitn(3, ':').nth(2).unwrap_or_default().trim();
-            if reason.is_empty() || reason.chars().count() > 2000 { continue; }
-            proposal["kind"] = json!("change_blocked");
-            proposal["blocked"] = json!(true);
-            proposal["blocked_reason"] = json!(reason);
-        } else {
-            continue;
+        if proposal["kind"] != "create_task" {
+            proposal["title"] = task["title"].clone();
+            proposal["task_id"] = json!(id);
         }
+        proposal["description"] = json!("");
+        proposal["source_segment_ids"] = json!([segment["id"]]);
+        proposal["needs_clarification"] = json!(false);
         proposals.push(proposal);
         if proposals.len() >= 96 { break; }
     }

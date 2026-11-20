@@ -57,9 +57,25 @@ struct Transcript: Decodable {
     struct SpeakerAssignment: Decodable { let speakerId: String? }
     struct SpeakerTurn: Decodable { let speakerId: String }
 
+    struct ProcessingMetrics: Decodable {
+        let audioDurationMs: Int?
+        let preparationMs: Int?
+        let transcriptionMs: Int?
+        let diarizationMs: Int?
+        let cachedFinalDiarization: Bool?
+        let parallelDiarization: Bool?
+        let cachedSpeechBlocks: Int?
+        let processedSpeechBlocks: Int?
+
+        var isAvailable: Bool {
+            preparationMs != nil || transcriptionMs != nil || diarizationMs != nil
+        }
+    }
+
     let voiceMatches: [VoiceMatch]?
     let speakerAssignments: [SpeakerAssignment]?
     let speakerTurns: [SpeakerTurn]?
     let modelRunId: Int
+    let parameters: ProcessingMetrics?
     let segments: [Segment]
 }

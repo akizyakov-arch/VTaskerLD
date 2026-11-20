@@ -94,6 +94,15 @@ struct Proposal: Decodable, Identifiable {
 
     var editsAssignee: Bool { kind == "change_task" || kind == "change_assignee" }
     var editsDeadline: Bool { kind == "change_task" || kind == "change_due" }
+    var reviewAssigneeId: Int? {
+        if let reviewDraft { return reviewDraft.data.assigneeId }
+        return editsAssignee ? proposed?.assigneeId : assigneeId
+    }
+
+    var reviewDeadline: (date: String?, time: String?) {
+        if let reviewDraft { return (reviewDraft.data.dueDate, reviewDraft.data.dueTime) }
+        return editsDeadline ? (proposed?.dueDate, proposed?.dueTime) : (dueDate, dueTime)
+    }
 }
 
 struct Decision: Decodable, Identifiable {
@@ -186,9 +195,7 @@ struct ApprovalsView: View {
 
         var id: Int { proposal.id }
         var deadline: String? {
-            let changesDue = proposal.editsDeadline
-            let date = changesDue ? proposal.proposed?.dueDate : proposal.dueDate
-            let time = changesDue ? proposal.proposed?.dueTime : proposal.dueTime
+            let (date, time) = proposal.reviewDeadline
             return date.map { $0 + " " + (time ?? "23:59") }
         }
 
@@ -361,8 +368,8 @@ struct ApprovalsView: View {
             let target = proposal.taskId.flatMap { tasks[$0] }
             let projectID = target?.projectId ?? proposal.projectId
             if let projectList, projectID != projectList.project.id { return nil }
-            let assigneeID = proposal.editsAssignee
-                ? proposal.proposed?.assigneeId : (proposal.assigneeId ?? target?.assigneeId)
+            let assigneeID = proposal.editsAssignee || proposal.reviewDraft != nil
+                ? proposal.reviewAssigneeId : (proposal.assigneeId ?? target?.assigneeId)
             return Row(proposal: proposal, target: target, project: projectID.flatMap { projects[$0] },
                        assignee: assigneeID.flatMap { people[$0] },
                        meeting: proposal.source?.meetingId.flatMap { meetings[$0] })
@@ -567,11 +574,13 @@ struct ApprovalsView: View {
         if let description = proposal.description, !description.isEmpty {
             Text(description).textSelection(.enabled)
         }
-        if let person = workspace.people.first(where: { $0.id == proposal.assigneeId }) {
-            LabeledContent("Исполнитель", value: person.name)
-        }
-        if let date = proposal.dueDate {
-            LabeledContent("Срок", value: [date, proposal.dueTime].compactMap { $0 }.joined(separator: " "))
+        if proposal.kind == "create_task" {
+            if let person = workspace.people.first(where: { $0.id == proposal.reviewAssigneeId }) {
+                LabeledContent("Исполнитель", value: person.name)
+            }
+            if let date = proposal.reviewDeadline.date {
+                LabeledContent("Срок", value: [date, proposal.reviewDeadline.time].compactMap { $0 }.joined(separator: " "))
+            }
         }
         if let target, let change = proposal.proposed {
             LabeledContent("Задача", value: target.title)

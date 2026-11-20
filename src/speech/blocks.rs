@@ -74,6 +74,8 @@ pub(crate) struct WhisperSession {
     tail: Vec<i16>,
     tail_text: String,
     window_end_ms: Option<u64>,
+    cached_blocks: usize,
+    processed_blocks: usize,
 }
 
 pub(crate) const OVERLAP_FRAMES: usize = 16000;
@@ -115,6 +117,8 @@ impl WhisperSession {
             tail: Vec::new(),
             tail_text: String::new(),
             window_end_ms: None,
+            cached_blocks: 0,
+            processed_blocks: 0,
         })
     }
 
@@ -140,6 +144,7 @@ impl WhisperSession {
             )
             .optional()?;
         if let Some(cached) = cached {
+            self.cached_blocks += 1;
             return Ok(serde_json::from_str(&cached)?);
         }
         let pcm = scratch.join("block.pcm");
@@ -159,6 +164,7 @@ impl WhisperSession {
             "INSERT OR IGNORE INTO speech_blocks(meeting_id,cache_key,result_json,duration_ms,elapsed_ms) VALUES (?1,?2,?3,?4,?5)",
             rusqlite::params![meeting,key,output.to_string(),duration,began.elapsed().as_millis() as u64],
         )?;
+        self.processed_blocks += 1;
         Ok(output)
     }
 }
@@ -265,7 +271,7 @@ pub(crate) fn transcribe_file(
     scratch: &Path,
     engine: &Path,
     inputs: &[Value],
-) -> Result<Value> {
+) -> Result<(Value, usize, usize)> {
     let mut session = WhisperSession::start(config, engine)?;
     let mut reader = hound::WavReader::open(input)?;
     let mut samples = reader.samples::<i16>();
@@ -314,7 +320,7 @@ pub(crate) fn transcribe_file(
         }
         pending = &pending[count..];
     }
-    Ok(json!({"transcription":rows}))
+    Ok((json!({"transcription":rows}), session.cached_blocks, session.processed_blocks))
 }
 
 #[cfg(test)]

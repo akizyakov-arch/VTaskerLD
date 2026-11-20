@@ -1,7 +1,9 @@
 //! Post-meeting Whisper.cpp CLI backend. Run outside the HTTP/capture process.
 use crate::{audio::checksum, Store};
 use anyhow::{bail, Context, Result};
+use rusqlite::OptionalExtension;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -220,6 +222,7 @@ impl Store {
             )?;
             let scratch = tempfile::tempdir()?;
             let wav = scratch.path().join("input.wav");
+            normalize_sources(config, &inputs, scratch.path())?;
             let mut merged = hound::WavWriter::create(
                 &wav,
                 hound::WavSpec {
@@ -229,19 +232,12 @@ impl Store {
                     sample_format: hound::SampleFormat::Int,
                 },
             )?;
-            // Normalize each unique blob once; repeated occurrences retain their timing.
+            // Join normalized sources in timeline order, including repeated occurrences.
             let mut total_frames = 0u64;
             for input in &mut inputs {
                 let normalized = scratch
                     .path()
                     .join(format!("{}.wav", input["recording_id"].as_i64().unwrap()));
-                if !normalized.exists() {
-                    config.normalize_audio(
-                        Path::new(input["path"].as_str().unwrap()),
-                        &normalized,
-                        Duration::from_secs(300),
-                    )?;
-                }
                 let mut reader = hound::WavReader::open(normalized)?;
                 input["start_ms"] = json!(total_frames * 1000 / 16000);
                 input["normalized_frames"] = json!(reader.duration());
@@ -257,6 +253,7 @@ impl Store {
                 rusqlite::params![run, serde_json::to_string(&inputs)?],
             )?;
             let duration = hound::WavReader::open(&wav)?.duration() as u64 * 1000 / 16000;
+            parameters["audio_duration_ms"] = json!(duration);
             let diarization_started = Instant::now();
             let diarization_task = diarization.as_ref().filter(|_| !cloud).map(|config| {
                 let config = config.clone();
@@ -265,18 +262,23 @@ impl Store {
                 let engine = speaker_engine.clone();
                 let database = self.0.path().filter(|path| !path.is_empty()).map(PathBuf::from);
                 let sources = inputs.clone();
-                scope.spawn(move || -> Result<(Vec<Value>, u64, Option<f64>)> {
+                let settings = parameters["diarization"].clone();
+                scope.spawn(move || -> Result<(Vec<Value>, u64, Option<f64>, bool)> {
                     if let Some(engine) = engine {
                         let database = database.context("Block diarization requires a database file")?;
                         let store = Store::open(&database)?;
                         let turns = speaker_blocks::separate_file(
                             &store, meeting, &config, &engine, &input, &scratch, &sources, speaker_threads,
                         )?;
-                        Ok((turns, diarization_started.elapsed().as_millis() as u64, Some(0.2)))
+                        Ok((turns, diarization_started.elapsed().as_millis() as u64, Some(0.2), false))
                     } else {
-                        let (data, elapsed) = run_diarization(&config, &input, &scratch.join("speakers.json"))?;
-                        let ratio = data["window_shift_ratio"].as_f64();
-                        Ok((crate::diarization::parse_turns(&data, duration)?, elapsed, ratio))
+                        let store = database.as_deref().map(Store::open).transpose()?;
+                        let (data, cached) = final_diarization(
+                            store.as_ref(), meeting, &settings, &config, &input, &scratch.join("speakers.json"), duration,
+                        )?;
+                        Ok((crate::diarization::parse_turns(&data, duration)?,
+                            diarization_started.elapsed().as_millis() as u64,
+                            data["window_shift_ratio"].as_f64(), cached))
                     }
                 })
             });
@@ -315,9 +317,12 @@ impl Store {
                     bail!("{message}");
                 }
             } else if let Some(engine) = &block_engine {
-                let result = blocks::transcribe_file(self, meeting, config, &wav, scratch.path(), engine, &inputs)?;
+                let (result, cached, processed) =
+                    blocks::transcribe_file(self, meeting, config, &wav, scratch.path(), engine, &inputs)?;
                 std::fs::write(prefix.with_extension("json"), result.to_string())?;
                 parameters["block_processing"] = json!(true);
+                parameters["cached_speech_blocks"] = json!(cached);
+                parameters["processed_speech_blocks"] = json!(processed);
             } else {
                 run_command(&mut command, Duration::from_secs(7200))?;
             }
@@ -347,11 +352,11 @@ impl Store {
                 .filter(|_| output["cloud_segment_timestamps"] != false)
                 .filter(|_| cloud || config.vad_model.is_none() || !segments.is_empty())
             {
-                let (turns, elapsed_ms, ratio) = match parallel_result {
+                let (turns, elapsed_ms, ratio, cached) = match parallel_result {
                     Some(result) => result?,
                     None => {
                         let (data, elapsed_ms) = run_diarization(diarization, &wav, &scratch.path().join("speakers.json"))?;
-                        (crate::diarization::parse_turns(&data, duration)?, elapsed_ms, data["window_shift_ratio"].as_f64())
+                        (crate::diarization::parse_turns(&data, duration)?, elapsed_ms, data["window_shift_ratio"].as_f64(), false)
                     }
                 };
                 if let Some(engine) = &speaker_engine {
@@ -363,6 +368,7 @@ impl Store {
                     parameters["diarization"]["window_shift_ratio"] = json!(ratio);
                 }
                 parameters["diarization_ms"] = json!(elapsed_ms);
+                parameters["cached_final_diarization"] = json!(cached);
                 turns
             } else {
                 Vec::new()
@@ -607,6 +613,67 @@ fn overlap_label(segment: &Value, voices: &[Value]) -> Option<String> {
     if unknown > 0 { labels.push(if unknown == 1 { "неопознанный голос" } else { "неопознанные голоса" }); }
     Some(format!("{} · одновременно", labels.join(" и ")))
 }
+fn normalize_sources(config: &SpeechConfig, inputs: &[Value], scratch: &Path) -> Result<()> {
+    let mut unique = std::collections::BTreeMap::new();
+    for input in inputs {
+        let id = input["recording_id"].as_i64().context("missing recording id")?;
+        let source = Path::new(input["path"].as_str().context("missing audio path")?);
+        unique.entry(id).or_insert(source);
+    }
+    let sources: Vec<_> = unique.into_iter().collect();
+    let workers = std::thread::available_parallelism().map_or(1, |count| count.get().min(3));
+    let batch_size = sources.len().div_ceil(workers).max(1);
+    std::thread::scope(|scope| {
+        let jobs = sources.chunks(batch_size).map(|batch| {
+            scope.spawn(move || -> Result<()> {
+                for (id, path) in batch {
+                    config.normalize_audio(path, &scratch.join(format!("{id}.wav")), Duration::from_secs(300))?;
+                }
+                Ok(())
+            })
+        }).collect::<Vec<_>>();
+        for job in jobs {
+            job.join().map_err(|_| anyhow::anyhow!("audio normalization worker panicked"))??;
+        }
+        Ok(())
+    })
+}
+
+fn final_diarization(
+    store: Option<&Store>,
+    meeting: i64,
+    settings: &Value,
+    config: &crate::diarization::DiarizationConfig,
+    input: &Path,
+    output: &Path,
+    duration: u64,
+) -> Result<(Value, bool)> {
+    let Some(store) = store else {
+        return Ok((run_diarization(config, input, output)?.0, false));
+    };
+    // Whole-meeting output is compatible only with identical normalized audio,
+    // models, engine and clustering settings. Live blocks use a different key.
+    let fingerprint = json!({"kind":"whole-meeting-v1","audio_sha256":checksum(input)?,"configuration":settings});
+    let key = format!("{:x}", Sha256::digest(fingerprint.to_string().as_bytes()));
+    let cached: Option<String> = store.0.query_row(
+        "SELECT result_json FROM speaker_blocks WHERE meeting_id=?1 AND cache_key=?2",
+        rusqlite::params![meeting,key], |row| row.get(0),
+    ).optional()?;
+    if let Some(data) = cached.as_deref().and_then(|raw| serde_json::from_str::<Value>(raw).ok()) {
+        if crate::diarization::parse_turns(&data, duration).is_ok() {
+            return Ok((data, true));
+        }
+    }
+    let (data, _) = run_diarization(config, input, output)?;
+    crate::diarization::parse_turns(&data, duration)?;
+    store.0.execute(
+        "INSERT INTO speaker_blocks(meeting_id,cache_key,result_json) VALUES (?1,?2,?3)
+         ON CONFLICT(meeting_id,cache_key) DO UPDATE SET result_json=excluded.result_json",
+        rusqlite::params![meeting,key,data.to_string()],
+    )?;
+    Ok((data, false))
+}
+
 fn run_diarization(
     config: &crate::diarization::DiarizationConfig,
     input: &Path,

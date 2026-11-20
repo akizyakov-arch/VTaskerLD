@@ -11,11 +11,12 @@ use std::{
     sync::mpsc::{self, Receiver},
     thread,
 };
-pub const MODELS: [&str; 8] = [
+pub const OLLAMA_MODEL: &str = "ollama:qwen3:4b-instruct-2507-q4_K_M";
+pub const MODELS: [&str; 9] = [
     "openai/gpt-oss-120b", "openai/gpt-oss-20b",
     "deepseek:deepseek-flash", "deepseek:deepseek-v4-pro",
     "openai:gpt-4.1-mini", "gemini:gemini-2.5-flash",
-    "mistral:mistral-small-latest", "anthropic:claude-sonnet-4-5",
+    "mistral:mistral-small-latest", "anthropic:claude-sonnet-4-5", OLLAMA_MODEL,
 ];
 const ANALYSIS_POLICY: &str = "vtask-groq-context-tasks-v17";
 
@@ -612,8 +613,8 @@ impl Store {
     fn prepare_analysis(&self, mid: i64, model: &str, consent: bool, fresh: bool,
                         mode: Option<&str>, force: bool, scope: ProjectScope<'_>) -> Result<(i64, Value, bool)> {
         let local = mode == Some("local") && model == local_analysis::MODEL;
-        if !consent && !local {
-            bail!("Подтвердите отправку текста в Groq");
+        if !consent && !local && model != OLLAMA_MODEL {
+            bail!("Подтвердите отправку текста выбранному ИИ-провайдеру");
         }
         if !local && !valid_model(model) {
             bail!("Неизвестная модель Groq");
@@ -1129,14 +1130,16 @@ fn helper(payload: Value) -> std::result::Result<Value, String> {
         (result, bytes)
     });
     let start = std::time::Instant::now();
+    let local = payload["model"] == OLLAMA_MODEL;
+    let timeout = if local && payload["mode"] == "analyze" { 900 } else { 300 };
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break Ok(status),
             Ok(None) => {}
             Err(_) => break Err("Ошибка процесса Groq".to_owned()),
         }
-        if start.elapsed() > std::time::Duration::from_secs(300) {
-            break Err("Истекло время анализа Groq. Повторите вручную".to_owned());
+        if start.elapsed() > std::time::Duration::from_secs(timeout) {
+            break Err("Истекло время анализа ИИ. Повторите вручную".to_owned());
         }
         thread::sleep(std::time::Duration::from_millis(100));
     };
@@ -1161,6 +1164,8 @@ pub struct GroqWorker {
     key: Option<String>,
     automatic: bool,
     live_model: Option<String>,
+    assistant_model: Option<String>,
+    assistant_key: Option<String>,
     live_key: Option<String>,
     preview_enabled: bool,
     preview_session: String,
@@ -1205,6 +1210,9 @@ impl GroqWorker {
             key: None,
             automatic: settings["automatic"] == true,
             live_model: settings["live_model"].as_str().filter(|id| valid_model(id)).map(str::to_owned),
+            assistant_model: settings["assistant_model"].as_str().filter(|id| valid_model(id)).map(str::to_owned)
+                .or_else(|| (settings["assistant_local"] == true).then(|| OLLAMA_MODEL.to_owned())),
+            assistant_key: None,
             live_key: None,
             preview_enabled: settings["live_preview"] == true,
             preview_session: String::new(),
@@ -1228,10 +1236,9 @@ impl GroqWorker {
             account,
             base_account,
         };
-        worker.launch(
-            "load_key",
-            json!({"mode":"load_key","account":worker.account}),
-        );
+        if worker.model != OLLAMA_MODEL {
+            worker.launch("load_key", json!({"mode":"load_key","account":worker.account}));
+        }
         Ok(worker)
     }
     fn launch(&mut self, operation: &str, mut payload: Value) {
@@ -1251,7 +1258,7 @@ impl GroqWorker {
             let result = if let Some(account) = payload["load_account"].as_str() {
                 helper(json!({"mode":"load_key","account":account})).and_then(|value| {
                     let key = value["key"].as_str().filter(|key| !key.is_empty())
-                        .ok_or_else(|| "Добавьте API-ключ профиля анализа на лету.".to_owned())?;
+                        .ok_or_else(|| "Добавьте API-ключ выбранного провайдера в настройках ИИ.".to_owned())?;
                     let mut payload = payload;
                     payload["key"] = json!(key);
                     payload.as_object_mut().unwrap().remove("load_account");
@@ -1267,10 +1274,19 @@ impl GroqWorker {
         if self.rx.is_some() {
             bail!("Groq занят. Повторите запрос чуть позже.");
         }
-        let key = self
-            .key
-            .as_ref()
-            .context("Добавьте ключ Groq в настройках")?;
+        let model = self.assistant_model.as_deref().unwrap_or(&self.model);
+        let local = model == OLLAMA_MODEL;
+        let selected_provider = provider(model);
+        let key = if local {
+            None
+        } else {
+            self.assistant_key.as_deref().filter(|_| self.assistant_model.is_some())
+                .or_else(|| self.key.as_deref().filter(|_| provider(&self.model) == selected_provider))
+                .or_else(|| self.live_key.as_deref().filter(|_| {
+                    self.live_model.as_deref().map(provider) == Some(selected_provider)
+                }))
+        };
+        let load_account = (!local && key.is_none()).then(|| key_account(&self.base_account, model));
         let id = data["id"]
             .as_str()
             .filter(|id| {
@@ -1288,12 +1304,16 @@ impl GroqWorker {
         let today = data["today"]
             .as_str()
             .and_then(|value| chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").ok());
+        let prior_due_date = data["prior_due_date"]
+            .as_str()
+            .and_then(|value| chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").ok());
         self.assistant_id = Some(id.to_owned());
         self.assistant_result = None;
-        self.launch("assistant", json!({"mode":"assistant","key":key,"model":self.model,
+        self.launch("assistant", json!({"mode":"assistant","key":key,"load_account":load_account,"model":model,
             "text":text,"has_search":data["has_search"] == true,"has_project":data["has_project"] == true,
-            "today":today.map(|date| date.to_string())}));
-        Ok(json!({"state":"pending"}))
+            "has_task":data["has_task"] == true,"task_update_followup":data["task_update_followup"] == true,
+            "prior_due_date":prior_due_date.map(|date| date.to_string()),"today":today.map(|date| date.to_string())}));
+        Ok(json!({"state":"pending","local":local}))
     }
 
     pub fn assistant_result(&self, id: &str) -> Result<Value> {
@@ -1308,19 +1328,44 @@ impl GroqWorker {
     }
 
     pub fn status(&self) -> Value {
-        json!({"automatic":self.automatic,"model":self.model,"models":MODELS,"live_model":self.live_model,"live_preview":self.preview_enabled,"has_key":self.key.is_some(),"storage":self.storage,"busy":self.rx.is_some(),"operation":self.operation,"job_id":self.job,"error":self.error})
+        json!({"automatic":self.automatic,"model":self.model,"models":MODELS,"live_model":self.live_model,"live_preview":self.preview_enabled,"assistant_model":self.assistant_model,"assistant_local":self.assistant_model.as_deref()==Some(OLLAMA_MODEL),"local":self.model==OLLAMA_MODEL,"has_key":self.key.is_some(),"storage":self.storage,"busy":self.rx.is_some(),"operation":self.operation,"job_id":self.job,"error":self.error})
+    }
+    fn save_profiles(&self, store: &Store) -> Result<()> {
+        store.0.execute("INSERT INTO workspace_settings(key,data_json) VALUES ('groq',?1)
+            ON CONFLICT(key) DO UPDATE SET data_json=excluded.data_json",
+            [json!({"model":self.model,"live_model":self.live_model,"automatic":self.automatic,
+                    "live_preview":self.preview_enabled,"assistant_model":self.assistant_model,
+                    "assistant_local":self.assistant_model.as_deref()==Some(OLLAMA_MODEL)}).to_string()])?;
+        Ok(())
     }
     pub fn settings(&mut self, store: &Store, data: &Value) -> Result<Value> {
         if self.rx.is_some() {
             bail!("Дождитесь завершения операции Groq");
         }
+        let assistant = data["profile"] == "assistant";
         let live = data["profile"] == "live";
         let current_live = self.live_model.as_deref().unwrap_or(&self.model);
-        let model = data["model"].as_str().unwrap_or(if live { current_live } else { &self.model });
+        let assistant_model = if assistant {
+            if data["use_full_profile"] == true || data["local"] == false {
+                None
+            } else if data["local"] == true {
+                Some(OLLAMA_MODEL)
+            } else {
+                Some(data["model"].as_str().context("Выберите модель для Валли")?)
+            }
+        } else {
+            None
+        };
+        let model = if assistant { assistant_model.unwrap_or(&self.model) } else {
+            data["model"].as_str().unwrap_or(if live { current_live } else { &self.model })
+        };
         if !valid_model(model) {
             bail!("Неизвестная модель Groq");
         }
         let key = data["api_key"].as_str().unwrap_or("").trim();
+        if model == OLLAMA_MODEL && (!key.is_empty() || data["clear_key"] == true) {
+            bail!("Локальная модель Ollama не использует API-ключ");
+        }
         if !key.is_empty()
             && (!(16..=512).contains(&key.len())
                 || !key
@@ -1332,17 +1377,39 @@ impl GroqWorker {
         if data["clear_key"] == true && !key.is_empty() {
             bail!("Выберите сохранение или удаление ключа");
         }
+        if assistant {
+            if data["clear_key"] == true || (assistant_model.is_none() && !key.is_empty()) {
+                bail!("Управляйте ключом у выбранного провайдера");
+            }
+            let next = assistant_model.map(str::to_owned);
+            if next.as_deref().map(provider) != self.assistant_model.as_deref().map(provider) {
+                self.assistant_key = None;
+            }
+            self.assistant_model = next;
+            self.error = None;
+            self.save_profiles(store)?;
+            if !key.is_empty() {
+                let selected = self.assistant_model.as_deref().unwrap_or(&self.model);
+                let account = key_account(&self.base_account, selected);
+                if provider(selected) == provider(&self.model) {
+                    self.key = Some(key.into());
+                    self.storage = "session".into();
+                }
+                if self.live_model.as_deref().is_some_and(|live| provider(live) == provider(selected)) {
+                    self.live_key = Some(key.into());
+                }
+                self.assistant_key = Some(key.into());
+                let operation = if account == self.account { "save_key" } else { "save_assistant_key" };
+                self.launch(operation, json!({"mode":"save_key","account":account,"key":key,"persist":data["persist"]==true}));
+            }
+            return Ok(self.status());
+        }
         if live {
             let automatic = data["automatic"].as_bool().unwrap_or(self.automatic);
             let preview_enabled = data["live_preview"].as_bool().unwrap_or(self.preview_enabled);
             let live_model = if data["use_full_profile"] == true { None } else { Some(model.to_owned()) };
             let selected = live_model.as_deref().unwrap_or(&self.model);
             let account = key_account(&self.base_account, selected);
-            store.0.execute(
-                "INSERT INTO workspace_settings(key,data_json) VALUES ('groq',?1)
-                 ON CONFLICT(key) DO UPDATE SET data_json=excluded.data_json",
-                [json!({"model":self.model,"live_model":live_model,"automatic":automatic,"live_preview":preview_enabled}).to_string()],
-            )?;
             if provider(selected) != provider(current_live) {
                 self.live_key = None;
             }
@@ -1350,7 +1417,11 @@ impl GroqWorker {
             self.automatic = automatic;
             self.preview_enabled = preview_enabled;
             self.error = None;
+            self.save_profiles(store)?;
             if !key.is_empty() {
+                if self.assistant_model.as_deref().is_some_and(|assistant| key_account(&self.base_account, assistant) == account) {
+                    self.assistant_key = Some(key.into());
+                }
                 if account == self.account {
                     self.key = Some(key.into());
                     self.storage = "session".into();
@@ -1365,19 +1436,24 @@ impl GroqWorker {
         let switched = provider(model) != provider(&self.model);
         let model = model.to_owned();
         if switched {
-            if self.live_model.as_deref().is_some_and(|live| provider(live) == provider(model.as_str())) {
-                self.live_key = None;
-            }
-            self.key = None;
+            let selected_provider = provider(&model);
+            self.key = self.assistant_key.clone().filter(|_| self.assistant_model.as_deref().map(provider) == Some(selected_provider))
+                .or_else(|| self.live_key.clone().filter(|_| self.live_model.as_deref().map(provider) == Some(selected_provider)));
             self.storage = "session".into();
             self.account = key_account(&self.base_account, &model);
         }
         self.model = model;
         self.automatic = data["automatic"].as_bool().unwrap_or(self.automatic);
         self.error = None;
-        store.0.execute("INSERT INTO workspace_settings(key,data_json) VALUES ('groq',?1) ON CONFLICT(key) DO UPDATE SET data_json=excluded.data_json",[json!({"model":self.model,"live_model":self.live_model,"automatic":self.automatic,"live_preview":self.preview_enabled}).to_string()])?;
+        self.save_profiles(store)?;
         if data["clear_key"] == true {
             self.key = None;
+            if self.assistant_model.as_deref().is_some_and(|model| provider(model) == provider(&self.model)) {
+                self.assistant_key = None;
+            }
+            if self.live_model.as_deref().is_some_and(|model| provider(model) == provider(&self.model)) {
+                self.live_key = None;
+            }
             self.storage = "session".into();
             self.launch(
                 "delete_key",
@@ -1385,10 +1461,16 @@ impl GroqWorker {
             );
         } else if !key.is_empty() {
             self.key = Some(key.into());
+            if self.assistant_model.as_deref().is_some_and(|model| provider(model) == provider(&self.model)) {
+                self.assistant_key = Some(key.into());
+            }
+            if self.live_model.as_deref().is_some_and(|model| provider(model) == provider(&self.model)) {
+                self.live_key = Some(key.into());
+            }
             self.storage = "session".into();
             self.launch("save_key",json!({"mode":"save_key","account":self.account,"key":key,"persist":data["persist"]==true}));
         }
-        if switched && key.is_empty() && data["clear_key"] != true {
+        if switched && self.model != OLLAMA_MODEL && self.key.is_none() && data["clear_key"] != true {
             self.launch("load_key", json!({"mode":"load_key","account":self.account}));
         }
         Ok(self.status())
@@ -1417,12 +1499,12 @@ impl GroqWorker {
         }
         let model = if incremental { self.live_model.as_deref().unwrap_or(&self.model) } else { &self.model };
         let shared_key = provider(model) == provider(&self.model);
-        let key = if shared_key {
+        let key = if model == OLLAMA_MODEL { None } else if shared_key {
             Some(self.key.as_deref().context("Добавьте API-ключ провайдера в настройках")?)
         } else {
             self.live_key.as_deref()
         };
-        let load_account = if key.is_none() { Some(key_account(&self.base_account, model)) } else { None };
+        let load_account = (model != OLLAMA_MODEL && key.is_none()).then(|| key_account(&self.base_account, model));
         let mid = data["meeting_id"].as_i64().context("Выберите встречу")?;
         let force = !incremental && data["force"] == true;
         let mode = if incremental { "automatic" } else { "manual" };
@@ -1510,7 +1592,7 @@ impl GroqWorker {
         }
         let model = self.live_model.as_deref().unwrap_or(&self.model);
         let key = if provider(model) == provider(&self.model) { self.key.as_deref() } else { self.live_key.as_deref() };
-        let load_account = key.is_none().then(|| key_account(&self.base_account, model));
+        let load_account = (model != OLLAMA_MODEL && key.is_none()).then(|| key_account(&self.base_account, model));
         let payload = json!({
             "mode":"analyze","key":key,"load_account":load_account,"model":model,
             "input":{"title":title,"created_at":date,"timezone":store.workspace_timezone()?,
@@ -1529,7 +1611,7 @@ impl GroqWorker {
         }
         let live_model = self.live_model.as_deref().unwrap_or(&self.model);
         let uses_full_key = provider(live_model) == provider(&self.model);
-        if !self.automatic || (uses_full_key && self.key.is_none()) {
+        if !self.automatic || (live_model != OLLAMA_MODEL && uses_full_key && self.key.is_none()) {
             self.last_run = store.0.query_row(
                 "SELECT COALESCE(MAX(id),0) FROM model_runs WHERE status='completed'",
                 [],

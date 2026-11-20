@@ -291,6 +291,9 @@ struct MeetingTranscript: View {
             } else {
                 Text("Готового протокола пока нет.").foregroundStyle(.secondary)
             }
+            if let metrics = transcript?.parameters, metrics.isAvailable {
+                processingMetrics(metrics)
+            }
             HStack {
                 Menu {
                     Button("Текст (.txt)") { Task { await model.exportMeeting(meeting, asText: true) } }
@@ -306,6 +309,38 @@ struct MeetingTranscript: View {
             .buttonStyle(.bordered)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func processingMetrics(_ metrics: Transcript.ProcessingMetrics) -> some View {
+        DisclosureGroup("Время обработки") {
+            VStack(alignment: .leading, spacing: 6) {
+                durationRow("Длительность записи", metrics.audioDurationMs, fullMinutes: true)
+                durationRow("Подготовка аудио", metrics.preparationMs)
+                durationRow("Распознавание речи", metrics.transcriptionMs)
+                durationRow("Разделение голосов", metrics.diarizationMs)
+                if metrics.cachedFinalDiarization == true {
+                    Text("Разделение голосов взято из предыдущей обработки этой записи.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                if let cached = metrics.cachedSpeechBlocks, let processed = metrics.processedSpeechBlocks {
+                    LabeledContent("Речевые блоки", value: "\(cached) из кеша · \(processed) обработано заново")
+                }
+                if metrics.parallelDiarization == true, metrics.diarizationMs != nil {
+                    Text("Распознавание речи и разделение голосов выполнялись параллельно.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            .padding(.vertical, 6)
+            .monospacedDigit()
+        }
+    }
+
+    @ViewBuilder
+    private func durationRow(_ title: String, _ milliseconds: Int?, fullMinutes: Bool = false) -> some View {
+        if let milliseconds {
+            let seconds = (Double(milliseconds) / 1_000).formatted(.number.precision(.fractionLength(0...1)))
+            LabeledContent(title, value: fullMinutes || milliseconds >= 60_000 ? meetingTime(milliseconds) : "\(seconds) с")
+        }
     }
 
     private func topicsBySegment(in transcript: Transcript) -> [Int: String] {

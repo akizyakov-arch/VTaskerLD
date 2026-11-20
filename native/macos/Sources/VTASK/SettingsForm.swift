@@ -83,7 +83,7 @@ struct AssistantVoiceSettingsForm: View {
                 }
                 .disabled(!canPreview)
                 Toggle("Понимать свободные фразы через выбранный ИИ", isOn: $semanticInterpretation)
-                Text("Для нераспознанных команд Выбранный провайдер получает текст запроса. Проекты и задачи остаются на Mac.")
+                Text("Выбранная модель получает текст нераспознанной команды. Поиск по проектам и задачам выполняется на Mac.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Stepper(value: $silenceMilliseconds, in: AssistantVoicePreferences.silenceRange, step: 100) {

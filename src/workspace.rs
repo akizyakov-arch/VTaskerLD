@@ -215,6 +215,13 @@ fn stages(c: &Connection, task: &Value, demo: bool) -> Result<Value> {
     }
 }
 fn validate_source(c: &Connection, source: &Value, demo: bool) -> Result<()> {
+    if source["type"] == "assistant_command" {
+        let quote = text(source, "quote").trim();
+        if source["meeting_id"].is_null() && (1..=1000).contains(&quote.chars().count()) {
+            return Ok(());
+        }
+        bail!("Некорректный источник команды Валли");
+    }
     let meeting = id(source, "meeting_id").context("Источник должен содержать встречу")?;
     let mode: bool = c
         .query_row("SELECT is_demo FROM meetings WHERE id=?1", [meeting], |r| {
@@ -228,6 +235,200 @@ fn validate_source(c: &Connection, source: &Value, demo: bool) -> Result<()> {
         bail!("Нужны исходная цитата и временная метка встречи из текущего режима");
     }
     Ok(())
+}
+
+fn assistant_assignee(c: &Connection, name: &str, demo: bool) -> Result<i64> {
+    let mut stmt = c.prepare(
+        "SELECT p.id,p.name,COALESCE(d.last_name,''),COALESCE(d.patronymic,''),COALESCE(d.nickname,'')
+         FROM people p LEFT JOIN person_profiles d ON d.person_id=p.id WHERE p.is_demo=?1",
+    )?;
+    let normalize = |value: String| value.split_whitespace().collect::<Vec<_>>().join(" ")
+        .to_lowercase().replace('ё', "е");
+    let people = stmt.query_map([demo], |row| {
+        let first = normalize(row.get(1)?);
+        let last = normalize(row.get(2)?);
+        let patronymic = normalize(row.get(3)?);
+        let nickname = normalize(row.get(4)?);
+        let full = normalize(format!("{last} {first} {patronymic}"));
+        let aliases = [first.clone(), nickname, full, normalize(format!("{last} {first}")),
+            normalize(format!("{first} {last}")), normalize(format!("{first} {patronymic} {last}"))];
+        Ok((row.get::<_, i64>(0)?, first, aliases))
+    })?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let exact: Vec<_> = people.iter().filter(|(_, _, aliases)| aliases.iter().any(|value| value == name)).collect();
+    let matches = if exact.is_empty() {
+        people.iter().filter(|(_, value, _)| {
+            let Some(first) = value.split_whitespace().next() else { return false; };
+            let dative = if let Some(stem) = first.strip_suffix('а') {
+                format!("{stem}у")
+            } else if let Some(stem) = first.strip_suffix(['я', 'й', 'ь']) {
+                format!("{stem}ю")
+            } else {
+                format!("{first}у")
+            };
+            first == name || dative == name
+        }).collect()
+    } else {
+        exact
+    };
+    let [(id, _, _)] = matches.as_slice() else {
+        bail!("Уточните исполнителя. Можно указать имя и фамилию или псевдоним из карточки участника");
+    };
+    Ok(*id)
+}
+
+fn edit_assistant_review_draft(c: &Connection, proposal_id: i64, action: &Value, demo: bool) -> Result<Value> {
+    let raw: String = c.query_row(
+        "SELECT data_json FROM proposals WHERE id=?1 AND is_demo=?2 AND status='pending'",
+        params![proposal_id, demo], |row| row.get(0),
+    ).optional()?.context("Предложение уже рассмотрено или недоступно")?;
+    let proposal: Value = serde_json::from_str(&raw)?;
+    if proposal["kind"] != "create_task" || !matches!(text(action, "kind"), "change_due" | "change_assignee" | "change_task") {
+        bail!("Здесь можно изменить срок и исполнителя новой задачи на согласовании");
+    }
+    let mut draft = proposal.get("review_draft").filter(|draft| draft["data"].is_object()).cloned()
+        .unwrap_or_else(|| json!({
+            "op":"review", "id":proposal_id, "data":{
+                "title":proposal["title"], "description":proposal["description"], "project_id":proposal["project_id"],
+                "assignee_id":proposal["assignee_id"], "stage_id":proposal["proposed"]["stage_id"],
+                "due_date":proposal["due_date"], "due_time":proposal["due_time"],
+                "related_task_id":proposal["related_task_id"], "priority":"normal", "blocked":false
+            }
+        }));
+    let project = id(&draft["data"], "project_id").map(|id| entity(c, "projects", id)).transpose()?;
+    if project.as_ref().is_some_and(|project| project["archived"] == true) {
+        bail!("Задача относится к архивному проекту");
+    }
+    if text(&draft["data"], "stage_id").is_empty() {
+        let stages = stages(c, &draft["data"], demo)?;
+        draft["data"]["stage_id"] = stages.as_array().into_iter().flatten()
+            .find(|stage| stage["kind"] == "active").map(|stage| stage["id"].clone()).unwrap_or_default();
+    }
+    if action["due_date"].is_string() {
+        draft["data"]["due_date"] = action["due_date"].clone();
+        draft["data"]["due_time"] = action["due_time"].clone();
+        if id(&draft, "existing_task_id").is_some() { draft["apply_due"] = json!(true); }
+    }
+    if let Some(name) = action["assignee_name"].as_str() {
+        draft["data"]["assignee_id"] = json!(assistant_assignee(c, name, demo)?);
+        if id(&draft, "existing_task_id").is_some() { draft["apply_assignee"] = json!(true); }
+    }
+    c.execute(
+        "UPDATE proposals SET data_json=json_set(data_json,'$.review_draft',json(?2)) WHERE id=?1 AND is_demo=?3 AND status='pending'",
+        params![proposal_id, draft.to_string(), demo],
+    )?;
+    Ok(json!({"id":proposal_id}))
+}
+
+fn assistant_task_update(changes: &Value) -> Result<Value> {
+    let fields = changes.as_object().context("Некорректные параметры изменения задачи")?;
+    if fields.keys().any(|key| !matches!(key.as_str(), "due_date" | "due_time" | "assignee"))
+        || fields.values().any(|value| !value.is_string()) {
+        bail!("Можно указать только срок, время и имя исполнителя");
+    }
+    let date = changes["due_date"].as_str().map(|value| {
+        let date = NaiveDate::parse_from_str(value, "%Y-%m-%d").context("Уточните дату срока")?;
+        if value.len() != 10 || date.format("%Y-%m-%d").to_string() != value { bail!("Уточните дату срока"); }
+        Ok(date.to_string())
+    }).transpose()?;
+    let time = changes["due_time"].as_str().map(|value| {
+        if date.is_none() || value.len() != 5 { bail!("Укажите дату и время срока"); }
+        let time = NaiveTime::parse_from_str(value, "%H:%M").context("Уточните время срока")?;
+        Ok(time.format("%H:%M").to_string())
+    }).transpose()?;
+    let name = changes["assignee"].as_str().map(|value| {
+        let value = value.trim();
+        if value.is_empty() || value.chars().count() > 120 { bail!("Уточните имя исполнителя"); }
+        Ok(value.to_lowercase().replace('ё', "е"))
+    }).transpose()?;
+    let kind = match (date.is_some(), name.is_some()) {
+        (true, true) => "change_task",
+        (true, false) => "change_due",
+        (false, true) => "change_assignee",
+        (false, false) => bail!("Уточните срок или исполнителя"),
+    };
+    Ok(json!({"kind":kind,"due_date":date,"due_time":time,"assignee_name":name}))
+}
+
+fn propose_assistant_command(c: &Connection, request: &Value, demo: bool) -> Result<Value> {
+    let quote = text(request, "text").trim();
+    if quote.chars().count() > 1000 { bail!("Команда должна быть до 1000 символов"); }
+    let timezone: Tz = text(&settings(c)?, "timezone").parse()?;
+    let today = Utc::now().with_timezone(&timezone).date_naive();
+    let target_id = id(request, "task_id");
+    let draft_id = id(request, "proposal_id");
+    if target_id.is_some() && draft_id.is_some() { bail!("Выберите одну задачу"); }
+    let selected_action = || {
+        if let Some(changes) = request.get("changes") {
+            if quote.is_empty() { bail!("Укажите исходную команду Валли"); }
+            return assistant_task_update(changes);
+        }
+        crate::local_analysis::parse_action(quote, Some(today))
+            .context("Уточните команду, например «Перенеси срок на завтра в 16:30»")
+    };
+    if let Some(proposal_id) = draft_id {
+        return edit_assistant_review_draft(c, proposal_id, &selected_action()?, demo);
+    }
+    let (task_id, action) = if let Some(task_id) = target_id {
+        (task_id, selected_action()?)
+    } else {
+        if request.get("changes").is_some() { bail!("Сначала выберите задачу"); }
+        crate::local_analysis::parse_command(quote, Some(today)).context(
+            "Откройте задачу или укажите её номер, например «По задаче #42: перенести срок на завтра в 16:30»",
+        )?
+    };
+    let task = entity(c, "tasks", task_id)?;
+    same_scope(&task, demo)?;
+    if let Some(project_id) = id(&task, "project_id") {
+        if entity(c, "projects", project_id)?["archived"] == true {
+            bail!("Задача относится к архивному проекту");
+        }
+    }
+    let kind = text(&action, "kind");
+    if kind == "change_task" && !stages(c, &task, demo)?.as_array().into_iter().flatten()
+        .any(|stage| stage["id"] == task["stage_id"] && stage["kind"] == "active") {
+        bail!("Срок и исполнителя вместе можно изменить у активной задачи");
+    }
+    let mut proposal = json!({"kind":kind, "title":task["title"], "project_id":task["project_id"],
+        "task_id":task_id,"origin":"assistant_command","source":{"type":"assistant_command","quote":quote}});
+    if kind == "create_task" {
+        proposal["title"] = action["title"].clone();
+        proposal["related_task_id"] = json!(task_id);
+        proposal["task_id"] = Value::Null;
+    } else {
+        let normalized = |title: &str| title.trim().to_lowercase().replace('ё', "е");
+        let proposed = match kind {
+            "change_due" => json!({"due_date":action["due_date"],"due_time":action["due_time"]}),
+            "change_task" => json!({"due_date":action["due_date"],"due_time":action["due_time"],
+                "assignee_id":assistant_assignee(c, text(&action,"assignee_name"), demo)?}),
+            "change_blocked" => json!({"blocked":action["blocked"],"blocked_reason":text(&action,"blocked_reason")}),
+            "change_status" => {
+                let matches = stages(c, &task, demo)?;
+                let stage = matches.as_array().into_iter().flatten()
+                    .find(|stage| normalized(text(stage,"title")) == text(&action,"stage_title"))
+                    .context("Укажите название статуса из проекта")?;
+                json!({"stage_id":stage["id"],"stage_title":stage["title"]})
+            }
+            "change_assignee" => json!({"assignee_id":assistant_assignee(c, text(&action,"assignee_name"), demo)?}),
+            _ => bail!("Неизвестная команда Валли"),
+        };
+        let fields = change_fields(kind);
+        let baseline: serde_json::Map<_, _> = fields.iter().map(|key| (key.to_string(), task[*key].clone())).collect();
+        if fields.iter().all(|key| task[*key] == proposed[*key]) {
+            bail!("В задаче уже установлены эти значения");
+        }
+        proposal["base_task"] = json!(baseline);
+        proposal["proposed"] = proposed;
+    }
+    let raw = proposal.to_string();
+    if let Some(existing) = c.query_row(
+        "SELECT id FROM proposals WHERE is_demo=?1 AND status='pending'
+         AND json_remove(data_json,'$.review_draft')=?2 ORDER BY id DESC LIMIT 1",
+        params![demo, raw], |row| row.get::<_,i64>(0),
+    ).optional()? {
+        return Ok(json!({"id":existing}));
+    }
+    c.execute("INSERT INTO proposals(data_json,is_demo) VALUES (?1,?2)", params![raw,demo])?;
+    Ok(json!({"id":c.last_insert_rowid()}))
 }
 fn validate_task(c: &Connection, v: &mut Value, demo: bool, own: Option<i64>) -> Result<()> {
     for key in ["project_id", "assignee_id", "author_id"] {
@@ -1005,8 +1206,10 @@ impl Store {
                     .collect::<rusqlite::Result<Vec<_>>>()?;
                 json!(rows.into_iter().map(|(i,p,n,t)|Ok(json!({"id":i,"before":p.map(|s|serde_json::from_str::<Value>(&s)).transpose()?,"after":serde_json::from_str::<Value>(&n)?,"created_at":t}))).collect::<Result<Vec<_>>>()?)
             }
+            "assistant_command" => propose_assistant_command(&tx, body, demo)?,
             "propose" => {
                 let p = &body["data"];
+                if p["source"]["type"] == "assistant_command" { bail!("Используйте команду Валли"); }
                 validate_source(&tx, &p["source"], demo)?;
                 if ![
                     "create_task",
@@ -1314,7 +1517,7 @@ fn review(c: &Connection, body: &Value, demo: bool, linked_decision: Option<i64>
                 }
                 result = save(c, "tasks", data, Some(&old), demo, None)?;
             } else {
-                if proposal["origin"] == "groq" && body["confirm_separate_task"] != true {
+                if matches!(text(&proposal,"origin"), "groq" | "assistant_command") && body["confirm_separate_task"] != true {
                     let project = id(approved, "project_id");
                     let title = text(approved, "title");
                     let candidates = proposal["candidate_task_ids"].as_array();
@@ -1393,6 +1596,9 @@ fn review(c: &Connection, body: &Value, demo: bool, linked_decision: Option<i64>
                 .context("Выберите существующую задачу")?;
             let old = entity(c, "tasks", tid)?;
             same_scope(&old, demo)?;
+            if proposal["origin"] == "assistant_command" && proposal["project_id"] != old["project_id"] {
+                bail!("Задача теперь в другом проекте. Отправьте команду заново");
+            }
             if matches!(text(&proposal,"origin"),"groq" | "local_analysis")
                 && id(&proposal,"task_id") == Some(tid) && !proposal["project_id"].is_null()
                 && id(&proposal,"project_id") != id(&old,"project_id") {
@@ -1417,8 +1623,10 @@ fn review(c: &Connection, body: &Value, demo: bool, linked_decision: Option<i64>
                 if old["project_id"] != proposal["project_id"] {
                     bail!("Выберите задачу из проекта предложения");
                 }
-                let project = entity(c, "projects", id(&old, "project_id").context("Задача без проекта")?)?;
-                if project["archived"] == true || !project["stages"].as_array().into_iter().flatten()
+                let project = id(&old, "project_id").map(|id| entity(c, "projects", id)).transpose()?;
+                if project.is_none() && proposal["origin"] != "assistant_command" { bail!("Задача без проекта"); }
+                if project.is_some_and(|project| project["archived"] == true)
+                    || !stages(c, &old, demo)?.as_array().into_iter().flatten()
                     .any(|stage| stage["id"] == old["stage_id"] && stage["kind"] == "active") {
                     bail!("Пакет можно применить только к активной задаче проекта");
                 }

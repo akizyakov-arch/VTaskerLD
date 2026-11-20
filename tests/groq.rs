@@ -1,7 +1,7 @@
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
 use vtracker::{
-    groq::{GroqWorker, MODELS},
+    groq::{GroqWorker, MODELS, OLLAMA_MODEL},
     Store,
 };
 fn setup() -> (tempfile::TempDir, Store, i64, i64) {
@@ -28,6 +28,48 @@ fn meeting_with_transcript(s: &Store, c: &Connection, title: &str, text: &str) -
 }
 fn output(seg: i64) -> Value {
     json!({"summary":"Agreed to prepare a report.","open_questions":["Who reviews it?"],"decisions":[{"text":"Prepare report","source_segment_ids":[seg]}],"tasks":[{"title":"Prepare report","description":"Draft report","assignee_name":null,"due_date":null,"source_segment_ids":[seg]}]})
+}
+#[test]
+fn ollama_profile_persists_and_prepares_analysis_without_cloud_consent() {
+    let (dir, store, meeting, _) = setup();
+    let path = dir.path().join("db");
+    Connection::open(&path).unwrap().execute(
+        "INSERT INTO workspace_settings(key,data_json) VALUES('groq',?1)",
+        [json!({"model": OLLAMA_MODEL}).to_string()],
+    ).unwrap();
+    let mut worker = GroqWorker::new(&path, &store).unwrap();
+    assert_eq!(worker.status()["local"], true);
+    assert_eq!(worker.status()["has_key"], false);
+    worker.settings(&store, &json!({"profile":"assistant","local":true})).unwrap();
+    worker.settings(&store, &json!({"profile":"live","model":OLLAMA_MODEL})).unwrap();
+    let reopened = GroqWorker::new(&path, &store).unwrap();
+    assert_eq!(reopened.status()["assistant_local"], true);
+    assert_eq!(reopened.status()["assistant_model"], OLLAMA_MODEL);
+    assert_eq!(reopened.status()["live_model"], OLLAMA_MODEL);
+    assert!(store.groq_prepare(meeting, MODELS[0], false).is_err());
+    assert!(store.groq_prepare(meeting, OLLAMA_MODEL, false).is_ok());
+}
+
+#[test]
+fn assistant_provider_can_differ_from_protocol_provider() {
+    let (dir, store, _, _) = setup();
+    let path = dir.path().join("db");
+    Connection::open(&path).unwrap().execute(
+        "INSERT INTO workspace_settings(key,data_json) VALUES('groq',?1)",
+        [json!({"model": OLLAMA_MODEL, "assistant_local": true}).to_string()],
+    ).unwrap();
+    let mut worker = GroqWorker::new(&path, &store).unwrap();
+    assert_eq!(worker.status()["assistant_model"], OLLAMA_MODEL);
+    let cloud = "deepseek:deepseek-flash";
+    worker.settings(&store, &json!({"profile":"assistant","model":cloud})).unwrap();
+    worker.settings(&store, &json!({"profile":"live","use_full_profile":true})).unwrap();
+    let mut reopened = GroqWorker::new(&path, &store).unwrap();
+    assert_eq!(reopened.status()["assistant_model"], cloud);
+    assert_eq!(reopened.status()["model"], OLLAMA_MODEL);
+    assert!(reopened.settings(&store, &json!({"profile":"assistant","model":"ollama:unknown"})).is_err());
+    assert_eq!(reopened.status()["assistant_model"], cloud);
+    reopened.settings(&store, &json!({"profile":"assistant","use_full_profile":true})).unwrap();
+    assert!(GroqWorker::new(&path, &store).unwrap().status()["assistant_model"].is_null());
 }
 #[test]
 fn analysis_is_atomic_idempotent_and_only_proposes() {
@@ -467,6 +509,66 @@ fn retranscribing_an_overlapping_excerpt_does_not_reopen_an_accepted_task() {
 }
 
 #[test]
+fn continued_meeting_keeps_the_approved_task_and_proposes_only_the_new_deadline() {
+    let (dir, store, meeting, opening) = setup();
+    let project = store.workspace_action(&json!({"op":"save_project","data":{
+        "title":"Поставка","status":"active","stages":vtracker::workspace::default_stages()
+    }})).unwrap();
+    store.workspace_action(&json!({"op":"save_meeting","id":meeting,"data":{
+        "title":"Планирование","project_id":project["id"],"participants":[]
+    }})).unwrap();
+    let mut response = output(opening);
+    response["decisions"] = json!([]);
+    response["tasks"][0]["due_date"] = json!("2026-11-24");
+    let (analysis, _, _) = store.groq_prepare(meeting, MODELS[0], true).unwrap();
+    store.groq_complete(analysis, &response).unwrap();
+    let proposal = store.workspace(false, None).unwrap()["proposals"][0]["id"].clone();
+    let approved = store.workspace_action(&json!({"op":"review","id":proposal,"data":{
+        "title":"Prepare report","project_id":project["id"],"stage_id":"todo",
+        "priority":"normal","blocked":false,"due_date":"2026-11-24"
+    }})).unwrap();
+    let task = &approved["task"];
+
+    let conn = Connection::open(dir.path().join("db")).unwrap();
+    conn.execute(
+        "INSERT INTO segments(model_run_id,start_ms,end_ms,text,sources_json)
+         SELECT model_run_id,120000,123000,'Move the report to November 27 at 16:30','[]'
+         FROM segments WHERE id=?1",
+        [opening],
+    ).unwrap();
+    let continuation = conn.last_insert_rowid();
+    response["tasks"].as_array_mut().unwrap().push(json!({
+        "kind":"change_due","title":"Prepare report","task_id":task["id"],
+        "project_id":project["id"],"description":"","due_date":"2026-11-27",
+        "due_time":"16:30","source_segment_ids":[continuation]
+    }));
+    let (analysis, _, _) = store.groq_prepare_run(meeting, MODELS[0], true, true).unwrap();
+    store.groq_complete(analysis, &response).unwrap();
+    let snapshot = store.workspace(false, None).unwrap();
+    let proposals = snapshot["proposals"].as_array().unwrap();
+    assert_eq!(proposals.len(), 2);
+    let change = proposals.iter().find(|item| item["status"] == "pending").unwrap();
+    assert_eq!(change["kind"], "change_due");
+    assert_eq!(change["task_id"], task["id"]);
+    assert_eq!(change["source"]["segment_ids"], json!([continuation]));
+    assert_eq!(snapshot["tasks"].as_array().unwrap().len(), 1);
+    assert_eq!(snapshot["tasks"][0]["revision"], task["revision"]);
+    assert_eq!(snapshot["tasks"][0]["due_date"], "2026-11-24");
+    store.workspace_action(&json!({"op":"review","id":change["id"],"existing_task_id":task["id"],
+        "task_revision":task["revision"],"data":change["proposed"]
+    })).unwrap();
+
+    let (analysis, _, _) = store.groq_prepare_run(meeting, MODELS[0], true, true).unwrap();
+    store.groq_complete(analysis, &response).unwrap();
+    let final_state = store.workspace(false, None).unwrap();
+    assert_eq!(final_state["tasks"].as_array().unwrap().len(), 1);
+    assert_eq!(final_state["tasks"][0]["id"], task["id"]);
+    assert_eq!(final_state["tasks"][0]["due_date"], "2026-11-27");
+    assert_eq!(final_state["tasks"][0]["due_time"], "16:30");
+    assert!(final_state["proposals"].as_array().unwrap().iter().all(|item| item["status"] == "accepted"));
+}
+
+#[test]
 fn purchases_with_different_purposes_survive_reanalysis() {
     let (_dir, store, meeting, segment) = setup();
     let (first, _, _) = store.groq_prepare(meeting, MODELS[0], true).unwrap();
@@ -726,6 +828,196 @@ fn local_analysis_resolves_an_explicit_task_without_an_api_key() {
     let findings = &store.groq_analysis(meeting).unwrap()["saved"]["result"]["findings"];
     assert_eq!(findings[0]["source"]["segment_ids"], json!([segment]));
     assert_eq!(store.ai_budget(None).unwrap()["today_tokens"], 0);
+}
+
+#[test]
+fn assistant_chat_commands_stage_local_changes_until_approval() {
+    let (_dir, store, _, _) = setup();
+    let project = store.workspace_action(&json!({"op":"save_project","data":{
+        "title":"Тенты","status":"active","stages":vtracker::workspace::default_stages()
+    }})).unwrap();
+    let task = store.workspace_action(&json!({"op":"save_task","data":{
+        "title":"Закупить ткань","project_id":project["id"],"stage_id":"todo","priority":"normal","blocked":false
+    }})).unwrap();
+    let id = task["id"].as_i64().unwrap();
+    let stage = |action: &str| store.workspace_action(&json!({
+        "op":"assistant_command","text":format!("По задаче #{id}: {action}")
+    }));
+    let contextual = json!({"op":"assistant_command","task_id":id,"text":"Перенеси срок на 2030-11-24 в 16:30"});
+    let first = store.workspace_action(&contextual).unwrap();
+    assert_eq!(store.workspace_action(&contextual).unwrap(), first);
+    let change = store.workspace(false, None).unwrap();
+    assert_eq!(change["proposals"].as_array().unwrap().len(), 1);
+    assert!(change["tasks"][0]["due_date"].is_null());
+    let proposal = &change["proposals"][0];
+    let result = store.workspace_action(&json!({"op":"review","id":proposal["id"],
+        "task_revision":task["revision"],"data":proposal["proposed"]
+    })).unwrap();
+    assert_eq!(result["task"]["due_time"], "16:30");
+    assert_eq!(result["task"]["sources"][0]["type"], "assistant_command");
+    assert_eq!(result["task"]["sources"][0]["quote"], contextual["text"]);
+    assert!(stage("перенести срок на 2030-11-24 в 16:30").is_err());
+    let davyd = store.add_person("Давид").unwrap();
+    let update = json!({"op":"assistant_command","task_id":id,
+        "text":"Пусть Давид займётся тканью ко второму декабря",
+        "changes":{"due_date":"2030-12-02","assignee":"Давид"}});
+    let invalid = json!({"changes":{"due_date":"2030-02-30","assignee":"Давид"}});
+    let mut malformed = update.clone();
+    malformed["changes"] = invalid["changes"].clone();
+    assert!(store.workspace_action(&malformed).is_err());
+    let change = store.workspace_action(&update).unwrap();
+    let snapshot = store.workspace(false, None).unwrap();
+    assert_eq!(snapshot["tasks"][0]["due_date"], "2030-11-24");
+    let staged = snapshot["proposals"].as_array().unwrap().iter()
+        .find(|proposal| proposal["id"] == change["id"]).unwrap();
+    assert_eq!(staged["source"]["quote"], update["text"]);
+    assert_eq!(staged["proposed"]["due_date"], "2030-12-02");
+    assert_eq!(staged["proposed"]["assignee_id"], davyd);
+    let follow_up = stage("создать связанную задачу: Проверить склад").unwrap();
+    let result = store.workspace_action(&json!({"op":"review","id":follow_up["id"],"data":{
+        "title":"Проверить склад","project_id":project["id"],
+        "stage_id":"todo","priority":"normal","blocked":false
+    }})).unwrap();
+    let snapshot = store.workspace(false, None).unwrap();
+    let linked = snapshot["tasks"].as_array().unwrap().iter()
+        .find(|task| task["id"] == result["task"]["id"]).unwrap();
+    assert_eq!(linked["related_task_ids"], json!([id]));
+    assert_eq!(store.ai_budget(None).unwrap()["today_tokens"], 0);
+}
+
+#[test]
+fn assistant_edits_pending_task_deadline_and_assignee_in_the_same_draft() {
+    let (_dir, store, meeting, _) = setup();
+    let person = store.add_person("Давид").unwrap();
+    let project = store.workspace_action(&json!({"op":"save_project","data":{
+        "title":"Будущие проекты","status":"active","stages":vtracker::workspace::default_stages()
+    }})).unwrap();
+    let proposal = store.workspace_action(&json!({"op":"propose","data":{
+        "kind":"create_task","title":"Спросить Охана про сетку","project_id":project["id"],
+        "source":{"meeting_id":meeting,"start_ms":0,"quote":"Спросить Охана про сетку"}
+    }})).unwrap();
+    let command = json!({"op":"assistant_command","proposal_id":proposal["id"],
+        "text":"Поставь срок на 1 декабря 2099 Давиду"});
+    assert_eq!(store.workspace_action(&command).unwrap(), proposal);
+    assert_eq!(store.workspace_action(&command).unwrap(), proposal);
+    let correction = json!({"op":"assistant_command","proposal_id":proposal["id"],
+        "text":"Только на второе декабря", "changes":{"due_date":"2099-12-02"}});
+    assert_eq!(store.workspace_action(&correction).unwrap(), proposal);
+    let snapshot = store.workspace(false, None).unwrap();
+    assert!(snapshot["tasks"].as_array().unwrap().is_empty());
+    assert_eq!(snapshot["proposals"].as_array().unwrap().len(), 1);
+    let pending = &snapshot["proposals"][0];
+    assert_eq!(pending["status"], "pending");
+    assert_eq!(pending["source"]["quote"], "Спросить Охана про сетку");
+    let draft = &pending["review_draft"];
+    assert_eq!(draft["data"]["due_date"], "2099-12-02");
+    assert_eq!(draft["data"]["assignee_id"], person);
+    let approved = store.workspace_action(draft).unwrap();
+    assert_eq!(approved["task"]["due_date"], "2099-12-02");
+    assert_eq!(approved["task"]["assignee_id"], person);
+    assert!(store.workspace_action(&command).is_err());
+    assert_eq!(store.ai_budget(None).unwrap()["today_tokens"], 0);
+}
+
+#[test]
+fn local_commands_carry_task_changes_across_two_meetings_without_spending_tokens() {
+    let (dir, store, first_meeting, opening) = setup();
+    let database = dir.path().join("db");
+    let conn = Connection::open(&database).unwrap();
+    let person = store.add_person("Давид").unwrap();
+    let project = |name: &str| store.workspace_action(&json!({"op":"save_project","data":{
+        "title":name,"status":"active","stages":vtracker::workspace::default_stages()
+    }})).unwrap()["id"].as_i64().unwrap();
+    let tents = project("Тенты");
+    let stage = project("Сцена");
+    let task = |project| store.workspace_action(&json!({"op":"save_task","data":{
+        "title":"Закупить ткань","project_id":project,"stage_id":"todo","priority":"normal",
+        "blocked":false,"due_date":"2030-11-30"
+    }})).unwrap();
+    let purchase = task(tents);
+    let unrelated = task(stage);
+    let assign_project = |meeting| {
+        store.workspace_action(&json!({"op":"save_meeting","id":meeting,"data":{
+            "title":"Планирование поставки","project_id":tents,"participants":[person]
+        }})).unwrap();
+    };
+    let append_segment = |opening, start: i64, line: String| {
+        conn.execute(
+            "INSERT INTO segments(model_run_id,start_ms,end_ms,text,sources_json)
+             SELECT model_run_id,?2,?2+2000,?3,'[]' FROM segments WHERE id=?1",
+            params![opening,start,line],
+        ).unwrap();
+        conn.last_insert_rowid()
+    };
+
+    assign_project(first_meeting);
+    let id = purchase["id"].as_i64().unwrap();
+    conn.execute("UPDATE segments SET text=?2 WHERE id=?1",
+        params![opening, format!("По задаче #{id}: перенести срок на 24 ноября 2030 в 16:30.")]).unwrap();
+    let assignment = append_segment(opening, 4000, format!("По задаче #{id}: назначить Давид."));
+    append_segment(opening, 8000, format!("По задаче #{}: заблокировать: вне проекта", unrelated["id"]));
+    append_segment(opening, 12000, format!("По задаче #{id}: срок до 2030-11-25 в 25:00"));
+    let mut worker = GroqWorker::new(&database, &store).unwrap();
+    let request = json!({"meeting_id":first_meeting,"local":true});
+    assert_eq!(worker.start(&store, &request).unwrap()["local"], true);
+    assert_eq!(worker.start(&store, &request).unwrap()["cached"], true);
+    let snapshot = store.workspace(false, None).unwrap();
+    let proposals = snapshot["proposals"].as_array().unwrap();
+    assert_eq!(proposals.len(), 1);
+    let combined = &proposals[0];
+    assert_eq!(combined["kind"], "change_task");
+    assert_eq!(combined["task_id"], id);
+    assert_eq!(combined["source"]["segment_ids"], json!([opening, assignment]));
+    let approved = store.workspace_action(&json!({"op":"review","id":combined["id"],
+        "task_revision":purchase["revision"],"data":combined["proposed"]
+    })).unwrap();
+    assert_eq!(approved["task"]["due_date"], "2030-11-24");
+    assert_eq!(approved["task"]["due_time"], "16:30");
+    assert_eq!(approved["task"]["assignee_id"], person);
+    assert!(approved["decision_id"].is_number());
+
+    let (second, opening) = meeting_with_transcript(&store, &conn, "Проверка поставки",
+        &format!("По задаче #{id}: заблокировать: Поставщик не успевает"));
+    assign_project(second);
+    let follow_up = append_segment(opening, 4000, format!(
+        "По задаче #{id}: создать связанную задачу: Проверить остатки ткани на складе"
+    ));
+    let context = store.groq_snapshot(second).unwrap();
+    let snapshot = store.workspace(false, None).unwrap();
+    assert_eq!(snapshot["decisions"][0]["id"], approved["decision_id"]);
+    assert_eq!(context["project_decisions"][0]["text"], snapshot["decisions"][0]["text"]);
+    assert_eq!(context["project_decisions"][0]["task_id"], id);
+    assert_eq!(context["project_tasks"][0]["due_time"], "16:30");
+    let request = json!({"meeting_id":second,"local":true});
+    assert_eq!(worker.start(&store, &request).unwrap()["cached"], false);
+    assert_eq!(worker.start(&store, &request).unwrap()["cached"], true);
+    let snapshot = store.workspace(false, None).unwrap();
+    let proposals = snapshot["proposals"].as_array().unwrap();
+    assert_eq!(proposals.iter().filter(|item| item["status"] == "pending").count(), 2);
+    let blocker = proposals.iter().find(|item| item["kind"] == "change_blocked").unwrap();
+    let linked = proposals.iter().find(|item| item["kind"] == "create_task").unwrap();
+    assert_eq!(blocker["task_id"], id);
+    assert_eq!(linked["related_task_id"], id);
+    assert_eq!(linked["source"]["segment_ids"], json!([follow_up]));
+    let applied = store.workspace_action(&json!({"op":"review_batch","items":[
+        {"id":blocker["id"],"task_revision":approved["task"]["revision"],"data":blocker["proposed"]},
+        {"id":linked["id"],"data":{"title":linked["title"],"project_id":tents,
+            "stage_id":"todo","priority":"normal","blocked":false}}
+    ]})).unwrap();
+    let warehouse = &applied["applied"][1]["task"];
+    worker.start(&store, &request).unwrap();
+    let final_state = store.workspace(false, None).unwrap();
+    assert!(final_state["proposals"].as_array().unwrap().iter().all(|item| item["status"] == "accepted"));
+    let tasks = final_state["tasks"].as_array().unwrap();
+    assert_eq!(tasks.len(), 3);
+    let original = tasks.iter().find(|task| task["id"] == id).unwrap();
+    assert_eq!(original["related_task_ids"], json!([warehouse["id"]]));
+    assert_eq!(original["blocked_reason"], "Поставщик не успевает");
+    let other = tasks.iter().find(|task| task["id"] == unrelated["id"]).unwrap();
+    assert_eq!(other["due_date"], "2030-11-30");
+    assert_eq!(other["blocked"], false);
+    assert_eq!(store.ai_budget(None).unwrap()["today_tokens"], 0);
+    assert_eq!(conn.query_row("SELECT count(*) FROM ai_usage", [], |row| row.get::<_,i64>(0)).unwrap(), 0);
 }
 
 #[test]

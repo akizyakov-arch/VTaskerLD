@@ -41,6 +41,10 @@ impl SpeechWorker {
     pub(crate) fn speaker_detection_enabled(&self) -> bool {
         self.settings["speaker_detection"] != false
     }
+
+    pub(crate) fn live_display_enabled(&self) -> bool {
+        self.settings["live_display"] == true
+    }
     pub fn status(&self) -> Value {
         {
             let config = self.config();

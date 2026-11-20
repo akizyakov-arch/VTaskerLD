@@ -160,6 +160,7 @@ struct Recording: Decodable {
 struct CaptureStatus: Decodable, Equatable {
     let active: Session?
     let hint: SpeakerHint?
+    var liveDisplay: Bool?
 
     struct SpeakerHint: Decodable, Equatable {
         let sessionId: String?
