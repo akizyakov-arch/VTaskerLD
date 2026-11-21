@@ -221,12 +221,50 @@ struct ApprovalsView: View {
         }
     }
 
+    private enum ListEntry: Identifiable {
+        enum ID: Hashable {
+            case task(Int), decision(Int), proposal(Int)
+        }
+
+        case task(TaskItem)
+        case decision(Decision)
+        case proposal(Row)
+
+        var id: ID {
+            switch self {
+            case .task(let task): return .task(task.id)
+            case .decision(let decision): return .decision(decision.id)
+            case .proposal(let row): return .proposal(row.id)
+            }
+        }
+
+        func topic(using glossary: CompanyGlossary, topics: MeetingTopics) -> String {
+            switch self {
+            case .task(let task):
+                return topics.taskTitle(task, sources: task.sources ?? [], glossary: glossary)
+            case .decision(let decision):
+                return topics.title(topic: decision.source?.topic, text: decision.text,
+                                           context: [decision.reason, decision.source?.quote].compactMap { $0 }.joined(separator: " "),
+                                           glossary: glossary)
+            case .proposal(let row):
+                if let task = row.target {
+                    let topic = topics.taskTitle(task, sources: task.sources ?? [], glossary: glossary)
+                    if topic != MeetingTopics.ungrouped { return topic }
+                }
+                return MeetingTopicEntry<TaskItem>.proposalTopic(row.proposal, topics: topics, glossary: glossary)
+            }
+        }
+    }
+
+    @Environment(\.companyGlossary) private var glossary
+    @Environment(\.meetingTopics) private var meetingTopics
     @Environment(\.colorScheme) private var scheme
     @ObservedObject var model: WorkspaceModel
     let workspace: Workspace
     @Binding var inspectedItem: InspectedItem?
     @Binding var filters: Filters
     let itemList: ItemList
+    let groupByTopic: Bool
     @State private var markedTasks: Set<Int> = []
     @State private var markedProposals: Set<Int> = []
     @State private var confirmingBatchRejection = false
@@ -338,11 +376,13 @@ struct ApprovalsView: View {
                         .panelCard()
                 }
                 if let batchResult { Text(batchResult).foregroundStyle(.secondary) }
-                if itemList.status != .pending && itemList.includesDecision(false) {
+                if groupByTopic {
+                    groupedRows(tasks: acceptedTasks, decisions: shownDecisions, proposals: shown)
+                } else {
                     approvedRows(acceptedTasks)
+                    ForEach(shownDecisions, content: decisionRow)
+                    ForEach(shown, content: proposalCard)
                 }
-                ForEach(shownDecisions, content: decisionRow)
-                ForEach(shown, content: proposalCard)
                 if itemList.project == nil && itemList.status != .approved { archivedDrafts }
             }
             .padding(24)
@@ -366,6 +406,17 @@ struct ApprovalsView: View {
                     .padding(.vertical, 8)
                     .frame(maxWidth: .infinity)
                     .background(.regularMaterial)
+            }
+        }
+    }
+
+    private func groupedRows(tasks: [TaskItem], decisions: [Decision], proposals: [Row]) -> some View {
+        let entries = tasks.map(ListEntry.task) + decisions.map(ListEntry.decision) + proposals.map(ListEntry.proposal)
+        return MeetingTopicList(rows: entries, topic: { $0.topic(using: glossary, topics: meetingTopics) }, collapsible: true) { entry in
+            switch entry {
+            case .task(let task): acceptedTaskRow(task, open: itemList.openTask)
+            case .decision(let decision): decisionRow(decision)
+            case .proposal(let row): proposalCard(row)
             }
         }
     }
@@ -498,7 +549,7 @@ struct ApprovalsView: View {
                     .background(.quaternary, in: Capsule())
                     .foregroundStyle(.secondary)
                     .accessibilityLabel("Предложений: \(count) из \(pending.count)")
-                Spacer()
+                Spacer(minLength: 8)
                 if filters.isActive {
                     Button("Сбросить фильтры") { filters.reset() }
                     .buttonStyle(.link)

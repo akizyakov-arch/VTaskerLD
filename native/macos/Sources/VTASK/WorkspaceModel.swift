@@ -192,6 +192,11 @@ final class WorkspaceModel: ObservableObject {
     }
 
     @discardableResult
+    func setIndustryTemplate(_ template: IndustryTemplate) async -> Bool {
+        await command(["op": "settings", "data": ["industry_template": template.rawValue]])
+    }
+
+    @discardableResult
     func command(_ payload: [String: Any], path: String = "api/workspace/action") async -> Bool {
         await commandResponse(payload, path: path) != nil
     }

@@ -1,6 +1,7 @@
 pub mod audio;
 pub mod capture;
 pub mod diarization;
+mod glossary;
 pub mod groq;
 pub mod live;
 pub mod live_voice;

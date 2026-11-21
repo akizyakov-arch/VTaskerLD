@@ -1,0 +1,46 @@
+{
+  "common": [
+    {"term": "Техническое задание", "language": "ru", "section": "Согласование", "variants": [{"text": "ТЗ", "language": "ru"}, {"text": "техзадание", "language": "ru"}]},
+    {"term": "Утверждение заказчиком", "language": "ru", "section": "Согласование", "variants": [{"text": "дать добро", "language": "ru"}, {"text": "дать отмашку", "language": "ru"}]},
+    {"term": "Смета", "language": "ru", "section": "Финансы", "variants": [{"text": "калькуляция затрат", "language": "ru"}, {"text": "посчитать смету", "language": "ru"}]},
+    {"term": "Счёт на оплату", "language": "ru", "section": "Финансы", "variants": [{"text": "выставить счёт", "language": "ru"}, {"text": "инвойс", "language": "ru"}]},
+    {"term": "Дозаказ материалов", "language": "ru", "section": "Закупки", "variants": [{"text": "докупить материалы", "language": "ru"}, {"text": "дозаказать материалы", "language": "ru"}]}
+  ],
+  "universal": [
+    {"term": "Стартовая встреча", "language": "ru", "section": "Планирование", "variants": [{"text": "кик-офф", "language": "ru"}, {"text": "кикофф", "language": "ru"}, {"text": "установочная встреча", "language": "ru"}]},
+    {"term": "Ключевой этап", "language": "ru", "section": "Планирование", "variants": [{"text": "веха", "language": "ru"}, {"text": "контрольная точка", "language": "ru"}, {"text": "майлстоун", "language": "ru"}]},
+    {"term": "План действий", "language": "ru", "section": "Планирование", "variants": [{"text": "план работ", "language": "ru"}, {"text": "расписать шаги", "language": "ru"}]},
+    {"term": "Планирование рисков", "language": "ru", "section": "Планирование", "variants": [{"text": "разобрать риски", "language": "ru"}, {"text": "сверить риски", "language": "ru"}]},
+    {"term": "Согласование объёма работ", "language": "ru", "section": "Согласование", "variants": [{"text": "утвердить объём", "language": "ru"}, {"text": "уточнить объёмы", "language": "ru"}]}
+  ],
+  "decor": [
+    {"term": "Подбор референсов", "language": "ru", "section": "Концепция и замеры", "variants": [{"text": "собрать рефы", "language": "ru"}, {"text": "накидать рефы", "language": "ru"}]},
+    {"term": "Коллаж для согласования концепции", "language": "ru", "section": "Концепция и замеры", "variants": [{"text": "мудборд", "language": "ru"}, {"text": "доска настроения", "language": "ru"}]},
+    {"term": "Контрольный замер площадки", "language": "ru", "section": "Концепция и замеры", "variants": [{"text": "перемерить площадку", "language": "ru"}, {"text": "снять контрольные размеры", "language": "ru"}]},
+    {"term": "Передача в пошив", "language": "ru", "section": "Изготовление", "variants": [{"text": "отдать в отшив", "language": "ru"}, {"text": "отдать в пошив", "language": "ru"}, {"text": "запустить отшив", "language": "ru"}]},
+    {"term": "Пробный образец изделия", "language": "ru", "section": "Изготовление", "variants": [{"text": "сделать пробник", "language": "ru"}, {"text": "отшить образец", "language": "ru"}]},
+    {"term": "Доставка на площадку", "language": "ru", "section": "Логистика", "variants": [{"text": "закинуть на площадку", "language": "ru"}, {"text": "довезти декор", "language": "ru"}]},
+    {"term": "Монтаж декораций", "language": "ru", "section": "Монтаж", "variants": [{"text": "собрать декор на площадке", "language": "ru"}, {"text": "развесить декор", "language": "ru"}]},
+    {"term": "Демонтаж и возврат реквизита", "language": "ru", "section": "Демонтаж и возврат", "variants": [{"text": "свернуть площадку", "language": "ru"}, {"text": "сдать реквизит", "language": "ru"}, {"text": "сдать аренду", "language": "ru"}]}
+  ],
+  "it": [
+    {"term": "Изменение кода", "language": "ru", "section": "Разработка", "variants": [{"text": "сделать фичу", "language": "ru"}, {"text": "реализовать фичу", "language": "ru"}]},
+    {"term": "Рефакторинг кода", "language": "ru", "section": "Разработка", "variants": [{"text": "причесать код", "language": "ru"}, {"text": "отрефакторить", "language": "ru"}]},
+    {"term": "Проверка кода", "language": "ru", "section": "Ревью", "variants": [{"text": "код-ревью", "language": "ru"}, {"text": "посмотреть запрос на слияние", "language": "ru"}, {"text": "ревьюить код", "language": "ru"}]},
+    {"term": "Регрессионное тестирование", "language": "ru", "section": "Тестирование", "variants": [{"text": "прогнать регресс", "language": "ru"}, {"text": "регресс", "language": "ru"}, {"text": "регрессу", "language": "ru"}, {"text": "регрессионка", "language": "ru"}]},
+    {"term": "Проверка на тестовом стенде", "language": "ru", "section": "Тестирование", "variants": [{"text": "прогнать на стенде", "language": "ru"}, {"text": "проверить на стейдже", "language": "ru"}]},
+    {"term": "Выкладка в рабочую среду", "language": "ru", "section": "Релизы", "variants": [{"text": "выкатить на прод", "language": "ru"}, {"text": "деплой", "language": "ru"}, {"text": "деплоя", "language": "ru"}, {"text": "раскатить релиз", "language": "ru"}]},
+    {"term": "Откат выпуска", "language": "ru", "section": "Релизы", "variants": [{"text": "откатить релиз", "language": "ru"}, {"text": "откатить прод", "language": "ru"}]},
+    {"term": "Разбор инцидента", "language": "ru", "section": "Инциденты", "variants": [{"text": "постмортем", "language": "ru"}, {"text": "разобрать аварию", "language": "ru"}]}
+  ],
+  "construction": [
+    {"term": "Контрольный замер объекта", "language": "ru", "section": "Проектирование", "variants": [{"text": "снять обмеры", "language": "ru"}, {"text": "промерить объект", "language": "ru"}]},
+    {"term": "Выпуск рабочей документации", "language": "ru", "section": "Проектирование", "variants": [{"text": "выдать рабочку", "language": "ru"}, {"text": "выпустить рабочку", "language": "ru"}]},
+    {"term": "Подтверждение объёма выполненных работ", "language": "ru", "section": "Работы на объекте", "variants": [{"text": "закрыть объёмы", "language": "ru"}, {"text": "свести объёмы", "language": "ru"}]},
+    {"term": "Установка опалубки", "language": "ru", "section": "Работы на объекте", "variants": [{"text": "поставить опалубку", "language": "ru"}, {"text": "собрать опалубку", "language": "ru"}]},
+    {"term": "Доставка на объект", "language": "ru", "section": "Логистика", "variants": [{"text": "подвезти на объект", "language": "ru"}, {"text": "дозакинуть на объект", "language": "ru"}]},
+    {"term": "Монтаж инженерного оборудования", "language": "ru", "section": "Монтаж", "variants": [{"text": "смонтировать инженерку", "language": "ru"}, {"text": "поставить оборудование", "language": "ru"}]},
+    {"term": "Освидетельствование скрытых работ", "language": "ru", "section": "Приёмка", "variants": [{"text": "принять скрытые работы", "language": "ru"}, {"text": "акт скрытых работ", "language": "ru"}, {"text": "АОСР", "language": "ru"}]},
+    {"term": "Устранение замечаний", "language": "ru", "section": "Приёмка", "variants": [{"text": "закрыть замечания", "language": "ru"}, {"text": "отработать замечания", "language": "ru"}]}
+  ]
+}

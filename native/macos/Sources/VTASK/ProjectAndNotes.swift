@@ -5,6 +5,49 @@ private let projectStatusOptions: [(id: String, title: String)] = [
     ("completed", "Завершён"), ("cancelled", "Отменён")
 ]
 
+private extension Project {
+    var overviewDescription: String? {
+        guard let text = description?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty else { return nil }
+        return text
+    }
+}
+
+private struct ProjectStatusBadge: View {
+    var archived: Bool
+    var status: String
+    let palette: PanelPalette
+
+    var body: some View {
+        let title = projectStatusOptions.first { $0.id == status }?.title ?? status
+        return Label {
+            Text(archived ? "В архиве" : title)
+        } icon: {
+            Image(systemName: archived ? "archivebox" : "circle.fill")
+                .font(archived ? .caption : .system(size: 6))
+                .accessibilityHidden(true)
+        }
+        .font(.caption.weight(.semibold))
+        .foregroundStyle(archived ? palette.muted : palette.selectedInk)
+        .padding(.horizontal, 9)
+        .padding(.vertical, 5)
+        .background(archived ? palette.sidebar : palette.selected, in: Capsule())
+    }
+}
+
+private struct ProjectFolderIcon: View {
+    let palette: PanelPalette
+    let size: CGFloat
+
+    var body: some View {
+        Image(systemName: "folder.fill")
+            .font(.system(size: size * 0.43, weight: .medium))
+            .foregroundStyle(palette.selectedInk)
+            .frame(width: size, height: size)
+            .background(palette.selected, in: RoundedRectangle(cornerRadius: size * 0.26))
+            .accessibilityHidden(true)
+    }
+}
+
 struct ProjectEditor: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(\.colorScheme) private var scheme
@@ -64,11 +107,20 @@ struct ProjectEditor: View {
     var body: some View {
         let palette = PanelPalette(dark: scheme == .dark)
         VStack(alignment: .leading, spacing: 0) {
-            Label(project.title, systemImage: "folder")
-                .font(.title3.bold())
-                .accessibilityAddTraits(.isHeader)
-                .padding(.horizontal, 20)
-                .padding(.vertical, 16)
+            HStack(spacing: 12) {
+                ProjectFolderIcon(palette: palette, size: 44)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Карточка проекта").font(.caption).foregroundStyle(palette.muted)
+                    Text(title.isEmpty ? project.title : title)
+                        .font(.title2.weight(.semibold)).lineLimit(2)
+                        .accessibilityAddTraits(.isHeader)
+                }
+                Spacer(minLength: 8)
+                ProjectStatusBadge(archived: project.archived == true, status: status, palette: palette)
+            }
+            .padding(.horizontal, 20)
+            .padding(.vertical, 16)
+            .background(palette.surface)
             Divider()
             fields
             Divider()
@@ -87,7 +139,9 @@ struct ProjectEditor: View {
         Form {
             Section("Основное") {
                 TextField("Название", text: $title)
-                TextField("Описание", text: $description, axis: .vertical)
+                TextField("Краткое описание", text: $description,
+                          prompt: Text("О чём проект в одном или двух предложениях"), axis: .vertical)
+                    .lineLimit(2...5)
                 TextField("Цель", text: $goal, axis: .vertical)
                 TextField("Материалы", text: $materials, axis: .vertical)
                 Picker("Статус", selection: $status) {
@@ -278,6 +332,9 @@ struct ProjectOverview: View {
     let workspace: Workspace
     let openTask: (Int) -> Void
     let openTasks: () -> Void
+    let openBoard: () -> Void
+    let editProject: () -> Void
+    let editingDisabled: Bool
     @State private var selectedMetric: Metric?
 
     private enum Metric: String, CaseIterable {
@@ -315,7 +372,8 @@ struct ProjectOverview: View {
         let active = projectTasks.filter { $0.stageKind == "active" }
         let critical = projectTasks.filter { $0.priority == "critical" && $0.stageKind != "cancelled" }
         ScrollView {
-            VStack(alignment: .leading, spacing: 12) {
+            VStack(alignment: .leading, spacing: 16) {
+                summaryCard
                 if project.archived != true {
                     criticalTasksCard(critical)
                     if tracksSchedule {
@@ -330,25 +388,97 @@ struct ProjectOverview: View {
                         }
                     }
                 }
-                VStack(alignment: .leading, spacing: 10) {
-                    let owner = workspace.people.first { $0.id == project.ownerId }
-                    LabeledContent("Владелец", value: owner?.name ?? "Не назначен")
-                    let team = workspace.people.filter { (project.members ?? []).contains($0.id) }
-                    LabeledContent("Команда", value: team.isEmpty ? "Без участников" : team.map(\.name).joined(separator: ", "))
-                    LabeledContent("Начало и срок", value: [project.startDate, project.endDate]
-                        .map { $0.map(ProjectDateField.display) ?? "—" }.joined(separator: " / "))
-                    detail("Описание", project.description)
-                    detail("Цель", project.goal)
-                    detail("Материалы", project.materials)
-                    detail("Блокировка проекта", project.blocker)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .panelCard()
+                projectDetails
             }
             .padding(24)
             .frame(maxWidth: 860, alignment: .leading)
             .frame(maxWidth: .infinity)
         }
+    }
+
+    private var summaryCard: some View {
+        let owner = workspace.people.first { $0.id == project.ownerId }
+        let shape = RoundedRectangle(cornerRadius: 16)
+        return VStack(alignment: .leading, spacing: 16) {
+            HStack(spacing: 12) {
+                ProjectFolderIcon(palette: palette, size: 44)
+                Text("Краткое описание").font(.title3.weight(.semibold))
+                    .accessibilityAddTraits(.isHeader)
+                Spacer(minLength: 8)
+                ProjectStatusBadge(archived: project.archived == true, status: project.status, palette: palette)
+            }
+            if let description = project.overviewDescription {
+                Text(description)
+                    .font(.body)
+                    .lineSpacing(4)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
+            } else {
+                Button("Добавить описание", action: editProject)
+                    .buttonStyle(.link)
+                    .disabled(editingDisabled)
+            }
+            Divider()
+            ViewThatFits(in: .horizontal) {
+                HStack(alignment: .top, spacing: 24) {
+                    summaryFacts(owner?.speakerPickerName)
+                }
+                .fixedSize(horizontal: true, vertical: false)
+                VStack(alignment: .leading, spacing: 10) {
+                    summaryFacts(owner?.speakerPickerName)
+                }
+            }
+            if project.archived != true {
+                Button(action: openBoard) {
+                    Label("Доска задач проекта", systemImage: "rectangle.split.3x1")
+                }
+                .buttonStyle(.bordered)
+            }
+        }
+        .padding(20)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .foregroundStyle(palette.text)
+        .background {
+            ZStack {
+                shape.fill(palette.surface)
+                shape.fill(LinearGradient(colors: [palette.selected.opacity(0.42), .clear],
+                                          startPoint: .topLeading, endPoint: .bottomTrailing))
+            }
+        }
+        .overlay { shape.strokeBorder(palette.border).allowsHitTesting(false) }
+    }
+
+    @ViewBuilder
+    private func summaryFacts(_ owner: String?) -> some View {
+        summaryFact("Владелец", value: owner ?? "Не назначен", icon: "person.crop.circle")
+        summaryFact("Начало", value: project.startDate.map(ProjectDateField.display) ?? "Не указано",
+                    icon: "calendar")
+        summaryFact("Срок завершения", value: project.endDate.map(ProjectDateField.display) ?? "Без срока",
+                    icon: "flag")
+    }
+
+    private func summaryFact(_ title: String, value: String, icon: String) -> some View {
+        Label {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(title).font(.caption).foregroundStyle(palette.muted)
+                Text(value).font(.callout.weight(.semibold))
+            }
+        } icon: {
+            Image(systemName: icon).foregroundStyle(palette.accent)
+        }
+        .accessibilityElement(children: .combine)
+    }
+
+    private var projectDetails: some View {
+        let team = workspace.people.filter { (project.members ?? []).contains($0.id) }
+        return VStack(alignment: .leading, spacing: 12) {
+            Text("Детали проекта").font(.headline).accessibilityAddTraits(.isHeader)
+            detail("Команда", team.isEmpty ? "Без участников" : team.map(\.speakerPickerName).joined(separator: ", "))
+            detail("Цель", project.goal)
+            detail("Материалы", project.materials)
+            detail("Блокировка проекта", project.blocker)
+        }
+        .panelCard()
     }
 
     private func criticalTasksCard(_ tasks: [TaskItem]) -> some View {
@@ -693,15 +823,6 @@ struct ProjectDirectory: View {
         .accessibilityValue(filters.isActive ? "Фильтры включены" : "Нет активных фильтров")
     }
 
-    private func statusBadge(_ project: Project) -> some View {
-        Text(projectStatusOptions.first { $0.id == project.status }?.title ?? project.status)
-            .font(.caption.weight(.medium))
-            .foregroundStyle(palette.selectedInk)
-            .padding(.horizontal, 8)
-            .padding(.vertical, 4)
-            .background(palette.selected, in: Capsule())
-    }
-
     private func projectListRow(_ project: Project) -> some View {
         let expanded = expandedProjects.contains(project.id)
         let tasks = workspace.visibleTasks.filter { $0.projectId == project.id && $0.stageKind != "cancelled" }
@@ -718,7 +839,7 @@ struct ProjectDirectory: View {
                             .accessibilityHidden(true)
                         Text(project.title).font(.headline)
                         Spacer(minLength: 8)
-                        statusBadge(project)
+                        ProjectStatusBadge(archived: project.archived == true, status: project.status, palette: palette)
                     }
                     .contentShape(Rectangle())
                 }
@@ -727,6 +848,9 @@ struct ProjectDirectory: View {
                 projectActions(project, includesEdit: true)
             }
             if expanded {
+                if let description = project.overviewDescription {
+                    Text(description).font(.callout).foregroundStyle(palette.muted).lineLimit(3)
+                }
                 Button("Открыть проект") { openProject(project.id) }
                     .buttonStyle(.link)
                 if project.archived != true {
@@ -779,8 +903,10 @@ struct ProjectDirectory: View {
                     .foregroundStyle(palette.muted).accessibilityHidden(true)
             }
             Text(project.title).font(.headline).lineLimit(2)
-            statusBadge(project)
-            if let goal = project.goal, !goal.isEmpty { Text(goal).font(.callout).lineLimit(2) }
+            ProjectStatusBadge(archived: project.archived == true, status: project.status, palette: palette)
+            if let summary = project.overviewDescription ?? project.goal, !summary.isEmpty {
+                Text(summary).font(.callout).foregroundStyle(palette.muted).lineLimit(2)
+            }
             Label(person?.speakerPickerName ?? "Владелец не назначен", systemImage: "person")
                 .font(.caption).foregroundStyle(palette.muted).lineLimit(1)
             if let dates = project.startDate.map(ProjectDateField.display) ?? project.endDate.map(ProjectDateField.display) {

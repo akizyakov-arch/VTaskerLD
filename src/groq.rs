@@ -614,11 +614,16 @@ impl Store {
                 task["project_id"].as_i64().map_or(project_ids.is_empty(), |id| project_ids.contains(&id))
                     && !task["title"].as_str().is_some_and(administrative_change_title)
             }).collect();
+        let industry = crate::workspace::industry_template(&self.0)?;
+        let entries = crate::glossary::active_terms(&self.0, &industry)?;
+        let glossary = crate::glossary::Glossary::new(&entries);
+        let company_terms = glossary.relevant(segments.iter().filter_map(|segment| segment["text"].as_str()));
         let mut project_tasks = Vec::new();
         let mut project_decisions = Vec::new();
         if !project_ids.is_empty() {
             let transcript_terms: std::collections::HashSet<_> = segments.iter()
-                .filter_map(|s| s["text"].as_str()).flat_map(search_terms).collect();
+                .filter_map(|s| s["text"].as_str())
+                .flat_map(|text| search_terms(&glossary.expand(text)).collect::<Vec<_>>()).collect();
             let explicit_ids: std::collections::HashSet<i64> = segments.iter().filter_map(|s| s["text"].as_str())
                 .flat_map(|text| text.split('#').skip(1))
                 .filter_map(|tail| tail[..tail.find(|ch: char| !ch.is_ascii_digit()).unwrap_or(tail.len())]
@@ -631,9 +636,11 @@ impl Store {
                     .filter(|task| task["stage_kind"] == "active"
                         || task["id"].as_i64().is_some_and(|id| explicit_ids.contains(&id))).collect();
                 candidates.sort_by_cached_key(|task| {
-                    let title_hits = search_terms(task["title"].as_str().unwrap_or(""))
+                    let title = glossary.expand(task["title"].as_str().unwrap_or(""));
+                    let description = glossary.expand(task["description"].as_str().unwrap_or(""));
+                    let title_hits = search_terms(&title)
                         .collect::<std::collections::HashSet<_>>().intersection(&transcript_terms).count();
-                    let details_hits = search_terms(task["description"].as_str().unwrap_or(""))
+                    let details_hits = search_terms(&description)
                         .collect::<std::collections::HashSet<_>>().intersection(&transcript_terms).count();
                     let mentioned = task["id"].as_i64().is_some_and(|id| explicit_ids.contains(&id));
                     let administrative = task["id"].as_i64().is_some_and(|id| prior_changes.contains(&id));
@@ -658,10 +665,12 @@ impl Store {
             }
         }
         let timezone = self.workspace_timezone()?;
-        let value = json!({"meeting_id":mid,"title":title,"created_at":date,"timezone":timezone,"project_id":project,
+        let mut value = json!({"meeting_id":mid,"title":title,"created_at":date,"timezone":timezone,"project_id":project,
             "analysis_projects":analysis_projects,"model_run_id":run,"source_revision":revision(&self.0,mid)?,
             "participants":people,"segments":segments,"discussed_tasks":discussed_tasks,
             "project_tasks":project_tasks,"project_decisions":project_decisions,"project_materials":project_materials});
+        if industry != "decor" { value["industry_template"] = json!(industry); }
+        if !company_terms.is_empty() { value["company_terms"] = json!(company_terms); }
         if value.to_string().len() > 350_000 {
             bail!("Транскрипт слишком большой для одного анализа");
         }
@@ -743,7 +752,7 @@ impl Store {
                 ).optional()?;
                 if let Some((id, previous_model, raw)) = previous {
                     let previous: Value = serde_json::from_str(&raw)?;
-                    let same_context = ["analysis_mode", "analysis_policy", "source_revision"].iter()
+                    let same_context = ["analysis_mode", "analysis_policy", "source_revision", "company_terms", "industry_template"].iter()
                         .all(|key| input[*key] == previous[*key])
                         && input["analysis_projects"] == previous["analysis_projects"]
                         && (mode == Some("automatic") || ["project_tasks", "project_decisions", "project_materials"].iter()
@@ -764,7 +773,14 @@ impl Store {
             tx.commit()?;
             return Ok((id, input, false));
         }
-        let existing:Option<(i64,String)>=tx.query_row("SELECT id,state FROM meeting_analyses WHERE meeting_id=?1 AND source_revision=?2 AND model=?3",params![mid,input["source_revision"].as_str(),model],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+        let source_revision = input["source_revision"].as_str().unwrap();
+        let cache_revision = if !input["company_terms"].is_null() || !input["industry_template"].is_null() {
+            let vocabulary = json!([input["industry_template"],input["company_terms"]]);
+            format!("{source_revision}:run:glossary:{:x}", Sha256::digest(vocabulary.to_string()))
+        } else {
+            source_revision.to_owned()
+        };
+        let existing:Option<(i64,String)>=tx.query_row("SELECT id,state FROM meeting_analyses WHERE meeting_id=?1 AND source_revision=?2 AND model=?3",params![mid,cache_revision,model],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
         if let Some((id, state)) = existing {
             if state == "completed" {
                 tx.commit()?;
@@ -777,7 +793,7 @@ impl Store {
             tx.commit()?;
             return Ok((id, input, false));
         }
-        tx.execute("INSERT INTO meeting_analyses(meeting_id,model_run_id,source_revision,model,state,input_json) VALUES (?1,?2,?3,?4,'running',?5)",params![mid,input["model_run_id"].as_i64(),input["source_revision"].as_str(),model,input.to_string()])?;
+        tx.execute("INSERT INTO meeting_analyses(meeting_id,model_run_id,source_revision,model,state,input_json) VALUES (?1,?2,?3,?4,'running',?5)",params![mid,input["model_run_id"].as_i64(),cache_revision,model,input.to_string()])?;
         let id = tx.last_insert_rowid();
         tx.commit()?;
         Ok((id, input, false))
@@ -1069,10 +1085,13 @@ impl Store {
                 .context("Некорректный список наблюдений")?;
             for item in observations {
                 let kind = item["kind"].as_str()
-                    .filter(|kind| ["status_update", "question", "information"].contains(kind))
+                    .filter(|kind| ["status_update", "question", "information", "unclear_term"].contains(kind))
                     .context("Неизвестный тип наблюдения")?;
                 let text = bounded(item, "text", 4000, true)?;
                 let mut source = analysis_source(&input, mid, id, item)?;
+                if kind == "unclear_term" && !crate::glossary::valid_suggestion(&text, source["quote"].as_str().unwrap_or("")) {
+                    continue;
+                }
                 let project = result_project(&input, &item["project_id"]);
                 let task = snapshot_task(&input, item["task_id"].as_i64()).filter(|task| {
                     item["project_id"].is_null() || task["project_id"] == project
@@ -1696,10 +1715,15 @@ impl GroqWorker {
         let model = self.live_model.as_deref().unwrap_or(&self.model);
         let key = if provider(model) == provider(&self.model) { self.key.as_deref() } else { self.live_key.as_deref() };
         let load_account = (model != OLLAMA_MODEL && key.is_none()).then(|| key_account(&self.base_account, model));
+        let industry = crate::workspace::industry_template(&store.0)?;
+        let glossary_entries = crate::glossary::active_terms(&store.0, &industry)?;
+        let terms = crate::glossary::Glossary::new(&glossary_entries)
+            .relevant(segments.iter().filter_map(|segment| segment["text"].as_str()));
         let payload = json!({
             "mode":"analyze","key":key,"load_account":load_account,"model":model,
             "input":{"title":title,"created_at":date,"timezone":store.workspace_timezone()?,
-                     "participants":[],"segments":segments}
+                     "participants":[],"segments":segments,"company_terms":terms,
+                     "industry_template":industry}
         });
         self.preview_cursor = count;
         self.preview["running"] = json!(true);

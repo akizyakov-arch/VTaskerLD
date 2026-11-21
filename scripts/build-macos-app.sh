@@ -23,7 +23,7 @@ resources="$app/Contents/Resources"
 mkdir -p "$app/Contents/MacOS" "$resources/scripts"
 cp "$package/Resources/VTASK.icns" "$package/Sources/VTASK/Resources/meeting-topics.json" \
     "$package/Sources/VTASK/Resources/recording-wave.png" "$resources/"
-cp -R "$package/Sources/VTASK/Resources/Manrope" "$resources/"
+cp -R "$package/Sources/VTASK/Resources/Manrope" "$package/Sources/VTASK/Resources/ValliAvatar" "$resources/"
 cp "$repo_dir/web/vtask-light.svg" "$repo_dir/web/vtask-dark.svg" "$resources/"
 # Replace executables atomically so a running core keeps its signed inode.
 install -S -m 755 "$repo_dir/target/debug/vtracker" "$app/Contents/MacOS/vtracker"

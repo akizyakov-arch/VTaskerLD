@@ -669,6 +669,10 @@ fn settings(c: &Connection) -> Result<Value> {
         }
     })
 }
+pub(crate) fn industry_template(c: &Connection) -> Result<String> {
+    Ok(settings(c)?["industry_template"].as_str().unwrap_or("decor").to_owned())
+}
+
 fn annotate(task: &mut Value, stages: &Value, now: DateTime<Utc>, tz: Tz) -> Result<()> {
     let stage = stages
         .as_array()
@@ -911,10 +915,14 @@ impl Store {
                 "created_at":row.get::<_,String>(4)?,"read_at":row.get::<_,Option<String>>(5)?
             }));
         }
+        let company_terms = if demo { Vec::new() } else { crate::glossary::list(&self.0)? };
+        let industry_terms = crate::glossary::industry_terms(prefs["industry_template"].as_str().unwrap_or("decor"));
+        let glossary_terms = crate::glossary::effective_terms(&company_terms, &industry_terms);
         Ok(json!({"schema_version":1,"mode":if demo {"demo"}else{"real"},"now":now.to_rfc3339(),
             "today":now.with_timezone(&tz).date_naive().to_string(),"settings":prefs,"default_stages":default_stages,
             "people":people,"projects":projects,"tasks":tasks,"meetings":meetings,"proposals":proposals,
-            "decisions":decisions,"notifications":notifications}))
+            "decisions":decisions,"notifications":notifications,"company_terms":company_terms,
+            "industry_terms":industry_terms,"glossary_terms":glossary_terms}))
     }
     pub fn workspace_action(&self, body: &Value) -> Result<Value> {
         if body.get("demo").is_some_and(|v| !v.is_boolean()) {
@@ -926,6 +934,15 @@ impl Store {
         }
         let tx = self.0.unchecked_transaction()?;
         let result = match text(body, "op") {
+            "save_company_term" | "delete_company_term" => {
+                if demo { bail!("Справочник доступен в рабочей базе"); }
+                if text(body, "op") == "save_company_term" {
+                    crate::glossary::save(&tx, body)?
+                } else {
+                    crate::glossary::remove(&tx, body)?
+                }
+            }
+
             "read_task_notification" => {
                 let me = id(&settings(&tx)?, if demo { "demo_me_id" } else { "me_id" });
                 let changed = tx.execute(
@@ -979,10 +996,14 @@ impl Store {
                         "auto_process",
                         "saved_views",
                         "initialized",
+                        "industry_template",
                     ]
                     .contains(&key.as_str())
                     {
                         bail!("Неизвестная настройка");
+                    }
+                    if key == "industry_template" && !matches!(value.as_str(), Some("universal" | "decor" | "it" | "construction")) {
+                        bail!("Выберите отраслевой шаблон");
                     }
                     prefs[key] = value.clone();
                 }

@@ -9,6 +9,7 @@ struct MeetingTopics {
     )
     private struct Topic: Decodable {
         let title: String
+        let industries: [IndustryTemplate]?
         let prefixes: [String]
         let words: [String]?
         let phrases: [String]
@@ -27,7 +28,7 @@ struct MeetingTopics {
         }
     }
 
-    private static let workTopics: [Topic] = {
+    private static let catalog: [Topic] = {
         let url = Bundle.main.url(forResource: "meeting-topics", withExtension: "json")
             ?? Bundle.module.url(forResource: "meeting-topics", withExtension: "json")
         guard let url, let data = try? Data(contentsOf: url) else { return [] }
@@ -36,11 +37,19 @@ struct MeetingTopics {
         return (try? decoder.decode([Topic].self, from: data)) ?? []
     }()
 
+    private let workTopics: [Topic]
+
+    init(industry: IndustryTemplate) {
+        workTopics = Self.catalog.filter { $0.industries?.contains(industry) ?? true }
+    }
+
+    var sectionTitles: [String] { workTopics.map(\.title) }
+
     private static func words(in text: String) -> [Substring] {
         text.lowercased().replacingOccurrences(of: "ё", with: "е").split { !$0.isLetter }
     }
 
-    static func searchTerms(_ terms: [String]) -> (words: [String], topics: Set<String>) {
+    func searchTerms(_ terms: [String]) -> (words: [String], topics: Set<String>) {
         var literal: [String] = []
         var categories = Set<String>()
         for term in terms {
@@ -56,10 +65,10 @@ struct MeetingTopics {
         return (literal, categories)
     }
 
-    static func matchesSearchTopics(_ categories: Set<String>, fields: [String?]) -> Bool {
+    func matchesSearchTopics(_ categories: Set<String>, fields: [String?]) -> Bool {
         guard !categories.isEmpty else { return true }
         let texts = fields.compactMap { $0 }.map { text in
-            let terms = words(in: text)
+            let terms = Self.words(in: text)
             return (terms, " " + terms.joined(separator: " ") + " ")
         }
         return workTopics.filter { categories.contains($0.title) }.allSatisfy { topic in
@@ -69,8 +78,10 @@ struct MeetingTopics {
         }
     }
 
-    static func title(topic: String?, text: String, context: String? = nil) -> String {
-        let beginning = words(in: text).joined(separator: " ") + " "
+    func title(topic: String?, text: String, context: String? = nil,
+                      glossary: CompanyGlossary = CompanyGlossary()) -> String {
+        if let section = glossary.section(for: text) { return section }
+        let beginning = Self.words(in: text).joined(separator: " ") + " "
         if let topic = workTopics.first(where: { topic in
             topic.actions?.contains { beginning.hasPrefix($0 + " ") } == true
         }) {
@@ -83,19 +94,29 @@ struct MeetingTopics {
             return inferred ?? context.flatMap(fallback) ?? "Согласование"
         }
         if !explicit.isEmpty {
-            return workTopics.first { $0.title.caseInsensitiveCompare(explicit) == .orderedSame }?.title ?? explicit
+            if let known = Self.catalog.first(where: { $0.title.caseInsensitiveCompare(explicit) == .orderedSame }) {
+                if workTopics.contains(where: { $0.title == known.title }) { return known.title }
+            } else {
+                return explicit
+            }
         }
         if let inferred { return inferred }
-        if let context, let label = fallback(context) { return label }
-        return ungrouped
+        if let context, let label = glossary.section(for: context) ?? fallback(context) { return label }
+        return Self.ungrouped
     }
 
-    private static func fallback(_ text: String) -> String? {
-        let tokens = words(in: text)
+    func taskTitle(_ task: TaskItem, sources: [TaskSource], glossary: CompanyGlossary = CompanyGlossary()) -> String {
+        title(topic: sources.compactMap(\.topic).first, text: task.title,
+              context: ([task.description] + sources.map(\.quote)).compactMap { $0 }.joined(separator: " "),
+              glossary: glossary)
+    }
+
+    private func fallback(_ text: String) -> String? {
+        let tokens = Self.words(in: text)
         let phrase = " " + tokens.joined(separator: " ") + " "
         var matches = workTopics.filter { $0.matches(tokens, phrase: phrase) }
         if matches.contains(where: { $0.title == "Финансы" }) { return "Финансы" }
-        if let match = zone?.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)) {
+        if let match = Self.zone?.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)) {
             for group in 1..<match.numberOfRanges {
                 if let range = Range(match.range(at: group), in: text) {
                     return "Зона " + text[range].trimmingCharacters(in: .whitespacesAndNewlines)
@@ -106,9 +127,20 @@ struct MeetingTopics {
         return matches.count == 1 ? matches[0].title : nil
     }
 
-    static func order(_ title: String) -> Int {
-        if title == ungrouped { return workTopics.count + 1 }
+    func order(_ title: String) -> Int {
+        if title == Self.ungrouped { return workTopics.count + 1 }
         return workTopics.firstIndex { $0.title == title } ?? workTopics.count
+    }
+}
+
+private struct MeetingTopicsKey: EnvironmentKey {
+    static let defaultValue = MeetingTopics(industry: .decor)
+}
+
+extension EnvironmentValues {
+    var meetingTopics: MeetingTopics {
+        get { self[MeetingTopicsKey.self] }
+        set { self[MeetingTopicsKey.self] = newValue }
     }
 }
 
@@ -127,16 +159,19 @@ enum MeetingTopicEntry<Item: Identifiable>: Identifiable {
         items.map(Self.confirmed) + proposals.map(Self.proposed)
     }
 
-    static func proposalTopic(_ proposal: Proposal) -> String {
-        MeetingTopics.title(topic: proposal.source?.topic, text: proposal.title ?? "",
-                            context: [proposal.description, proposal.source?.quote].compactMap { $0 }.joined(separator: " "))
+    static func proposalTopic(_ proposal: Proposal, topics: MeetingTopics, glossary: CompanyGlossary) -> String {
+        topics.title(topic: proposal.source?.topic, text: proposal.title ?? "",
+                            context: [proposal.description, proposal.source?.quote].compactMap { $0 }.joined(separator: " "),
+                            glossary: glossary)
     }
 }
 
 struct MeetingTopicList<Row: Identifiable, Content: View>: View {
+    @Environment(\.meetingTopics) private var topics
     let rows: [Row]
     let topic: (Row) -> String
     var visibleRange: Range<Int>? = nil
+    var collapsible = false
     @ViewBuilder let content: (Row) -> Content
 
     var body: some View {
@@ -145,23 +180,32 @@ struct MeetingTopicList<Row: Identifiable, Content: View>: View {
         let keys = groups.keys.sorted { lhs, rhs in
             let left = groups[lhs]![0].title
             let right = groups[rhs]![0].title
-            let leftOrder = MeetingTopics.order(left)
-            let rightOrder = MeetingTopics.order(right)
+            let leftOrder = topics.order(left)
+            let rightOrder = topics.order(right)
             if leftOrder != rightOrder { return leftOrder < rightOrder }
             return left.localizedStandardCompare(right) == .orderedAscending
         }
 
         let sections = visibleSections(keys: keys, groups: groups)
         ForEach(sections, id: \.key) { section in
-            VStack(alignment: .leading, spacing: 6) {
-                if section.title != MeetingTopics.ungrouped || groups.count > 1 || visibleRange != nil {
-                    Text(section.title)
-                        .font(.subheadline.weight(.semibold))
-                        .foregroundStyle(.secondary)
-                        .accessibilityAddTraits(.isHeader)
-                        .padding(.bottom, 2)
+            if collapsible {
+                MeetingDisclosure(title: section.title, icon: "folder",
+                                  count: section.rows.count, initiallyExpanded: true) {
+                    LazyVStack(alignment: .leading, spacing: 8) {
+                        ForEach(section.rows, content: content)
+                    }
                 }
-                ForEach(section.rows, content: content)
+            } else {
+                VStack(alignment: .leading, spacing: 6) {
+                    if section.title != MeetingTopics.ungrouped || groups.count > 1 || visibleRange != nil {
+                        Text(section.title)
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                            .accessibilityAddTraits(.isHeader)
+                            .padding(.bottom, 2)
+                    }
+                    ForEach(section.rows, content: content)
+                }
             }
         }
     }

@@ -252,6 +252,8 @@ struct MeetingAnalysisView: View {
 }
 
 struct MeetingDecisions: View {
+    @Environment(\.companyGlossary) private var glossary
+    @Environment(\.meetingTopics) private var meetingTopics
     let decisions: [Decision]
     let proposals: [Proposal]
     let review: (Proposal) -> Void
@@ -262,9 +264,9 @@ struct MeetingDecisions: View {
                 MeetingTopicList(rows: MeetingTopicEntry.rows(decisions, proposals: proposals), topic: { row in
                     switch row {
                     case .confirmed(let decision):
-                        return MeetingTopics.title(topic: decision.source?.topic, text: decision.text, context: decision.source?.quote)
+                        return meetingTopics.title(topic: decision.source?.topic, text: decision.text, context: decision.source?.quote, glossary: glossary)
                     case .proposed(let proposal):
-                        return MeetingTopicEntry<Decision>.proposalTopic(proposal)
+                        return MeetingTopicEntry<Decision>.proposalTopic(proposal, topics: meetingTopics, glossary: glossary)
                     }
                 }) { row in
                     switch row {
@@ -325,8 +327,17 @@ struct MeetingDisclosure<Content: View>: View {
     let icon: String
     let count: Int?
     @ViewBuilder let content: () -> Content
-    @State private var expanded = false
+    @State private var expanded: Bool
     @State private var hovering = false
+
+    init(title: String, icon: String, count: Int?, initiallyExpanded: Bool = false,
+         @ViewBuilder content: @escaping () -> Content) {
+        self.title = title
+        self.icon = icon
+        self.count = count
+        self.content = content
+        _expanded = State(initialValue: initiallyExpanded)
+    }
 
     var body: some View {
         let state = expanded ? "Развёрнуто" : "Свёрнуто"

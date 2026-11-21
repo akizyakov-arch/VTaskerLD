@@ -44,7 +44,6 @@ struct Dashboard: View {
     let myID: Int?
     let openProjects: () -> Void
     let openMeetings: () -> Void
-    let openAssistant: () -> Void
     let meetings: [Meeting]
     let pending: [Proposal]
     let notifications: [TaskNotification]
@@ -59,13 +58,7 @@ struct Dashboard: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
-                HStack {
-                    Text(formattedToday).font(.callout).foregroundStyle(palette.muted)
-                    Spacer(minLength: 8)
-                    Button(action: openAssistant) { Label("Открыть помощника", systemImage: "sparkles") }
-                        .buttonStyle(.link)
-                        .font(.callout)
-                }
+                Text(formattedToday).font(.callout).foregroundStyle(palette.muted)
                 metrics
                 if !notifications.isEmpty {
                     MeetingDisclosure(title: "Уведомления", icon: "bell",

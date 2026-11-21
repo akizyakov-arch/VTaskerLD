@@ -6,6 +6,7 @@ struct WorkspaceSettings: Decodable {
     var autoProcess: Bool
     var meId: Int?
     var savedViews: [SavedTaskView]?
+    var industryTemplate: IndustryTemplate?
 
     var colorScheme: ColorScheme? {
         switch theme {
@@ -40,6 +41,7 @@ struct SettingsForm: View {
                 ForEach(people) { person in Text(person.name).tag(Optional(person.id)) }
             }
             Toggle("Распознавать после остановки записи", isOn: $draft.autoProcess)
+            LabeledContent("Отраслевой шаблон") { IndustryTemplateMenu(model: model) }
             Button("Сохранить") {
                 Task {
                     await model.command(["op": "settings", "data": [

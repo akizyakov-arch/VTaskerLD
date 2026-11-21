@@ -120,7 +120,7 @@ def obj(properties):return {'type':'object','properties':properties,'required':l
 TEXT={'type':'string'};NULLABLE={'type':['string','null']};IDS={'type':'array','items':{'type':'integer'}}
 SCHEMA=obj({'summary':TEXT,'decisions':{'type':'array','items':obj({'text':TEXT,'topic':NULLABLE,'source_segment_ids':IDS})},'open_questions':{'type':'array','items':TEXT},'tasks':{'type':'array','items':obj({'title':TEXT,'description':TEXT,'task_id':{'type':['integer','null']},'kind':{'type':'string','enum':['create_task','change_due','change_assignee','change_status','change_blocked']},'stage_title':NULLABLE,'blocked':{'type':['boolean','null']},'blocked_reason':NULLABLE,'assignee_name':NULLABLE,'due_date':NULLABLE,'due_time':NULLABLE,'needs_clarification':{'type':'boolean'},'clarification':TEXT,'topic':NULLABLE,'source_segment_ids':IDS})}})
 OBSERVATIONS = {'type': 'array', 'items': obj({
-    'kind': {'type': 'string', 'enum': ['status_update', 'question', 'information']},
+    'kind': {'type': 'string', 'enum': ['status_update', 'question', 'information', 'unclear_term']},
     'text': TEXT, 'task_id': {'type': ['integer', 'null']}, 'source_segment_ids': IDS,
 })}
 SCHEMA['properties']['observations'] = OBSERVATIONS
@@ -194,10 +194,17 @@ change_status или change_blocked. Каждое явно согласован�
 верни оба изменения и не дублируй их отдельным решением. stage_title и blocked заполняй только
 при явно названном изменении. Сохрани существенные самостоятельные решения.
 
+company_terms — словарь компании. Варианты написания обозначают тот же термин. Используй термины
+для понимания реплик и сопоставления с задачами. section — рекомендуемая тема для связанной работы.
+Сохраняй исходные реплики как доказательство. Словарь не описывает поручения сам по себе.
 topic — короткая тема по смыслу разговора, одинаковая для связанных пунктов. Если в topic_glossary
 есть подходящие термины, используй их как подсказки к теме. Справочник сам по себе не доказывает
 наличие задачи или решения. При неясной теме оставь null. В observations сохрани до пяти фактов
-или обновлений со ссылками на реплики. Не повторяй там задачи и решения.
+или обновлений со ссылками на реплики. Не повторяй там задачи и решения. Можно дополнительно
+отметить до трёх профессиональных слов, сокращений или сленговых выражений, если смысл важен
+и остаётся неясным после проверки company_terms и контекста. Для них верни observation с
+kind=unclear_term, в text — только точное выражение из исходной реплики (до шести слов),
+task_id=null и укажи исходные реплики. Не добавляй общеупотребительные слова и имена людей.
 До 12 задач и 12 решений на часть. Составь краткое резюме без новых фактов.
 В protocol_title предложи короткую тему по содержанию реплик, обычно 3–8 слов.
 Возьми её из обсуждения. Не добавляй дату, слово «Совещание» или имя проекта вместо темы.
@@ -217,7 +224,7 @@ def meeting_topic_rules():
     return []
 
 
-def meeting_topic_glossary(segments):
+def meeting_topic_glossary(segments, industry='decor'):
     def words(text):
         return re.findall(r'[^\W_]+', text.casefold().replace('ё', 'е'))
 
@@ -225,6 +232,8 @@ def meeting_topic_glossary(segments):
     phrase = ' ' + ' '.join(tokens) + ' '
     glossary = []
     for topic in meeting_topic_rules():
+        if 'industries' in topic and industry not in topic['industries']:
+            continue
         matches = [term for key in ('words', 'phrases', 'actions') for term in topic.get(key, [])
                    if ' ' + ' '.join(words(term)) + ' ' in phrase]
         matches.extend(term for term in topic.get('prefixes', [])
@@ -349,7 +358,7 @@ def reusable_prefix(snapshot, previous):
     if not previous:
         return 0, None
     old = previous['input']
-    for key in ('participants', 'created_at', 'timezone', 'title', 'project_id', 'analysis_projects'):
+    for key in ('participants', 'created_at', 'timezone', 'title', 'project_id', 'analysis_projects', 'company_terms', 'industry_template'):
         if old.get(key) != snapshot.get(key):
             return 0, None
     if snapshot.get('analysis_mode') == 'manual' and any(
@@ -473,6 +482,64 @@ def cache_key(data, phase, payload, system, schema, max_tokens):
     return hashlib.sha256(encoded).hexdigest()
 
 
+def glossary_words(text):
+    return re.findall(r'[^\W_]+', text.lower().replace('ё', 'е'))
+
+
+def relevant_company_terms(entries, segments, tasks=()):
+    def indexed(text):
+        return ' ' + ' '.join(glossary_words(text)) + ' '
+
+    texts = [indexed(segment['text']) for segment in segments]
+    task_texts = [indexed(task.get(key) or '') for task in tasks for key in ('title', 'description')]
+
+    def mentioned(text, sources):
+        phrase = indexed(text)
+        return len(phrase) > 2 and any(phrase in source for source in sources)
+
+    result = []
+    for entry in entries:
+        variants = [variant for variant in entry['variants'] if mentioned(variant['text'], texts)]
+        if variants or mentioned(entry['term'], texts):
+            from_tasks = [variant for variant in entry['variants']
+                          if variant not in variants and mentioned(variant['text'], task_texts)]
+            result.append({**entry, 'variants': (variants + from_tasks)[:6]})
+            if len(result) == 12:
+                break
+    return result
+
+
+def glossary_index(glossary):
+    patterns = {}
+    for entry in glossary:
+        for variant in entry['variants']:
+            parts = glossary_words(variant['text'])
+            if parts:
+                patterns.setdefault(parts[0], []).append((parts, entry['term']))
+    for choices in patterns.values():
+        choices.sort(key=lambda pair: -len(pair[0]))
+    return patterns
+
+
+def expand_glossary(text, patterns):
+    if not patterns:
+        return text
+    words = glossary_words(text)
+    result = []
+    offset = 0
+    while offset < len(words):
+        match = next(((parts, term) for parts, term in patterns.get(words[offset], [])
+                      if words[offset:offset + len(parts)] == parts), None)
+        if match:
+            parts, term = match
+            result.append(term)
+            offset += len(parts)
+        else:
+            result.append(words[offset])
+            offset += 1
+    return ' '.join(result)
+
+
 def analyze_part(data, payload, depth=0):
     meter = data.get('_meter')
     system = SYSTEM
@@ -491,8 +558,13 @@ def analyze_part(data, payload, depth=0):
                    'Срок, исполнитель и подтверждающие ID сохраняй. '
                    'Объедини повторы одного поручения, сохранив последнее согласованное уточнение.')
     max_tokens = min(8192, 2800 + len(payload['segments']) * 120) if depth == 0 else 2048
-    glossary = meeting_topic_glossary(payload['segments'])
+    snapshot = data.get('input', {})
+    glossary = meeting_topic_glossary(payload['segments'], snapshot.get('industry_template', 'decor'))
     request_payload = {**payload, 'topic_glossary': glossary} if glossary else payload
+    company = relevant_company_terms(snapshot.get('company_terms', []), payload['segments'],
+                                     payload.get('project_tasks', []))
+    if company:
+        request_payload = {**request_payload, 'company_terms': company}
     key = cache_key(data, 'extraction', request_payload, system, schema, max_tokens)
     if key and not data.get('force'):
         cached = meter.lookup(key)
@@ -535,15 +607,16 @@ def search_terms(text):
 
 def relevant_context(snapshot, segments, discussed):
     text = ' '.join(segment['text'] for segment in segments)
-    terms = search_terms(text)
+    patterns = glossary_index(snapshot.get('company_terms', []))
+    terms = search_terms(expand_glossary(text, patterns))
     use_history = re.search(r'прежн|предыдущ|раньш|верн|первонач|исходн|как\s+было', text.casefold()) is not None
     explicit_ids = {int(number) for number in re.findall(r'#(\d{1,19})(?!\d)', text)}
 
     projects_in_text = {project['id'] for project in snapshot.get('analysis_projects', [])
                         if project['title'].casefold() in text.casefold()}
     def relevance(task):
-        title_hits = len(terms & search_terms(task.get('title') or ''))
-        details_hits = len(terms & search_terms(task.get('description') or ''))
+        title_hits = len(terms & search_terms(expand_glossary(task.get('title') or '', patterns)))
+        details_hits = len(terms & search_terms(expand_glossary(task.get('description') or '', patterns)))
         return task.get('id') in explicit_ids, task.get('project_id') in projects_in_text, title_hits, min(3, details_hits)
 
     tasks = [task for task in snapshot.get('project_tasks', [])

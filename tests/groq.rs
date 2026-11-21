@@ -1322,3 +1322,117 @@ fn old_change_cards_cannot_capture_the_deadline_and_assignee_of_the_original_tas
     assert_eq!(applied["task"]["due_date"],"2026-11-24");
     assert_eq!(store.workspace(false,None).unwrap()["tasks"].as_array().unwrap().len(),3);
 }
+
+#[test]
+fn company_terms_are_saved_and_reused_in_meetings_without_sending_unrelated_terms() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("glossary.sqlite3");
+    let store = Store::open(&path).unwrap();
+    let connection = Connection::open(&path).unwrap();
+    let (meeting, segment) = meeting_with_transcript(&store, &connection, "Декор", "Нужен сотик и термопруток");
+    let term = |name, alias| json!({
+        "op":"save_company_term",
+        "data":{"term":name,"variants":[{"text":alias,"language":"ru"}],"section":"Материалы"}
+    });
+    let initial = store.workspace_action(&term("Панель", "карточка")).unwrap();
+    let (first, _, _) = store.groq_prepare_projects(meeting, MODELS[0], true, false, &[], false).unwrap();
+    store.groq_complete(first, &json!({
+        "summary":"Уточнили материалы","tasks":[],"decisions":[],"open_questions":[],
+        "observations":[
+            {"kind":"unclear_term","text":"термопруток","source_segment_ids":[segment]},
+            {"kind":"unclear_term","text":"выдуманный термин","source_segment_ids":[segment]}
+        ]
+    })).unwrap();
+    let analysis = store.groq_analysis(meeting).unwrap();
+    let findings = analysis["saved"]["result"]["findings"].as_array().unwrap();
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0]["text"], "термопруток");
+
+    let entry = store.workspace_action(&term("Сотовый поликарбонат", "сотик")).unwrap();
+    assert!(store.workspace_action(&term("Другое значение", "СОТИК")).is_err());
+    let (second, input, cached) = store.groq_prepare_projects(meeting, MODELS[0], true, false, &[], false).unwrap();
+    assert!(!cached);
+    assert_ne!(first, second);
+    let terms = input["company_terms"].as_array().unwrap();
+    assert_eq!(terms.len(), 1);
+    assert_eq!(terms[0]["term"], "Сотовый поликарбонат");
+    assert_eq!(input["segments"][0]["text"], "Нужен сотик и термопруток");
+    assert_eq!(store.workspace(false, None).unwrap()["company_terms"].as_array().unwrap().len(), 2);
+    assert_eq!(store.workspace(true, None).unwrap()["company_terms"], json!([]));
+    assert!(store.workspace_action(&json!({"op":"delete_company_term","id":entry["id"],"revision":0})).is_err());
+    store.workspace_action(&json!({"op":"delete_company_term","id":initial["id"],"revision":initial["revision"]})).unwrap();
+}
+
+#[test]
+fn changing_industry_refreshes_analysis_context_and_preserves_company_terms() {
+    let (_dir, store, meeting, segment) = setup();
+    let (first, _, _) = store.groq_prepare_projects(meeting, MODELS[0], true, false, &[], false).unwrap();
+    store.groq_complete(first, &output(segment)).unwrap();
+    let term = store.workspace_action(&json!({
+        "op":"save_company_term",
+        "data":{"term":"Сотовый поликарбонат","variants":[{"text":"сотик","language":"ru"}]}
+    })).unwrap();
+    assert!(store.workspace_action(&json!({"op":"settings","data":{"industry_template":"unknown"}})).is_err());
+    store.workspace_action(&json!({"op":"settings","data":{"industry_template":"it"}})).unwrap();
+    let state = store.workspace(false, None).unwrap();
+    assert_eq!(state["settings"]["industry_template"], "it");
+    assert_eq!(state["company_terms"][0]["id"], term["id"]);
+
+    let (second, context, cached) = store.groq_prepare_projects(meeting, MODELS[0], true, false, &[], false).unwrap();
+    assert_ne!(first, second);
+    assert!(!cached);
+    assert_eq!(context["industry_template"], "it");
+}
+
+#[test]
+fn starter_glossary_combines_with_company_variants_and_switches_industry() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("glossary.sqlite3");
+    let store = Store::open(&path).unwrap();
+    let connection = Connection::open(&path).unwrap();
+    let (meeting, _) = meeting_with_transcript(
+        &store,
+        &connection,
+        "Релиз",
+        "Завтра боевой выклад. Потом нужно выкатить на прод и проверить метрики.",
+    );
+    let select = |industry| {
+        store.workspace_action(&json!({
+            "op":"settings","data":{"industry_template":industry}
+        })).unwrap();
+    };
+    select("it");
+    let canonical = "Выкладка в рабочую среду";
+    let company_variant = json!({"text":"боевой выклад","language":"ru"});
+    store.workspace_action(&json!({
+        "op":"save_company_term",
+        "data":{"term":canonical,"variants":[company_variant]}
+    })).unwrap();
+
+    let state = store.workspace(false, None).unwrap();
+    let includes = |terms: &serde_json::Value, term| {
+        terms.as_array().unwrap().iter().any(|entry| entry["term"] == term)
+    };
+    assert!(includes(&state["industry_terms"], canonical));
+    assert!(!includes(&state["industry_terms"], "Передача в пошив"));
+    assert_eq!(state["company_terms"][0]["variants"], json!([company_variant]));
+    let (_, snapshot, _) = store
+        .groq_prepare_projects(meeting, MODELS[0], true, false, &[], false)
+        .unwrap();
+    let relevant = snapshot["company_terms"].as_array().unwrap();
+    assert_eq!(relevant.len(), 1);
+    assert_eq!(relevant[0]["term"], canonical);
+    assert_eq!(relevant[0]["section"], "Релизы");
+    let variants = relevant[0]["variants"].as_array().unwrap();
+    assert!(variants.contains(&company_variant));
+    assert!(variants.iter().any(|variant| variant["text"] == "выкатить на прод"));
+
+    select("construction");
+    let state = store.workspace(false, None).unwrap();
+    assert!(includes(&state["industry_terms"], "Освидетельствование скрытых работ"));
+    assert!(!includes(&state["industry_terms"], canonical));
+    assert_eq!(state["company_terms"][0]["variants"], json!([company_variant]));
+    let company_term = state["glossary_terms"].as_array().unwrap().iter()
+        .find(|entry| entry["term"] == canonical).unwrap();
+    assert_eq!(company_term["variants"], json!([company_variant]));
+}

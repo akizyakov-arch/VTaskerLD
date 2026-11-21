@@ -11,6 +11,9 @@ struct Workspace: Decodable {
     let proposals: [Proposal]
     let decisions: [Decision]
     let notifications: [TaskNotification]?
+    let companyTerms: [CompanyTerm]?
+    let industryTerms: [CompanyTerm]?
+    let glossaryTerms: [CompanyTerm]?
 
     var visibleTasks: [TaskItem] {
         let archivedIDs = Set(projects.filter { $0.archived == true }.map(\.id))

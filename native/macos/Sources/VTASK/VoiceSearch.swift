@@ -57,6 +57,8 @@ enum AssistantVoicePreferences {
 final class VoiceSearch: ObservableObject {
     @Published private(set) var listening = false
     @Published private(set) var preparing = false
+    @Published private(set) var transcribing = false
+    @Published private(set) var needsRepeat = false
     @Published private(set) var text = ""
     @Published private(set) var completedText: String?
     @Published private(set) var error: String?
@@ -74,13 +76,13 @@ final class VoiceSearch: ObservableObject {
     func start(silenceMilliseconds: Int, recognitionEngine: AssistantRecognitionEngine,
                transcribe: @escaping (Data, Int) async throws -> String) async {
         guard !preparing && !listening else { return }
+        clearFeedback()
         let apple = recognitionEngine == .macOS ? recognizer : nil
         if recognitionEngine == .macOS && (apple?.isAvailable != true || apple?.supportsOnDeviceRecognition != true) {
             error = "Локальное распознавание русского языка недоступно."
             return
         }
         preparing = true
-        error = nil
         let session = UUID()
         generation = session
         defer { if generation == session { preparing = false } }
@@ -178,6 +180,7 @@ final class VoiceSearch: ObservableObject {
                     if result?.isFinal == true {
                         finish()
                     } else if let failure {
+                        needsRepeat = text.isEmpty
                         error = failure.localizedDescription
                         stop()
                     }
@@ -196,16 +199,21 @@ final class VoiceSearch: ObservableObject {
                     guard reachedLimit || (heardSpeech && lastSpeech.duration(to: .now) >= silenceDelay) else { continue }
                     endInput()
                     if heardSpeech {
+                        transcribing = true
                         do {
                             let recognized = try await recognizeAudio(audio.data(), audio.sampleRate)
                             guard generation == session, !Task.isCancelled else { return }
                             text = recognized
-                            if text.isEmpty { error = "\(recognitionEngine.title) не распознал голосовую команду." }
+                            if text.isEmpty {
+                                needsRepeat = true
+                                error = "\(recognitionEngine.title) не распознал голосовую команду."
+                            }
                         } catch {
                             guard generation == session, !Task.isCancelled else { return }
                             self.error = error.localizedDescription
                         }
                     } else {
+                        needsRepeat = true
                         error = "Голос не обнаружен."
                     }
                     finish()
@@ -213,6 +221,7 @@ final class VoiceSearch: ObservableObject {
                 }
                 if !text.isEmpty && lastSpeech.duration(to: .now) >= silenceDelay {
                     endInput()
+                    transcribing = true
                     recognition?.finish()
                     // The recognizer can still revise words after the microphone stops.
                     do { try await Task.sleep(for: .milliseconds(1500)) } catch { return }
@@ -232,12 +241,18 @@ final class VoiceSearch: ObservableObject {
         if !message.isEmpty { completedText = message }
     }
 
+    func clearFeedback() {
+        needsRepeat = false
+        error = nil
+    }
+
     func stop() {
         silenceMonitor?.cancel()
         silenceMonitor = nil
         generation = UUID()
         preparing = false
         listening = false
+        transcribing = false
         endInput()
         recognition?.cancel()
         recognition = nil

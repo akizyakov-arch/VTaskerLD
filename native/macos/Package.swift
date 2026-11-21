@@ -14,6 +14,7 @@ let package = Package(
     ]), .executableTarget(name: "VTASK", resources: [
         .copy("Resources/meeting-topics.json"),
         .copy("Resources/recording-wave.png"),
-        .copy("Resources/Manrope")
+        .copy("Resources/Manrope"),
+        .copy("Resources/ValliAvatar")
     ])]
 )

@@ -4,11 +4,11 @@ struct AssistantSearch: View {
     let tasks: [TaskItem]
     let today: String
     let projects: [Project]
+    let glossaryModel: WorkspaceModel
     let currentProject: Project?
-    let searchProject: Project?
     let currentTask: TaskItem?
     let taskStages: (TaskItem) -> [Stage]
-    let changeTaskStatus: (TaskItem, Stage) async -> String
+    let changeTaskStatus: (TaskItem, Stage) async -> (message: String, saved: Bool)
     let people: [Person]
     let proposals: [Proposal]
     let meetings: [Meeting]
@@ -17,6 +17,7 @@ struct AssistantSearch: View {
     let openProposal: (Proposal) -> Void
     let canUseMicrophone: Bool
     let meetingRecording: Bool
+    let takingNotes: Bool
     let liveTranscript: LiveTranscript?
     @Binding var liveRequests: [String]
     let transcribe: (Data, Int) async throws -> String
@@ -28,16 +29,6 @@ struct AssistantSearch: View {
         let id = UUID()
         let text: String
         let isUser: Bool
-    }
-
-    private enum TaskCommandScope {
-        case project(Int)
-        case unassigned
-
-        var projectID: Int? {
-            if case .project(let id) = self { return id }
-            return nil
-        }
     }
 
     private struct PendingTaskCommand {
@@ -88,6 +79,12 @@ struct AssistantSearch: View {
     @State private var sendingLocalCommand = false
     @State private var localProposalID: Int?
     @State private var pendingTaskCommand: PendingTaskCommand?
+    @Environment(\.companyGlossary) private var glossary
+    @Environment(\.meetingTopics) private var meetingTopics
+    @State private var pendingTerm: CompanyTermDraft?
+    @State private var awaitingTerm = false
+    @State private var editingTerm: CompanyTermDraft?
+    @State private var savingTerm = false
     private enum Refinement {
         case assignee, project, deadline
     }
@@ -114,10 +111,31 @@ struct AssistantSearch: View {
     @State private var interpretation: Task<Void, Never>?
     @AppStorage("assistantSemanticInterpretation") private var semanticInterpretation = true
     @State private var projectChoices: [Project] = []
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var interpretingSearch = false
+    @State private var replyState: ValliState = .idle
 
     private var listeningRequest: Int? {
-        voiceEnabled && canUseMicrophone && !speech.isSpeaking && interpretation == nil && !changingStatus && !sendingLocalCommand ? listenTurn : nil
+        voiceEnabled && canUseMicrophone && !speech.isSpeaking && interpretation == nil && !changingStatus && !sendingLocalCommand && !savingTerm && editingTerm == nil ? listenTurn : nil
+    }
+
+    private var avatarState: ValliState {
+        if voice.needsRepeat { return .audioUnclear }
+        if interpretation != nil { return interpretingSearch ? .searching : .thinking }
+        if voice.transcribing || voice.preparing || changingStatus || sendingLocalCommand || savingTerm { return .thinking }
+        if pendingTerm != nil || localProposalID != nil { return .needsReview }
+        if let command = pendingTaskCommand {
+            if command.selected != nil && command.unresolvedAssignee == nil && command.update?.fields.isEmpty == false {
+                return .needsReview
+            }
+            return .question
+        }
+        if awaitingTerm || awaitingStatusTaskName || awaitingStatusForTask != nil ||
+            refinement != nil || !projectChoices.isEmpty || replyState == .question {
+            return .question
+        }
+        if voice.listening { return .listening }
+        if replyState == .done { return .done }
+        return takingNotes ? .takingNotes : .idle
     }
 
     private struct SearchResults {
@@ -191,32 +209,34 @@ struct AssistantSearch: View {
                                   with: "", options: [.regularExpression, .caseInsensitive])
         let parsed = AssistantTaskFilters.parse(topicQuery, today: today)
         let filters = parsed.filters
-        let words = tokens(parsed.remaining).filter { !ignored.contains($0) }
+        let words = tokens(parsed.remaining)
+        let usefulWords = words.filter { !ignored.contains($0) }
         let projectWords: Set<String> = ["проект", "проекте", "проекту", "проекта"]
         let scopeIndex = words.firstIndex { projectWords.contains($0) }
         let scope = projectScope(words, at: scopeIndex)
         let terms = scopeIndex.flatMap { index in
             scope.first.map { Array(words.prefix(index)) + Array(words.dropFirst(index + 1 + tokens($0.title).count)) }
         } ?? words
-        let assignees = assigneeMatch(in: terms)
-        let searchTopic = MeetingTopics.searchTerms(terms.filter { $0 != assignees?.word })
+        let assignees = assigneeMatch(in: terms.filter { !ignored.contains($0) })
+        let searchWords = glossary.expand(terms.filter { $0 != assignees?.word }).filter { !ignored.contains($0) }
+        let searchTopic = meetingTopics.searchTerms(searchWords)
         let assigneeIDs = Set(refinedAssignee.map { [$0.id] } ?? assignees?.people.map(\.id) ?? [])
         let taskOnly = filters.isActive || assignees != nil || refinedAssignee != nil ||
             refinedProject != nil || refinedDeadline != nil || tokens(searchQuery).contains { $0.hasPrefix("задач") }
         let canMatch = (scopeIndex == nil || !scope.isEmpty || refinedProject != nil) && assigneeIDs.count <= 1
         let defaultScope = allProjects == nil && !filters.noProjectOnly && !extra.noProjectOnly
-            ? searchProject.map { [$0.id] } ?? [] : []
+            ? currentProject.map { [$0.id] } ?? [] : []
         let scopeIDs = Set(refinedProject.map { [$0.id] } ?? (scopeIndex != nil ? scope.map(\.id) : defaultScope))
         let projectScope = scopeIDs.count == 1
-            ? (scopeIDs.first == searchProject?.id ? searchProject?.title : projectName(scopeIDs.first))
+            ? (scopeIDs.first == currentProject?.id ? currentProject?.title : projectName(scopeIDs.first))
             : (filters.noProjectOnly || extra.noProjectOnly ? "Без проекта" : nil)
         let matchingProposals = proposals.filter { proposal in
             guard !projectListOnly, canMatch, !filters.isActive, !extra.isActive, refinedDeadline == nil,
-                  !words.isEmpty || taskOnly, proposal.status == "pending", proposal.kind != "decision" else { return false }
+                  !usefulWords.isEmpty || taskOnly, proposal.status == "pending", proposal.kind != "decision" else { return false }
             let target = tasks.first { $0.id == proposal.taskId }
             let meeting = meetings.first { $0.id == proposal.source?.meetingId }
             let projectID = proposalProjectID(proposal)
-            guard projectID.map({ id in id == searchProject?.id || projects.contains { $0.id == id } }) ?? true,
+            guard projectID.map({ id in id == currentProject?.id || projects.contains { $0.id == id } }) ?? true,
                   scopeIDs.isEmpty || projectID.map(scopeIDs.contains) == true else { return false }
             let assignee = proposal.reviewDraft.map { $0.data.assigneeId }
                 ?? (proposal.proposed?.assigneeId ?? proposal.assigneeId ?? target?.assigneeId)
@@ -226,7 +246,7 @@ struct AssistantSearch: View {
             let fields = [proposal.reviewDraft?.data.title ?? proposal.title,
                           proposal.reviewDraft?.data.description ?? proposal.description,
                           proposal.source?.quote, proposal.source?.topic, target?.title, target?.description]
-            return MeetingTopics.matchesSearchTopics(searchTopic.topics, fields: fields)
+            return meetingTopics.matchesSearchTopics(searchTopic.topics, fields: glossaryTopicFields(fields))
                 && matches(searchTopic.words, in: fields + [project, person, meeting?.visibleTitle],
                            tolerateTaskVariations: tolerateTaskVariations)
         }
@@ -251,12 +271,12 @@ struct AssistantSearch: View {
                 [source.quote, meetings.first { $0.id == source.meetingId }?.visibleTitle]
             }
             let fields = [task.title, task.description] + (task.sources ?? []).map(\.quote)
-            return MeetingTopics.matchesSearchTopics(searchTopic.topics, fields: fields)
+            return meetingTopics.matchesSearchTopics(searchTopic.topics, fields: glossaryTopicFields(fields))
                 && matches(searchTopic.words, in: [task.title, task.description, project, person] + context,
                            tolerateTaskVariations: tolerateTaskVariations)
         }
         let foundProjects = scopeIndex == nil
-            ? projects.filter { !words.isEmpty && matches(words, in: [$0.title, $0.description]) }
+            ? projects.filter { !usefulWords.isEmpty && matches(usefulWords, in: [$0.title, $0.description]) }
             : scope
         let listedProjects = projects.filter { project in
             (!activeProjectsOnly || project.status == "active") &&
@@ -272,22 +292,18 @@ struct AssistantSearch: View {
 
     var body: some View {
         let results = searchResults
+        let state = avatarState
         VStack(spacing: 0) {
             HStack {
                 WindowCloseButton(label: "Закрыть ассистента", action: close)
                     .keyboardShortcut(.cancelAction)
                 NavigationBackButton(action: close)
-                TimelineView(.animation(minimumInterval: 1.0 / 24, paused: !voiceEnabled || !canUseMicrophone || reduceMotion)) { context in
-                    let phase = context.date.timeIntervalSinceReferenceDate * .pi / 1.4
-                    let pulse = voiceEnabled && canUseMicrophone && !reduceMotion ? 0.65 + 0.35 * cos(phase) : 1
-                    Image(systemName: "sparkles")
-                        .frame(width: 32, height: 32)
-                        .background(Color.accentColor.opacity(0.24 * pulse), in: Circle())
-                        .foregroundStyle(Color.accentColor)
-                        .opacity(voiceEnabled ? 1 : 0.55)
+                ValliAvatar(state: state, size: 44, animated: true)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Валли").font(.title3.weight(.semibold))
+                    Text(state.title).font(.caption).foregroundStyle(.secondary)
                 }
-                .accessibilityHidden(true)
-                Text("Валли").font(.title2.bold())
+                .accessibilityElement(children: .combine)
                 Spacer()
             }
             .padding(16)
@@ -313,13 +329,22 @@ struct AssistantSearch: View {
                                 Button(stage.title) { applyTaskStatus(stage, to: task) }
                             }
                         }
-                        ForEach(statusTaskChoices) { task in
+                        ForEach(statusTaskChoices.filter { statusTask($0.id) != nil }) { task in
                             let project = projects.first { $0.id == task.projectId }?.title ?? "Без проекта"
                             Button(task.title + " · " + project) {
                                 if let latest = statusTask(task.id) {
                                     requestTaskStatus(pendingStatusTarget, for: latest)
                                 }
                             }
+                        }
+                        if let draft = pendingTerm {
+                            HStack {
+                                Button("Сохранить термин") { saveCompanyTerm(draft) }
+                                    .buttonStyle(.borderedProminent)
+                                Button("Исправить") { editingTerm = draft }
+                                Button("Отмена") { cancelCompanyTerm() }
+                            }
+                            .disabled(savingTerm)
                         }
                         if let command = pendingTaskCommand {
                             taskCommandChoices(command)
@@ -357,7 +382,7 @@ struct AssistantSearch: View {
                 }
                 .onChange(of: messages.count) { _ in
                     showAllTaskResults = false
-                    if searchQuery.isEmpty || pendingTaskCommand != nil || !statusTaskChoices.isEmpty {
+                    if searchQuery.isEmpty || pendingTerm != nil || pendingTaskCommand != nil || !statusTaskChoices.isEmpty {
                         scroll.scrollTo("chat-end", anchor: .bottom)
                     } else {
                         scroll.scrollTo("search-results", anchor: .top)
@@ -378,7 +403,7 @@ struct AssistantSearch: View {
             } else if speech.isSpeaking {
                 Button("Остановить озвучивание") { speech.stop() }
                     .buttonStyle(.link).font(.caption)
-            } else if voice.listening {
+            } else if voice.listening && state != .listening {
                 Text("Слушаю…").font(.caption).foregroundStyle(.secondary)
             }
             if let proposal = proposals.first(where: { $0.id == localProposalID && $0.status == "pending" }) {
@@ -408,6 +433,11 @@ struct AssistantSearch: View {
                     .disabled(sendingLocalCommand || query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
             .padding(14)
+        }
+        .task(id: replyState == .done ? messages.last?.id : nil) {
+            guard replyState == .done else { return }
+            do { try await Task.sleep(for: .seconds(2)) } catch { return }
+            replyState = .idle
         }
         .task(id: listeningRequest) {
             guard listeningRequest != nil else { return }
@@ -439,12 +469,20 @@ struct AssistantSearch: View {
                 voice.stop()
             }
         }
+        .sheet(item: $editingTerm) { draft in
+            CompanyTermEditor(model: glossaryModel, draft: draft) {
+                pendingTerm = nil
+                awaitingTerm = false
+                append("Термин сохранён в справочнике компании.", feedback: .done)
+            }
+            .sheetCloseButton(disabled: glossaryModel.saving)
+        }
         .onAppear(perform: handleLiveRequests)
         .onChange(of: currentTask?.id) { _ in clearStatusRequest() }
-        .onChange(of: searchProject?.id) { _ in
+        .onChange(of: taskCommandScope) { _ in clearStatusRequest() }
+        .onChange(of: currentProject?.id) { _ in
             interpretation?.cancel()
             interpretation = nil
-            clearStatusRequest()
             reset()
         }
         .onChange(of: liveRequests) { _ in handleLiveRequests() }
@@ -584,11 +622,12 @@ struct AssistantSearch: View {
         for request in requests {
             append("Валли, " + request, user: true)
             searchQuery = request
-            append(searchResults.reply)
+            reportSearchResults()
         }
     }
 
-    private func append(_ text: String, user: Bool = false) {
+    private func append(_ text: String, user: Bool = false, feedback: ValliState = .idle) {
+        replyState = feedback
         messages.append(Message(text: text, isUser: user))
         if !user {
             if voiceEnabled && speakReplies && !meetingRecording {
@@ -601,15 +640,26 @@ struct AssistantSearch: View {
 
     private func reset() {
         searchQuery = ""
+        replyState = .idle
         localProposalID = nil
         projectChoices = []
         pendingTaskCommand = nil
+        pendingTerm = nil
+        awaitingTerm = false
         clearRefinements()
+    }
+
+    private var taskCommandScope: TaskCommandScope? {
+        TaskCommandScope(projectID: currentProject?.id, task: currentTask)
+    }
+
+    private var statusTasks: [TaskItem] {
+        TaskCommandScope.tasks(tasks, in: taskCommandScope)
     }
 
     private func statusTask(_ id: Int?) -> TaskItem? {
         guard let id else { return nil }
-        return tasks.first { $0.id == id }
+        return statusTasks.first { $0.id == id }
     }
 
     private func clearStatusRequest() {
@@ -624,9 +674,10 @@ struct AssistantSearch: View {
         clearStatusRequest()
         let parts = AssistantTaskStatus.destinations(in: phrase)
         let candidates = [(name: phrase, target: fallbackTarget)] + parts
+        let availableTasks = statusTasks
         for candidate in candidates where !candidate.name.isEmpty {
             let words = tokens(candidate.name)
-            let exact = tasks.filter { tokens($0.title) == words }
+            let exact = availableTasks.filter { tokens($0.title) == words }
             if exact.count == 1, let task = exact.first {
                 requestTaskStatus(candidate.target, for: task)
                 return
@@ -643,7 +694,7 @@ struct AssistantSearch: View {
         let candidate = parts.first ?? (name: phrase, target: fallbackTarget)
         if !candidate.name.isEmpty {
             let words = tokens(candidate.name)
-            let related = words.isEmpty ? [] : tasks.filter { matches(words, in: [$0.title]) }
+            let related = words.isEmpty ? [] : availableTasks.filter { matches(words, in: [$0.title]) }
             if !related.isEmpty {
                 offerStatusTasks(related, target: candidate.target)
                 return
@@ -651,8 +702,14 @@ struct AssistantSearch: View {
         }
         awaitingStatusTaskName = true
         pendingStatusTarget = candidate.target
-        append(candidate.name.isEmpty ? "Какую задачу перенести?" :
-               "Не нашёл задачу «\(candidate.name)». Назовите её точнее.")
+        if candidate.name.isEmpty {
+            append("Какую задачу перенести?")
+        } else if let scope = taskCommandScope {
+            let location = scope.projectID.map { "в проекте «" + projectName($0) + "»" } ?? "среди задач без проекта"
+            append("Не нашёл задачу «\(candidate.name)» \(location). Уточните название или откройте нужный проект.")
+        } else {
+            append("Не нашёл задачу «\(candidate.name)». Назовите её точнее.")
+        }
     }
 
     private func offerStatusTasks(_ options: [TaskItem], target: String) {
@@ -677,18 +734,19 @@ struct AssistantSearch: View {
     }
 
     private func applyTaskStatus(_ stage: Stage, to task: TaskItem) {
-        guard !changingStatus, taskStages(task).contains(where: { $0.id == stage.id }) else { return }
+        guard !changingStatus, statusTask(task.id) != nil,
+              taskStages(task).contains(where: { $0.id == stage.id }) else { return }
         clearStatusRequest()
         if task.stageId == stage.id {
-            append("«\(task.title)» уже в статусе «\(stage.title)».")
+            append("«\(task.title)» уже в статусе «\(stage.title)».", feedback: .done)
             return
         }
         changingStatus = true
         voice.stop()
         Task {
-            let reply = await changeTaskStatus(task, stage)
+            let (reply, saved) = await changeTaskStatus(task, stage)
             changingStatus = false
-            append(reply)
+            append(reply, feedback: saved ? .done : .idle)
         }
     }
 
@@ -720,7 +778,7 @@ struct AssistantSearch: View {
     private func commandTargets(_ command: PendingTaskCommand, in scope: TaskCommandScope,
                                 matching query: String) -> [TaskCommandTarget] {
         let projectID = scope.projectID
-        var targets = tasks.filter { $0.projectId == projectID }.map(TaskCommandTarget.task)
+        var targets = TaskCommandScope.tasks(tasks, in: scope).map(TaskCommandTarget.task)
         if command.editsDeadline || command.update != nil {
             targets += pendingNewTasks.filter { proposal in
                 let draftProject = proposal.reviewDraft.map { $0.data.projectId }
@@ -974,13 +1032,70 @@ struct AssistantSearch: View {
         }
     }
 
+    private func handleCompanyTerm(_ text: String, normalized: String) -> Bool {
+        if let draft = pendingTerm {
+            if ["да", "сохрани", "сохранить", "запомни", "подтверждаю"].contains(normalized) {
+                saveCompanyTerm(draft)
+                return true
+            }
+            if ["нет", "отмена"].contains(normalized) {
+                cancelCompanyTerm()
+                return true
+            }
+            if ["исправь", "исправить", "редактировать"].contains(normalized) {
+                editingTerm = draft
+                return true
+            }
+        }
+        let teaching = CompanyTermRequest.isRequest(text)
+        guard teaching || awaitingTerm || pendingTerm != nil else { return false }
+        if let draft = CompanyTermRequest.draft(from: text) {
+            reset()
+            clearStatusRequest()
+            pendingTerm = draft
+            let variant = draft.variants.first?.text ?? ""
+            append("Запомнить «" + variant + "» как «" + draft.term + "» для всей компании?")
+        } else if teaching || awaitingTerm {
+            awaitingTerm = true
+            pendingTerm = nil
+            append("Какое выражение запомнить и что оно означает? Например: «сотик — сотовый поликарбонат».")
+        } else {
+            return false
+        }
+        return true
+    }
+
+    private func saveCompanyTerm(_ draft: CompanyTermDraft) {
+        guard !savingTerm else { return }
+        savingTerm = true
+        voice.stop()
+        Task {
+            let saved = await draft.save(using: glossaryModel)
+            savingTerm = false
+            if saved {
+                pendingTerm = nil
+                awaitingTerm = false
+                append("Запомнил «" + draft.term + "» для всей компании.", feedback: .done)
+            } else {
+                append(glossaryModel.error ?? "Не удалось сохранить термин.")
+            }
+        }
+    }
+
+    private func cancelCompanyTerm() {
+        pendingTerm = nil
+        awaitingTerm = false
+        append("Сохранение термина отменено.")
+    }
+
     private func submit() {
-        guard !changingStatus && !sendingLocalCommand else { return }
+        guard !changingStatus && !sendingLocalCommand && !savingTerm else { return }
         let text = query.trimmingCharacters(in: .whitespacesAndNewlines)
         query = ""
         guard !text.isEmpty else { return }
         interpretation?.cancel()
         interpretation = nil
+        voice.clearFeedback()
         voice.stop()
         let choosingProject = !projectChoices.isEmpty
         projectChoices = []
@@ -992,6 +1107,7 @@ struct AssistantSearch: View {
             append("Запрос отменён. Что сделать дальше?")
             return
         }
+        if handleCompanyTerm(text, normalized: normalized) { return }
         if AssistantRequest.isCreationRequest(text) {
             append("Чтобы создать задачу, проект, совещание или решение, откройте меню «+».")
             return
@@ -1036,13 +1152,7 @@ struct AssistantSearch: View {
             if command.title.isEmpty, let currentTask {
                 sendTaskCommand(command.action, to: .task(currentTask))
             } else {
-                let scope: TaskCommandScope?
-                if let currentTask {
-                    scope = currentTask.projectId.map(TaskCommandScope.project) ?? .unassigned
-                } else {
-                    scope = currentProject.map { .project($0.id) }
-                }
-                beginTaskCommand(command, scope: scope)
+                beginTaskCommand(command, scope: taskCommandScope)
             }
             return
         }
@@ -1064,8 +1174,13 @@ struct AssistantSearch: View {
             if let task = statusTask(awaitingStatusForTask) ?? currentTask {
                 requestTaskStatus(target, for: task)
             } else {
-                append("Откройте карточку задачи или скажите «Перенеси задачу» и назовите её.")
+                append("Откройте карточку задачи или скажите «Перенеси задачу» и назовите её.", feedback: .question)
             }
+            return
+        }
+        if let prefix = normalized.range(of: #"^(?:открой|откройте|открыть)\s+(?:мне\s+)?проект(?:\s+|$)"#, options: .regularExpression) {
+            clearStatusRequest()
+            openNamedProject(String(normalized[prefix.upperBound...]))
             return
         }
         if let task = statusTask(awaitingStatusForTask) {
@@ -1076,9 +1191,7 @@ struct AssistantSearch: View {
             requestNamedStatus(normalized, fallbackTarget: pendingStatusTarget)
             return
         }
-        if let prefix = normalized.range(of: #"^(?:открой|откройте|открыть)\s+(?:мне\s+)?проект(?:\s+|$)"#, options: .regularExpression) {
-            openNamedProject(String(normalized[prefix.upperBound...]))
-        } else if choosingProject && projects.contains(where: { tokens($0.title) == tokens(text) }) {
+        if choosingProject && projects.contains(where: { tokens($0.title) == tokens(text) }) {
             openNamedProject(text)
         } else if !handleRefinement(text) {
             search(text)
@@ -1088,7 +1201,7 @@ struct AssistantSearch: View {
     private func search(_ text: String, readOnly: Bool = false) {
         let results = resultsForQuery(text)
         if semanticInterpretation && results.isEmpty && !results.recognized {
-            interpretRequest(text, readOnly: readOnly)
+            interpretRequest(text, readOnly: readOnly, searching: true)
         } else {
             showSearch(text)
         }
@@ -1097,10 +1210,18 @@ struct AssistantSearch: View {
     private func showSearch(_ text: String) {
         clearRefinements()
         searchQuery = text
-        append(searchResults.reply)
+        reportSearchResults()
     }
 
-    private func interpretRequest(_ text: String, followup: AssistantTaskUpdate? = nil, readOnly: Bool = false) {
+    private func reportSearchResults(prefix: String = "") {
+        let results = searchResults
+        let feedback: ValliState = results.ambiguousAssignees.isEmpty ? .done : .question
+        append(prefix + results.reply, feedback: feedback)
+    }
+
+    private func interpretRequest(_ text: String, followup: AssistantTaskUpdate? = nil,
+                                  readOnly: Bool = false, searching: Bool = false) {
+        interpretingSearch = searching
         let hasSearch = !searchQuery.isEmpty && !searchResults.projectListOnly
         let hasProject = currentProject != nil
         interpretation = Task {
@@ -1133,7 +1254,7 @@ struct AssistantSearch: View {
             clearRefinements()
             let filter = intent.filters ?? ""
             searchQuery = filter.contains("активн") || filter.contains("актуальн") ? "активные проекты" : "проекты"
-            append(searchResults.reply)
+            reportSearchResults()
         case .searchTasks, .refineTasks:
             applyTaskIntent(intent, title: title, request: text)
         case .updateTask:
@@ -1165,7 +1286,7 @@ struct AssistantSearch: View {
                 beginTaskCommand(command, scope: currentProject.map { .project($0.id) })
             }
         case .clarify:
-            append("Уточните, что показать, открыть или изменить.")
+            append("Уточните, что показать, открыть или изменить.", feedback: .question)
         }
     }
 
@@ -1236,7 +1357,7 @@ struct AssistantSearch: View {
             }
             refinedAssignee = person
         }
-        append(searchResults.reply)
+        reportSearchResults()
     }
 
     @ViewBuilder
@@ -1344,13 +1465,13 @@ struct AssistantSearch: View {
     private func applyAssignee(_ person: Person) {
         refinedAssignee = person
         refinement = nil
-        append("Исполнитель «" + person.name + "». " + searchResults.reply)
+        reportSearchResults(prefix: "Исполнитель «" + person.name + "». ")
     }
 
     private func applyProject(_ project: Project) {
         refinedProject = project
         refinement = nil
-        append("Проект «" + project.title + "». " + searchResults.reply)
+        reportSearchResults(prefix: "Проект «" + project.title + "». ")
     }
 
     private func applyDeadline(_ text: String) {
@@ -1361,7 +1482,7 @@ struct AssistantSearch: View {
         refinedDeadline = deadline
         refinedDeadlineLabel = text
         refinement = nil
-        append("Срок «" + text + "». " + searchResults.reply)
+        reportSearchResults(prefix: "Срок «" + text + "». ")
     }
 
     private func openNamedProject(_ name: String) {
@@ -1391,7 +1512,7 @@ struct AssistantSearch: View {
     private func showProject(_ project: Project) {
         projectChoices = []
         openProject(project.id)
-        append("Открыла проект «" + project.title + "».")
+        append("Открыла проект «" + project.title + "».", feedback: .done)
     }
 
     private func oneEditApart(_ first: String, _ second: String) -> Bool {
@@ -1416,9 +1537,18 @@ struct AssistantSearch: View {
             || (first.count >= 5 && second.count >= 5 && first.dropLast() == second.dropLast())
     }
 
+    private func glossarySearchFields(_ fields: [String?]) -> [String?] {
+        fields.map { field in field.map { glossary.expand(tokens($0)).joined(separator: " ") } }
+    }
+
+    private func glossaryTopicFields(_ fields: [String?]) -> [String?] {
+        fields + glossarySearchFields(fields) + fields.map { $0.flatMap { glossary.section(for: $0) } }
+    }
+
     private func matches(_ words: [String], in fields: [String?], tolerateTaskVariations: Bool = false) -> Bool {
-        let searchable = tokens(fields.compactMap { $0 }.joined(separator: " "))
-        return words.allSatisfy { word in
+        let searchable = tokens(fields.compactMap { $0 }.joined(separator: " ")) +
+            glossarySearchFields(fields).compactMap { $0 }.flatMap(tokens)
+        return glossary.expand(words).allSatisfy { word in
             searchable.contains { candidate in
                 similar(word, candidate) ||
                     (tolerateTaskVariations && AssistantTaskText.matchesVariation(word, candidate))

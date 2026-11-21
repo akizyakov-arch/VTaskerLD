@@ -304,4 +304,25 @@ class AIBudgetTests(unittest.TestCase):
   verified = g.verified_proposals(result, {'segments': history, 'project_materials': materials})
   self.assertEqual(verified['tasks'][0]['material_ids'], [1])
 
+ def test_company_glossary_sends_only_current_variants_and_preserves_the_quote(self):
+  glossary = [
+   {'term':'сотовый поликарбонат','variants':[{'text':'сотик'},{'text':'cellular polycarbonate'}]},
+   {'term':'запуск','variants':[{'text':'rollout'}]},
+  ]
+  segments = [{'id':1,'text':'Нужен сотик для стенда, в планах сотиковый узор'}]
+  packed = g.relevant_company_terms(glossary, segments)
+  self.assertEqual(packed, [{'term':'сотовый поликарбонат','variants':[{'text':'сотик'}]}])
+  self.assertEqual(g.expand_glossary(segments[0]['text'], g.glossary_index(packed)),
+                   'нужен сотовый поликарбонат для стенда в планах сотиковый узор')
+  self.assertEqual(segments[0]['text'], 'Нужен сотик для стенда, в планах сотиковый узор')
+
+ def test_industry_selects_terms_and_keeps_shared_sections(self):
+  segments = [{'id':1,'text':'Нужно выкатить на прод, принять скрытые работы и сверить смету.'}]
+  def titles(industry):
+   return {item['topic'] for item in g.meeting_topic_glossary(segments, industry)}
+  self.assertEqual(titles('it'), {'Релизы', 'Финансы'})
+  self.assertEqual(titles('construction'), {'Приёмка', 'Финансы'})
+  self.assertEqual(titles('universal'), {'Финансы'})
+  self.assertEqual(titles('decor'), {'Финансы'})
+
 if __name__=='__main__':unittest.main()

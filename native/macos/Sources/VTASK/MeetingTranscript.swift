@@ -3,6 +3,8 @@ import UniformTypeIdentifiers
 
 struct MeetingTranscript: View {
     @ObservedObject var model: WorkspaceModel
+    @Environment(\.companyGlossary) private var glossary
+    @Environment(\.meetingTopics) private var meetingTopics
     let meeting: Meeting
     @State private var transcript: Transcript?
     @State private var error: String?
@@ -27,7 +29,6 @@ struct MeetingTranscript: View {
         var text: String {
             segments.map { $0.text.trimmingCharacters(in: .whitespacesAndNewlines) }.joined(separator: " ")
         }
-        var topic: String { MeetingTopics.title(topic: nil, text: text) }
     }
 
     private enum SpeakerFilter: Hashable {
@@ -285,7 +286,7 @@ struct MeetingTranscript: View {
                 } else {
                     let flow = paragraphs(transcript.segments).filter { $0.segments.contains(where: includes) }
                     transcriptPage(rows: flow, pageSize: paragraphsPerPage, selectedPage: $readingPage,
-                                   topic: { $0.topic }, content: paragraphRow)
+                                   topic: { meetingTopics.title(topic: nil, text: $0.text, glossary: glossary) }, content: paragraphRow)
                 }
                 voiceMatching(transcript)
             } else {
@@ -346,7 +347,7 @@ struct MeetingTranscript: View {
     private func topicsBySegment(in transcript: Transcript) -> [Int: String] {
         guard order == .byTopic else { return [:] }
         return paragraphs(transcript.segments).reduce(into: [:]) { topics, paragraph in
-            let topic = paragraph.topic
+            let topic = meetingTopics.title(topic: nil, text: paragraph.text, glossary: glossary)
             for segment in paragraph.segments { topics[segment.id] = topic }
         }
     }

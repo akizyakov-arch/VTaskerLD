@@ -81,6 +81,31 @@ enum AssistantRequest {
     }
 }
 
+enum TaskCommandScope: Equatable {
+    case project(Int)
+    case unassigned
+
+    init?(projectID: Int?, task: TaskItem?) {
+        if let task {
+            self = task.projectId.map(Self.project) ?? .unassigned
+        } else if let projectID {
+            self = .project(projectID)
+        } else {
+            return nil
+        }
+    }
+
+    var projectID: Int? {
+        if case .project(let id) = self { return id }
+        return nil
+    }
+
+    static func tasks(_ tasks: [TaskItem], in scope: Self?) -> [TaskItem] {
+        guard let scope else { return tasks }
+        return tasks.filter { $0.projectId == scope.projectID }
+    }
+}
+
 enum AssistantTaskStatus {
     static func target(in text: String) -> String? {
         let text = AssistantRequest.normalize(text)
