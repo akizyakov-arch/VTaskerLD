@@ -109,6 +109,10 @@ struct Meeting: Decodable, Identifiable {
     let id: Int
     let scheduledAt: String?
     let title: String
+    let displayTitle: String?
+    let protocolTitle: String?
+    let meetingAt: String?
+    let projectName: String?
     let projectId: Int?
     let status: String
     let participants: [Int]
@@ -117,18 +121,35 @@ struct Meeting: Decodable, Identifiable {
     let manualNotes: MeetingNotes?
     let analysis: MeetingAnalysis?
 
+    var visibleTitle: String { displayTitle ?? title }
+
+    func meetingDateLabel(in zone: TimeZone) -> String? {
+        if let meetingAt {
+            let parser = ISO8601DateFormatter()
+            parser.formatOptions.insert(.withFractionalSeconds)
+            if let date = parser.date(from: meetingAt) ?? ISO8601DateFormatter().date(from: meetingAt) {
+                return formatMeetingDate(date, in: zone)
+            }
+        }
+        return scheduleLabel(in: zone)
+    }
+
     var scheduledDate: Date? {
         scheduledAt.flatMap { ISO8601DateFormatter().date(from: $0) }
     }
 
     func scheduleLabel(in zone: TimeZone) -> String? {
         guard let scheduledDate else { return nil }
+        return formatMeetingDate(scheduledDate, in: zone)
+    }
+
+    private func formatMeetingDate(_ date: Date, in zone: TimeZone) -> String {
         let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "ru_RU")
+        formatter.locale = .current
         formatter.timeZone = zone
         formatter.dateStyle = .medium
         formatter.timeStyle = .short
-        return formatter.string(from: scheduledDate)
+        return formatter.string(from: date)
     }
 }
 

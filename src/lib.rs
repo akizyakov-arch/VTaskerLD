@@ -104,9 +104,18 @@ impl Store {
         Ok(())
     }
     pub fn export(&self, id: i64) -> Result<Value> {
-        let meeting = self.0.query_row("SELECT title,status,created_at FROM meetings WHERE id=?1", [id], |r| {
-            Ok(json!({"id":id,"title":r.get::<_,String>(0)?,"status":r.get::<_,String>(1)?,"created_at":r.get::<_,String>(2)?}))
+        let mut meeting = self.0.query_row(
+            "SELECT m.title,m.status,m.created_at,m.scheduled_at,m.project_id,
+                (SELECT min(created_at) FROM capture_sources WHERE meeting_id=m.id),
+                json_extract(p.data_json,'$.title')
+             FROM meetings m LEFT JOIN projects p ON p.id=m.project_id WHERE m.id=?1", [id], |r| {
+            Ok(json!({"id":id,"title":r.get::<_,String>(0)?,"status":r.get::<_,String>(1)?,"created_at":r.get::<_,String>(2)?,
+                "scheduled_at":r.get::<_,Option<String>>(3)?,"project_id":r.get::<_,Option<i64>>(4)?,
+                "recorded_at":r.get::<_,Option<String>>(5)?,"project_name":r.get::<_,Option<String>>(6)?}))
         }).context("meeting not found")?;
+        let analysis = self.groq_analysis(id)?;
+        let timezone = self.workspace_timezone()?.parse().unwrap_or(chrono_tz::Europe::Moscow);
+        crate::groq::decorate_meeting_protocol(&mut meeting, &analysis, timezone);
         let timeline = self.audio_inputs(id)?;
         let mut transcript = self.transcript(id)?;
         if let Some(run) = transcript["model_run_id"].as_i64() {
@@ -120,7 +129,7 @@ impl Store {
                 json!(inputs.as_array().map_or(0, Vec::len) != timeline.len());
         }
         Ok(
-            json!({"audio_timeline":timeline,"schema_version":1,"meeting":meeting,"analysis":self.groq_analysis(id)?,"manual_notes":self.meeting_notes(id)?,"recordings":self.recordings(id)?,"fragments":self.fragments(id)?,"transcript":transcript,"live":self.live_snapshot(id)?}),
+            json!({"audio_timeline":timeline,"schema_version":1,"meeting":meeting,"analysis":analysis,"manual_notes":self.meeting_notes(id)?,"recordings":self.recordings(id)?,"fragments":self.fragments(id)?,"transcript":transcript,"live":self.live_snapshot(id)?}),
         )
     }
 }

@@ -202,6 +202,20 @@ final class WorkspaceModel: ObservableObject {
                        "revision": project.revision, "archived": archived])
     }
 
+    func transcribeAssistant(_ audio: Data, sampleRate: Int) async throws -> String {
+        struct Reply: Decodable { let text: String }
+        var url = baseURL.appendingPathComponent("api/assistant/transcribe")
+        url.append(queryItems: [URLQueryItem(name: "rate", value: String(sampleRate))])
+        var request = URLRequest(url: url, timeoutInterval: 35)
+        request.httpMethod = "POST"
+        request.setValue(baseURL.absoluteString, forHTTPHeaderField: "Origin")
+        request.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
+        request.httpBody = audio
+        let (data, response) = try await URLSession.shared.data(for: request)
+        try validateResponse(data, response)
+        return try decode(Reply.self, from: data).text
+    }
+
     func interpretAssistant(_ text: String, hasSearch: Bool, hasProject: Bool, hasTask: Bool,
                             followup: AssistantTaskUpdate?) async throws -> AssistantIntent {
         struct Reply: Decodable {

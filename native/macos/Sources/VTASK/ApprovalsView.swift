@@ -24,6 +24,7 @@ struct Proposal: Decodable, Identifiable {
     let proposed: Changes?
     var baseTask: Changes?
     var candidateTaskIds: [Int]?
+    var suggestedExistingTaskId: Int?
     var candidateBaselines: [CandidateBaseline]?
     var reviewDraft: ReviewDraft?
     var needsClarification: Bool?
@@ -55,6 +56,7 @@ struct Proposal: Decodable, Identifiable {
         let relatedProposalIds: [Int]?
         let applyDue: Bool?
         let applyAssignee: Bool?
+        let applyDescription: Bool?
         let confirmSeparateTask: Bool?
         let data: Fields
     }
@@ -76,7 +78,9 @@ struct Proposal: Decodable, Identifiable {
 
     var presentation: (title: String, icon: String) {
         switch kind {
-        case "create_task": return ("Новая задача", "plus.square")
+        case "create_task":
+            if suggestedExistingTaskId != nil { return ("Уточнение к задаче", "link") }
+            return ("Новая задача", "plus.square")
         case "change_task": return ("Изменение задачи", "arrow.left.arrow.right")
         case "change_due": return ("Изменение срока", "calendar")
         case "change_assignee": return ("Смена исполнителя", "person.crop.circle")
@@ -129,7 +133,14 @@ struct Decision: Decodable, Identifiable {
 }
 
 struct ApprovalsView: View {
-    struct ProjectList {
+    enum InspectedItem: Hashable, Identifiable {
+        case proposal(Int)
+        case decision(Int)
+
+        var id: Self { self }
+    }
+
+    struct ItemList {
         enum Kind: String, CaseIterable {
             case all = "Все"
             case tasks = "Задачи"
@@ -142,11 +153,13 @@ struct ApprovalsView: View {
             case pending = "На согласовании"
         }
 
-        let project: Project
+        let project: Project?
         let kind: Kind
         let status: Status
         let openTask: (Int) -> Void
         let openMeeting: (Int) -> Void
+        var acceptedTasks: [TaskItem]? = nil
+        var taskGrouping: String? = nil
 
         func includesDecision(_ isDecision: Bool) -> Bool {
             kind == .all || (kind == .decisions) == isDecision
@@ -202,7 +215,7 @@ struct ApprovalsView: View {
         func matches(_ terms: [Substring]) -> Bool {
             guard !terms.isEmpty else { return true }
             let text = [proposal.displayTitle, proposal.presentation.title, proposal.description, proposal.source?.quote,
-                        target?.title, project?.title, assignee?.speakerPickerName, meeting?.title]
+                        target?.title, project?.title, assignee?.speakerPickerName, meeting?.visibleTitle]
                 .compactMap { $0 }.joined(separator: " ")
             return terms.allSatisfy { text.localizedStandardContains(String($0)) }
         }
@@ -211,36 +224,107 @@ struct ApprovalsView: View {
     @Environment(\.colorScheme) private var scheme
     @ObservedObject var model: WorkspaceModel
     let workspace: Workspace
-    @Binding var editing: Proposal?
+    @Binding var inspectedItem: InspectedItem?
     @Binding var filters: Filters
-    var projectList: ProjectList? = nil
-    @State private var expanded: Set<Int> = []
+    let itemList: ItemList
+    @State private var markedTasks: Set<Int> = []
+    @State private var markedProposals: Set<Int> = []
+    @State private var confirmingBatchRejection = false
     @State private var prepared: [Int: [String: Any]] = [:]
     @State private var batchResult: String?
 
 
     var body: some View {
         let pending = pendingRows
-        let shown = filteredRows(pending).filter { row in
-            projectList?.status != .approved && (projectList?.includesDecision(row.proposal.kind == "decision") ?? true)
+        let showsApprovalFilters = itemList.project == nil && itemList.status == .pending
+        let shown = (showsApprovalFilters ? filteredRows(pending) : pending.filter {
+            $0.matches(filters.query.split(whereSeparator: \.isWhitespace))
+        }).filter { row in
+            itemList.status != .approved && itemList.includesDecision(row.proposal.kind == "decision")
         }
         let search = filters.query.trimmingCharacters(in: .whitespacesAndNewlines)
-        let acceptedTasks = projectTasks(matching: search)
-        let projectDecisions = projectList.map { list in
-            workspace.decisions.filter { $0.projectId == list.project.id }
-        } ?? []
-        let shownDecisions = projectDecisions.filter { decision in
-            guard let projectList, projectList.status != .pending, projectList.includesDecision(true) else { return false }
-            return (projectList.status == .all || decision.active) &&
+        let acceptedTasks = matchingTasks(search)
+        let decisions = workspace.decisions.filter { decision in
+            if let project = itemList.project { return decision.projectId == project.id }
+            return !workspace.projects.contains { $0.id == decision.projectId && $0.archived == true }
+        }
+        let shownDecisions = decisions.filter { decision in
+            guard itemList.status != .pending, itemList.includesDecision(true) else { return false }
+            return (itemList.status == .all || decision.active) &&
                 (search.isEmpty || decision.text.localizedStandardContains(search) ||
                     decision.reason?.localizedStandardContains(search) == true)
         }
+        HStack(spacing: 0) {
+            proposalList(pending: pending, shown: shown, acceptedTasks: acceptedTasks,
+                         shownDecisions: shownDecisions,
+                         showsApprovalFilters: showsApprovalFilters)
+            switch inspectedItem {
+            case .proposal(let id):
+                if let proposal = pending.first(where: { $0.id == id })?.proposal {
+                    inspectorPanel(proposal.presentation.title) {
+                        ProposalEditor(model: model, workspace: workspace, proposal: proposal, prepare: { payload in
+                            prepared[proposal.id] = payload
+                            markedTasks.removeAll()
+                            markedProposals.insert(proposal.id)
+                            batchResult = nil
+                        }, closePanel: { inspectedItem = nil })
+                        .id(proposal.id)
+                    }
+                }
+            case .decision(let id):
+                if let decision = decisions.first(where: { $0.id == id }) {
+                    inspectorPanel("Решение") {
+                        ProjectDecisionDetails(model: model, workspace: workspace, decision: decision,
+                                               prior: decisions.first { $0.id == decision.supersedesId },
+                                               openMeeting: itemList.openMeeting, openTask: itemList.openTask)
+                            .id(decision.id)
+                    }
+                }
+            case nil:
+                EmptyView()
+            }
+        }
+        .onChange(of: acceptedTasks.map(\.id)) { ids in markedTasks.formIntersection(ids) }
+        .onChange(of: shown.map(\.id)) { ids in markedProposals.formIntersection(ids) }
+        .onChange(of: pending.map(\.id)) { ids in
+            prepared = prepared.filter { ids.contains($0.key) }
+            if case .proposal(let id) = inspectedItem, !ids.contains(id) { inspectedItem = nil }
+        }
+        .onChange(of: decisions.map(\.id)) { ids in
+            if case .decision(let id) = inspectedItem, !ids.contains(id) { inspectedItem = nil }
+        }
+    }
+
+    private func inspectorPanel<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
+        let palette = PanelPalette(dark: scheme == .dark)
+        return HStack(spacing: 0) {
+            Divider()
+            VStack(spacing: 0) {
+                HStack {
+                    WindowCloseButton(label: "Закрыть карточку") { inspectedItem = nil }
+                    Text(title).font(.headline).accessibilityAddTraits(.isHeader)
+                    Spacer()
+                }
+                .padding(10)
+                .disabled(model.saving)
+                Divider()
+                content()
+                    .background(palette.background)
+            }
+            .frame(minWidth: 290, idealWidth: 350, maxWidth: 410)
+            .background(palette.surface)
+        }
+    }
+
+    private func proposalList(pending: [Row], shown: [Row], acceptedTasks: [TaskItem],
+                              shownDecisions: [Decision],
+                              showsApprovalFilters: Bool) -> some View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 10) {
-                if projectList != nil {
-                    PanelSearchField(placeholder: "Поиск по задачам и решениям", query: $filters.query)
-                } else {
+                if showsApprovalFilters {
                     listControls(pending, count: shown.count).padding(.bottom, 4)
+                } else {
+                    PanelSearchField(placeholder: "Поиск по задачам и решениям", query: $filters.query)
                 }
                 if let error = model.error {
                     Label(error, systemImage: "exclamationmark.circle")
@@ -248,86 +332,70 @@ struct ApprovalsView: View {
                         .panelCard()
                 }
                 if shown.isEmpty && acceptedTasks.isEmpty && shownDecisions.isEmpty {
-                    Label(projectList != nil ? "По выбранным фильтрам ничего нет" :
-                            pending.isEmpty ? "Нет предложений на подтверждение" : "Предложения не найдены",
+                    Label("По выбранным фильтрам ничего нет",
                           systemImage: pending.isEmpty ? "tray" : "magnifyingglass")
                         .foregroundStyle(.secondary)
                         .panelCard()
                 }
                 if let batchResult { Text(batchResult).foregroundStyle(.secondary) }
-                let selected = shown.filter { prepared[$0.id] != nil }
-                if !selected.isEmpty {
-                    let decisionsInBatch = selected.filter { $0.proposal.kind == "decision" }
-                    let canLink = selected.count > 1 && decisionsInBatch.count == 1 &&
-                        selected.allSatisfy { $0.meeting?.id == decisionsInBatch[0].meeting?.id &&
-                            $0.project?.id == decisionsInBatch[0].project?.id }
-                    HStack {
-                        Text("К применению: \(selected.count)")
-                        Spacer()
-                        Button(canLink ? "Утвердить решение и правки" : "Применить выбранные") {
-                            let items = selected.compactMap { prepared[$0.id] }
-                            Task {
-                                if await model.command(["op": "review_batch", "items": items, "associate_decision": canLink]) {
-                                    batchResult = "Применено предложений: \(items.count)"
-                                }
-                            }
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .disabled(model.saving || selected.count > 100)
-                    }
-                    .panelCard()
+                if itemList.status != .pending && itemList.includesDecision(false) {
+                    approvedRows(acceptedTasks)
                 }
-                if let projectList {
-                    ForEach(acceptedTasks) { task in
-                        acceptedTaskRow(task, open: projectList.openTask)
-                    }
-                    ForEach(shownDecisions) { decision in
-                        ProjectDecisionCard(model: model, workspace: workspace, decision: decision,
-                                            prior: projectDecisions.first { $0.id == decision.supersedesId },
-                                            openMeeting: projectList.openMeeting, openTask: projectList.openTask)
-                    }
-                    ForEach(shown, content: proposalCard)
-                } else {
-                    let groups = Dictionary(grouping: shown) { $0.project?.id }
-                    let groupIDs = shown.map { $0.project?.id }.reduce(into: [Int?]()) { ids, id in
-                        if !ids.contains(id) { ids.append(id) }
-                    }
-                    ForEach(groupIDs, id: \.self) { id in
-                        if let rows = groups[id] {
-                            Text(rows.first?.project?.title ?? "Без проекта")
-                                .font(.headline).accessibilityAddTraits(.isHeader)
-                                .padding(.top, 8)
-                            ForEach(rows, content: proposalCard)
-                        }
-                    }
-                    decisions.padding(.top, 6)
-                    archivedDrafts
-                }
+                ForEach(shownDecisions, content: decisionRow)
+                ForEach(shown, content: proposalCard)
+                if itemList.project == nil && itemList.status != .approved { archivedDrafts }
             }
             .padding(24)
             .frame(maxWidth: 860)
             .frame(maxWidth: .infinity)
         }
-        .onChange(of: pending.map(\.id)) { ids in
-            expanded.formIntersection(ids)
-            prepared = prepared.filter { ids.contains($0.key) }
-        }
-        .sheet(item: $editing) { proposal in
-            ProposalEditor(model: model, workspace: workspace, proposal: proposal, prepare: { payload in
-                prepared[proposal.id] = payload
-                batchResult = nil
-            })
-                .sheetCloseButton(disabled: model.saving)
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            let selected = shown.filter { markedProposals.contains($0.id) }
+            if !selected.isEmpty {
+                proposalBatchBar(selected)
+                    .frame(maxWidth: 812)
+                    .padding(.horizontal, 24)
+                    .padding(.vertical, 8)
+                    .frame(maxWidth: .infinity)
+                    .background(.regularMaterial)
+            } else if itemList.status != .pending && itemList.includesDecision(false) &&
+                (!markedTasks.isEmpty || model.lastBatchID != nil) {
+                TaskBatchBar(model: model, workspace: workspace, tasks: acceptedTasks, selection: $markedTasks)
+                    .frame(maxWidth: 812)
+                    .padding(.horizontal, 24)
+                    .padding(.vertical, 8)
+                    .frame(maxWidth: .infinity)
+                    .background(.regularMaterial)
+            }
         }
     }
 
-    private func projectTasks(matching search: String) -> [TaskItem] {
-        guard let projectList, projectList.project.archived != true,
-              projectList.status != .pending, projectList.includesDecision(false) else { return [] }
-        return workspace.visibleTasks.filter { task in
-            task.projectId == projectList.project.id &&
+    private func matchingTasks(_ search: String) -> [TaskItem] {
+        guard itemList.project?.archived != true,
+              itemList.status != .pending, itemList.includesDecision(false) else { return [] }
+        return (itemList.acceptedTasks ?? workspace.visibleTasks).filter { task in
+            (itemList.project == nil || task.projectId == itemList.project?.id) &&
                 (search.isEmpty || task.title.localizedStandardContains(search) ||
                     task.description?.localizedStandardContains(search) == true)
+        }
+    }
+
+    @ViewBuilder
+    private func approvedRows(_ tasks: [TaskItem]) -> some View {
+        if let grouping = itemList.taskGrouping, ["project", "assignee", "stage"].contains(grouping) {
+            let groups = Dictionary(grouping: tasks) { task in
+                switch grouping {
+                case "project": return workspace.projects.first { $0.id == task.projectId }?.title ?? "Без проекта"
+                case "assignee": return workspace.people.first { $0.id == task.assigneeId }?.name ?? "Без исполнителя"
+                default: return task.stageTitle
+                }
+            }
+            ForEach(groups.keys.sorted(), id: \.self) { group in
+                Text(group).font(.headline).accessibilityAddTraits(.isHeader)
+                ForEach(groups[group] ?? []) { task in acceptedTaskRow(task, open: itemList.openTask) }
+            }
+        } else {
+            ForEach(tasks) { task in acceptedTaskRow(task, open: itemList.openTask) }
         }
     }
 
@@ -335,27 +403,38 @@ struct ApprovalsView: View {
         let palette = PanelPalette(dark: scheme == .dark)
         let assignee = workspace.people.first { $0.id == task.assigneeId }?.speakerPickerName
         let due = task.dueDate.map { [ProjectDateField.display($0), task.dueTime].compactMap { $0 }.joined(separator: " ") }
-        return Button { open(task.id) } label: {
-            HStack(spacing: 10) {
-                Image(systemName: "checklist")
-                    .foregroundStyle(palette.selectedInk)
-                    .frame(width: 34, height: 34)
-                    .background(palette.selected, in: RoundedRectangle(cornerRadius: 8))
-                    .accessibilityHidden(true)
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(task.title).font(.headline)
-                        .foregroundStyle(task.overdue ? palette.recordingInk : palette.text)
-                    Text(["Задача · Согласовано", task.stageTitle, assignee ?? "Без исполнителя", due ?? "Без срока"]
-                        .compactMap { $0 }.joined(separator: " · "))
-                        .font(.caption).foregroundStyle(.secondary)
+        let marked = markedTasks.contains(task.id)
+        return HStack(spacing: 10) {
+            selectionButton(title: task.title, marked: marked, palette: palette) {
+                if marked { markedTasks.remove(task.id) }
+                else {
+                    markedProposals.removeAll()
+                    markedTasks.insert(task.id)
                 }
-                Spacer(minLength: 8)
-                Image(systemName: "chevron.right").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .contentShape(Rectangle())
+            Button { open(task.id) } label: {
+                HStack(spacing: 10) {
+                    Image(systemName: "checklist")
+                        .foregroundStyle(palette.selectedInk)
+                        .frame(width: 34, height: 34)
+                        .background(palette.selected, in: RoundedRectangle(cornerRadius: 8))
+                        .accessibilityHidden(true)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(task.title).font(.headline)
+                            .foregroundStyle(task.overdue ? palette.recordingInk : palette.text)
+                        let projectName = itemList.project == nil ? workspace.projects.first { $0.id == task.projectId }?.title : nil
+                        Text(["Задача · Согласовано", projectName, task.stageTitle, assignee ?? "Без исполнителя", due ?? "Без срока"]
+                            .compactMap { $0 }.joined(separator: " · "))
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    Spacer(minLength: 8)
+                    Image(systemName: "chevron.right").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
         }
-        .buttonStyle(.plain)
         .panelCard()
     }
 
@@ -365,9 +444,9 @@ struct ApprovalsView: View {
         let people = Dictionary(uniqueKeysWithValues: workspace.people.map { ($0.id, $0) })
         let meetings = Dictionary(uniqueKeysWithValues: workspace.meetings.map { ($0.id, $0) })
         return workspace.proposals.filter { $0.status == "pending" }.compactMap { proposal in
-            let target = proposal.taskId.flatMap { tasks[$0] }
+            let target = (proposal.taskId ?? proposal.suggestedExistingTaskId).flatMap { tasks[$0] }
             let projectID = target?.projectId ?? proposal.projectId
-            if let projectList, projectID != projectList.project.id { return nil }
+            if let project = itemList.project, projectID != project.id { return nil }
             let assigneeID = proposal.editsAssignee || proposal.reviewDraft != nil
                 ? proposal.reviewAssigneeId : (proposal.assigneeId ?? target?.assigneeId)
             return Row(proposal: proposal, target: target, project: projectID.flatMap { projects[$0] },
@@ -499,135 +578,141 @@ struct ApprovalsView: View {
         }
     }
 
-    private func proposalCard(_ row: Row) -> some View {
-        let proposal = row.proposal
-        let open = expanded.contains(proposal.id)
-        let kind = proposal.presentation
-        let subtitle = [proposal.displayTitle == kind.title && projectList == nil ? nil : kind.title,
-                        projectList == nil ? row.project?.title : "На согласовании"]
-            .compactMap { $0 }.joined(separator: " · ")
-        let palette = PanelPalette(dark: scheme == .dark)
-        return VStack(alignment: .leading, spacing: 12) {
-            HStack(spacing: 12) {
-                Button {
-                    if open { expanded.remove(proposal.id) }
-                    else { expanded.insert(proposal.id) }
-                } label: {
-                    HStack(spacing: 10) {
-                        Image(systemName: open ? "chevron.down" : "chevron.right")
-                            .font(.caption.weight(.semibold))
-                            .foregroundStyle(.secondary)
-                            .frame(width: 12)
-                            .accessibilityHidden(true)
-                        Image(systemName: kind.icon)
-                            .foregroundStyle(palette.selectedInk)
-                            .frame(width: 34, height: 34)
-                            .background(palette.selected, in: RoundedRectangle(cornerRadius: 8))
-                            .accessibilityHidden(true)
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text(proposal.displayTitle)
-                                .font(.headline)
-                                .lineLimit(open ? nil : 2)
-                            if !subtitle.isEmpty {
-                                Text(subtitle)
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                                    .lineLimit(1)
-                            }
-                        }
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                    }
-                    .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .accessibilityValue(open ? "Развёрнуто" : "Свёрнуто")
-                if prepared[proposal.id] != nil {
-                    Button { prepared.removeValue(forKey: proposal.id) } label: {
-                        Label("Убрать из пакета", systemImage: "checkmark.circle.fill")
-                            .labelStyle(.iconOnly)
-                    }
-                    .help("Убрать из пакета")
-                    .disabled(model.saving)
-                }
-                Button("Проверить") { editing = proposal }
-                    .buttonStyle(.bordered)
-                    .disabled(model.saving || model.loading)
+    private func selectionButton(title: String, marked: Bool, palette: PanelPalette,
+                                 action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: marked ? "checkmark.circle.fill" : "circle")
+                .foregroundStyle(marked ? palette.accent : palette.muted)
+                .frame(width: 24, height: 28)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel((marked ? "Снять выбор: " : "Выбрать: ") + title)
+        .accessibilityAddTraits(marked ? .isSelected : [])
+        .disabled(model.saving || model.loading)
+    }
+
+    private func proposalBatchBar(_ selected: [Row]) -> some View {
+        let ready = selected.compactMap { prepared[$0.id] }
+        let next = selected.first { prepared[$0.id] == nil }
+        let decisions = selected.filter { $0.proposal.kind == "decision" }
+        let canLink = selected.count > 1 && decisions.count == 1 &&
+            selected.allSatisfy { $0.meeting?.id == decisions[0].meeting?.id && $0.project?.id == decisions[0].project?.id }
+        return HStack(spacing: 10) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text("Выбрано: \(selected.count)").font(.callout.weight(.medium)).monospacedDigit()
+                Text(selected.count > 100 ? "До 100 предложений за раз" : "Проверено: \(ready.count) из \(selected.count)")
+                    .font(.caption).foregroundStyle(.secondary)
             }
-            if open {
-                Divider()
-                details(proposal, target: row.target, meeting: row.meeting)
-                HStack {
-                    Spacer()
-                    Button("Отклонить", role: .destructive) {
-                        Task { await model.command(["op": "review", "id": proposal.id, "reject": true]) }
-                    }
-                    .buttonStyle(.bordered)
-                    .disabled(model.saving || model.loading)
+            Menu {
+                if let next {
+                    Button("Проверить следующее") { inspectedItem = .proposal(next.id) }
                 }
+                Button(canLink ? "Утвердить решение и правки" : "Согласовать выбранные") {
+                    applyProposalBatch(ready, associateDecision: canLink, rejected: false)
+                }
+                .disabled(next != nil || selected.count > 100)
+                Button("Отклонить выбранные", role: .destructive) { confirmingBatchRejection = true }
+                    .disabled(selected.count > 100)
+            } label: {
+                Label("Действия", systemImage: "ellipsis.circle")
+            }
+            .disabled(model.saving || model.loading)
+            Button("Снять выбор") { markedProposals.removeAll() }.buttonStyle(.link)
+            Spacer(minLength: 4)
+        }
+        .panelCard(inset: 10)
+        .confirmationDialog("Отклонить выбранные предложения?", isPresented: $confirmingBatchRejection) {
+            Button("Отклонить \(selected.count)", role: .destructive) {
+                applyProposalBatch(selected.map { ["id": $0.id, "reject": true] },
+                                   associateDecision: false, rejected: true)
+            }
+            Button("Отмена", role: .cancel) {}
+        }
+    }
+
+    private func applyProposalBatch(_ items: [[String: Any]], associateDecision: Bool, rejected: Bool) {
+        Task {
+            if await model.command(["op": "review_batch", "items": items, "associate_decision": associateDecision]) {
+                markedProposals.removeAll()
+                batchResult = rejected ? "Отклонено предложений: \(items.count)" : "Применено предложений: \(items.count)"
             }
         }
+    }
+
+    private func decisionRow(_ decision: Decision) -> some View {
+        let palette = PanelPalette(dark: scheme == .dark)
+        let projectName = itemList.project == nil
+            ? workspace.projects.first { $0.id == decision.projectId }?.title : nil
+        return Button { inspectedItem = .decision(decision.id) } label: {
+            HStack(spacing: 10) {
+                Image(systemName: "checkmark.seal")
+                    .foregroundStyle(palette.selectedInk)
+                    .frame(width: 34, height: 34)
+                    .background(palette.selected, in: RoundedRectangle(cornerRadius: 8))
+                    .accessibilityHidden(true)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(decision.text).font(.headline).lineLimit(2)
+                    Text(["Решение", decision.active ? "Согласовано" : decision.statusLabel, projectName]
+                        .compactMap { $0 }.joined(separator: " · "))
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                Spacer(minLength: 8)
+                Image(systemName: "chevron.right").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                    .accessibilityHidden(true)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(model.saving)
+        .accessibilityAddTraits(inspectedItem == .decision(decision.id) ? .isSelected : [])
         .panelCard()
     }
 
-    @ViewBuilder
-    private func details(_ proposal: Proposal, target: TaskItem?, meeting: Meeting?) -> some View {
-        if let description = proposal.description, !description.isEmpty {
-            Text(description).textSelection(.enabled)
-        }
-        if proposal.kind == "create_task" {
-            if let person = workspace.people.first(where: { $0.id == proposal.reviewAssigneeId }) {
-                LabeledContent("Исполнитель", value: person.name)
+    private func proposalCard(_ row: Row) -> some View {
+        let proposal = row.proposal
+        let kind = proposal.presentation
+        let subtitle = [proposal.displayTitle == kind.title ? nil : kind.title,
+                        itemList.project == nil ? row.project?.title : nil, "На согласовании"]
+            .compactMap { $0 }.joined(separator: " · ")
+        let palette = PanelPalette(dark: scheme == .dark)
+        let marked = markedProposals.contains(proposal.id)
+        return HStack(spacing: 10) {
+            selectionButton(title: proposal.displayTitle, marked: marked, palette: palette) {
+                if marked { markedProposals.remove(proposal.id) }
+                else {
+                    markedTasks.removeAll()
+                    markedProposals.insert(proposal.id)
+                }
             }
-            if let date = proposal.reviewDeadline.date {
-                LabeledContent("Срок", value: [date, proposal.reviewDeadline.time].compactMap { $0 }.joined(separator: " "))
-            }
-        }
-        if let target, let change = proposal.proposed {
-            LabeledContent("Задача", value: target.title)
-            switch proposal.kind {
-            case "change_task":
-                LabeledContent("Срок", value: [change.dueDate, change.dueTime].compactMap { $0 }.joined(separator: " "))
-                LabeledContent("Исполнитель", value: workspace.people.first { $0.id == change.assigneeId }?.name ?? "Уточнить")
-            case "change_due":
-                LabeledContent("Новый срок", value: change.dueDate.map { [$0, change.dueTime].compactMap { $0 }.joined(separator: " ") } ?? "Без срока")
-            case "change_assignee":
-                let assignee = workspace.people.first { $0.id == change.assigneeId }
-                LabeledContent("Новый исполнитель", value: assignee?.name ?? "Без исполнителя")
-            case "change_blocked":
-                LabeledContent("Блокировка", value: change.blocked == true ? change.blockedReason ?? "Установлена" : "Снять")
-            case "change_status":
-                LabeledContent("Новый статус", value: stages(for: target.projectId).first { $0.id == change.stageId }?.title ?? "Неизвестный статус")
-            default: EmptyView()
-            }
-        }
-        if let quote = proposal.source?.quote, !quote.isEmpty {
-            VStack(alignment: .leading, spacing: 6) {
-                let time = proposal.source?.startMs.map(meetingTime)
-                Label([meeting?.title ?? "Фрагмент протокола", time].compactMap { $0 }.joined(separator: " · "),
-                      systemImage: "text.quote")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
-                Text(quote).textSelection(.enabled)
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(12)
-            .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 8))
-        }
-    }
-
-    private var decisions: some View {
-        MeetingDisclosure(title: "История решений", icon: "checkmark.seal", count: workspace.decisions.count) {
-            if workspace.decisions.isEmpty {
-                Text("Подтверждённых решений пока нет.").foregroundStyle(.secondary)
-            }
-            ForEach(workspace.decisions) { decision in
-                VStack(alignment: .leading) {
-                    Text(decision.text).textSelection(.enabled)
-                    Text(decision.statusLabel).font(.caption).foregroundStyle(.secondary)
+            Button { inspectedItem = .proposal(proposal.id) } label: {
+                HStack(spacing: 10) {
+                    Image(systemName: kind.icon)
+                        .foregroundStyle(palette.selectedInk)
+                        .frame(width: 34, height: 34)
+                        .background(palette.selected, in: RoundedRectangle(cornerRadius: 8))
+                        .accessibilityHidden(true)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(proposal.displayTitle).font(.headline).lineLimit(2)
+                        Text(subtitle).font(.caption).foregroundStyle(.secondary)
+                    }
+                    Spacer(minLength: 8)
+                    if prepared[proposal.id] != nil {
+                        Image(systemName: "checkmark.seal").foregroundStyle(palette.accent)
+                            .help("Готово к согласованию")
+                            .accessibilityLabel("Готово к согласованию")
+                    }
+                    Image(systemName: "chevron.right").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
             }
+            .buttonStyle(.plain)
+            .disabled(model.saving || model.loading)
+            .accessibilityAddTraits(inspectedItem == .proposal(proposal.id) ? .isSelected : [])
         }
+        .panelCard()
     }
 
     @ViewBuilder
@@ -660,10 +745,6 @@ struct ApprovalsView: View {
         }
     }
 
-    private func stages(for projectID: Int?) -> [Stage] {
-        workspace.projects.first { $0.id == projectID }?.stages ?? workspace.defaultStages
-    }
-
 }
 
 struct ProposalEditor: View {
@@ -674,6 +755,7 @@ struct ProposalEditor: View {
     let proposal: Proposal
     let fromMeeting: Bool
     let prepare: (([String: Any]) -> Void)?
+    let closePanel: (() -> Void)?
     @State private var confirmingRejection = false
 
     @State private var title: String
@@ -686,6 +768,7 @@ struct ProposalEditor: View {
     @State private var stageID: String
     @State private var applyDue = false
     @State private var applyAssignee = false
+    @State private var applyDescription = false
     @State private var createSeparateTask = false
     @State private var confirmUnassigned = false
     @State private var acknowledgeTaskConflict = false
@@ -701,18 +784,22 @@ struct ProposalEditor: View {
     @State private var relatedTaskID: Int?
 
     init(model: WorkspaceModel, workspace: Workspace, proposal: Proposal, fromMeeting: Bool = false,
-         prepare: (([String: Any]) -> Void)? = nil) {
+         prepare: (([String: Any]) -> Void)? = nil, closePanel: (() -> Void)? = nil) {
         self.model = model
         self.workspace = workspace
         self.proposal = proposal
         self.fromMeeting = fromMeeting
         self.prepare = prepare
+        self.closePanel = closePanel
         _blocked = State(initialValue: proposal.proposed?.blocked ?? true)
         _blockedReason = State(initialValue: proposal.proposed?.blockedReason ?? "")
         _title = State(initialValue: proposal.title ?? "")
         _description = State(initialValue: proposal.description ?? "")
         _projectID = State(initialValue: proposal.projectId)
-        _taskID = State(initialValue: workspace.visibleTasks.first { $0.id == proposal.taskId }?.id)
+        let proposedTarget = proposal.taskId ?? proposal.suggestedExistingTaskId
+        _taskID = State(initialValue: workspace.visibleTasks.first { $0.id == proposedTarget }?.id)
+        _applyDescription = State(initialValue: proposal.suggestedExistingTaskId != nil &&
+                                  proposal.description?.isEmpty == false)
         _assigneeID = State(initialValue: proposal.editsAssignee ? proposal.proposed?.assigneeId : proposal.assigneeId)
         _dueDate = State(initialValue: (proposal.editsDeadline ? proposal.proposed?.dueDate : proposal.dueDate) ?? "")
         _dueTime = State(initialValue: (proposal.editsDeadline ? proposal.proposed?.dueTime : proposal.dueTime) ?? "")
@@ -729,6 +816,7 @@ struct ProposalEditor: View {
             _taskID = State(initialValue: workspace.visibleTasks.first { $0.id == draft.existingTaskId }?.id)
             _applyDue = State(initialValue: draft.applyDue ?? false)
             _applyAssignee = State(initialValue: draft.applyAssignee ?? false)
+            _applyDescription = State(initialValue: draft.applyDescription ?? false)
             _createSeparateTask = State(initialValue: draft.confirmSeparateTask ?? false)
             _relatedIDs = State(initialValue: Set(draft.relatedProposalIds ?? []))
             _assigneeID = State(initialValue: fields.assigneeId)
@@ -947,12 +1035,14 @@ struct ProposalEditor: View {
     var body: some View {
         let palette = PanelPalette(dark: scheme == .dark)
         VStack(alignment: .leading, spacing: 0) {
-            Label(proposal.presentation.title, systemImage: proposal.presentation.icon)
-                .font(.title3.bold())
-                .accessibilityAddTraits(.isHeader)
-                .padding(.horizontal, 20)
-                .padding(.vertical, 16)
-            Divider()
+            if closePanel == nil {
+                Label(proposal.presentation.title, systemImage: proposal.presentation.icon)
+                    .font(.title3.bold())
+                    .accessibilityAddTraits(.isHeader)
+                    .padding(.horizontal, 20)
+                    .padding(.vertical, 16)
+                Divider()
+            }
             fields
             Divider()
             actions
@@ -961,7 +1051,7 @@ struct ProposalEditor: View {
                 .background(palette.surface)
         }
         .background(palette.background)
-        .frame(width: 560, height: 540)
+        .frame(width: closePanel == nil ? 560 : nil, height: closePanel == nil ? 540 : nil)
         .disabled(model.saving)
         .interactiveDismissDisabled(model.saving)
         .sheet(isPresented: $showingSource) {
@@ -975,7 +1065,7 @@ struct ProposalEditor: View {
             Button("Отклонить", role: .destructive) {
                 Task {
                     if await model.command(["op": "review", "id": proposal.id, "reject": true]) {
-                        dismiss()
+                        close()
                     }
                 }
             }
@@ -1005,7 +1095,7 @@ struct ProposalEditor: View {
             if let quote = proposal.source?.quote, !quote.isEmpty {
                 Section("Фрагмент протокола") {
                     if let meeting = workspace.meetings.first(where: { $0.id == proposal.source?.meetingId }) {
-                        Label([meeting.title, proposal.source?.startMs.map(meetingTime)].compactMap { $0 }.joined(separator: " · "),
+                        Label([meeting.visibleTitle, proposal.source?.startMs.map(meetingTime)].compactMap { $0 }.joined(separator: " · "),
                               systemImage: "video")
                             .foregroundStyle(.secondary)
                         let times = proposal.source?.segmentTimesMs ?? [proposal.source?.startMs].compactMap { $0 }
@@ -1044,6 +1134,7 @@ struct ProposalEditor: View {
                     acknowledgeTaskConflict = false
                     applyDue = false
                     applyAssignee = false
+                    applyDescription = taskID != nil && taskID == proposal.suggestedExistingTaskId && !description.isEmpty
                     relatedIDs.removeAll()
                     resetStageIfNeeded()
                 }
@@ -1091,6 +1182,14 @@ struct ProposalEditor: View {
                 }
             }
             if createsTask && target != nil {
+                if taskID == proposal.suggestedExistingTaskId {
+                    Section("Уточнение к задаче") {
+                        Toggle("Добавить детали в описание", isOn: $applyDescription)
+                        if applyDescription {
+                            TextField("Дополнение", text: $description, axis: .vertical)
+                        }
+                    }
+                }
                 Toggle("Изменить срок существующей задачи", isOn: $applyDue)
                 Toggle("Назначить исполнителя существующей задачи", isOn: $applyAssignee)
             }
@@ -1140,33 +1239,55 @@ struct ProposalEditor: View {
             if let error = model.error {
                 Label(error, systemImage: "exclamationmark.circle").foregroundStyle(.red)
             }
-            HStack {
-                if fromMeeting && proposal.id != 0 {
-                    Button("Отклонить", role: .destructive) { confirmingRejection = true }
+            if closePanel != nil {
+                HStack {
+                    rejectButton
+                    Spacer()
+                    confirmButton
                 }
-                Spacer()
-                Button(fromMeeting ? "К совещанию" : "Отмена", role: .cancel) { dismiss() }
-                if proposal.id != 0 {
-                    Button(prepare == nil ? "Сохранить черновик" : "В пакет") {
-                        let draft = payload
-                        Task {
-                            if await model.command(["op": "save_review_draft", "id": proposal.id, "draft": draft]) {
-                                if canConfirm { prepare?(draft) }
-                                dismiss()
-                            }
-                        }
-                    }
-                    .disabled(prepare != nil && !canConfirm)
+                draftButton.frame(maxWidth: .infinity, alignment: .trailing)
+            } else {
+                HStack {
+                    if fromMeeting && proposal.id != 0 { rejectButton }
+                    Spacer()
+                    Button(fromMeeting ? "К совещанию" : "Отмена", role: .cancel, action: close)
+                    if proposal.id != 0 { draftButton }
+                    confirmButton
                 }
-                Button(proposal.id == 0 ? "Отправить на подтверждение" : "Подтвердить") {
-                    Task { if await model.command(payload) { dismiss() } }
-                }
-                .buttonStyle(.borderedProminent)
-                .keyboardShortcut(.defaultAction)
-                .disabled(!canConfirm)
             }
-            .buttonStyle(.bordered)
         }
+        .buttonStyle(.bordered)
+    }
+
+    private var rejectButton: some View {
+        Button("Отклонить", role: .destructive) { confirmingRejection = true }
+    }
+
+    private var draftButton: some View {
+        Button(prepare == nil ? "Сохранить черновик" : "Готово к согласованию") {
+            let draft = payload
+            Task {
+                if await model.command(["op": "save_review_draft", "id": proposal.id, "draft": draft]) {
+                    if canConfirm { prepare?(draft) }
+                    close()
+                }
+            }
+        }
+        .disabled(prepare != nil && !canConfirm)
+    }
+
+    private var confirmButton: some View {
+        Button(proposal.id == 0 ? "Отправить на подтверждение" : "Подтвердить") {
+            Task { if await model.command(payload) { close() } }
+        }
+        .buttonStyle(.borderedProminent)
+        .keyboardShortcut(closePanel == nil ? .defaultAction : nil)
+        .disabled(!canConfirm)
+    }
+
+    private func close() {
+        if let closePanel { closePanel() }
+        else { dismiss() }
     }
 
     private var canConfirm: Bool {
@@ -1234,6 +1355,7 @@ struct ProposalEditor: View {
             request["task_revision"] = target.revision
             request["apply_due"] = applyDue
             if applyAssignee { request["apply_assignee"] = true }
+            if createsTask && applyDescription { request["apply_description"] = true }
             if taskConflict { request["acknowledge_task_conflict"] = acknowledgeTaskConflict }
         }
         return request

@@ -4,7 +4,7 @@ use anyhow::{bail, Result};
 use serde_json::{json, Value};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
 
 /// The web process supervises a worker subprocess; inference never runs in HTTP handlers.
@@ -28,14 +28,12 @@ impl Default for SpeechWorker {
 }
 impl SpeechWorker {
     pub(crate) fn config(&self) -> Result<SpeechConfig> {
-        let mut config = SpeechConfig::from_env_with_speaker_detection(self.speaker_detection_enabled())?;
-        if let Some(path) = self.settings["local_model"]
-            .as_str()
-            .filter(|v| !v.is_empty())
-        {
-            config.model = PathBuf::from(path);
-        }
-        Ok(config)
+        self.local_config(self.speaker_detection_enabled())
+    }
+
+    pub(crate) fn local_config(&self, speaker_detection: bool) -> Result<SpeechConfig> {
+        SpeechConfig::from_env_with_model(speaker_detection,
+            self.settings["local_model"].as_str().filter(|path| !path.is_empty()))
     }
 
     pub(crate) fn speaker_detection_enabled(&self) -> bool {

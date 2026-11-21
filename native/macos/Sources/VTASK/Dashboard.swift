@@ -105,7 +105,7 @@ struct Dashboard: View {
                         if meetings.isEmpty { Text("Нет совещаний").foregroundStyle(.secondary) }
                         ForEach(meetings.prefix(4)) { meeting in
                             let status = meeting.processing?.label ?? (meeting.recordings.isEmpty ? "Новая" : "Сохранено")
-                            dashboardRow(meeting.title, icon: "video", subtitle: status) {
+                            dashboardRow(meeting.visibleTitle, icon: "video", subtitle: status) {
                                 openMeeting(meeting.id)
                             }
                         }

@@ -100,3 +100,41 @@ struct AssistantTaskFilters {
         return nil
     }
 }
+
+
+enum AssistantTaskText {
+    private static let endings = [
+        "ыми", "ими", "ому", "ему", "ого", "его", "ами", "ями",
+        "ых", "их", "ым", "им", "ом", "ем", "ой", "ей",
+        "ый", "ий", "ые", "ие", "ая", "яя", "ую", "юю", "ах", "ях",
+        "ов", "ев", "ам", "ям", "а", "я", "у", "ю", "е", "ы", "и", "о"
+    ]
+
+    private static func stem(_ word: String) -> String {
+        guard let ending = endings.first(where: { word.hasSuffix($0) && word.count - $0.count >= 4 }) else {
+            return word
+        }
+        return String(word.dropLast(ending.count))
+    }
+
+    static func matchesAnchor(_ words: [String], in candidates: [String]) -> Bool {
+        words.contains { word in
+            word.count >= 8 && candidates.contains { matchesVariation(word, $0) }
+        }
+    }
+
+    static func matchesVariation(_ word: String, _ candidate: String) -> Bool {
+        guard word.allSatisfy(\.isLetter), candidate.allSatisfy(\.isLetter) else { return false }
+        let left = stem(word)
+        let right = stem(candidate)
+        if left == right { return true }
+
+        let shorter = Array(left.count <= right.count ? left : right)
+        let longer = Array(left.count <= right.count ? right : left)
+        guard shorter.count >= 7, longer.count - shorter.count <= 1 else { return false }
+        let sharedPrefix = zip(shorter, longer).prefix { $0.0 == $0.1 }.count
+        let skippedInShorter = shorter.count == longer.count ? 1 : 0
+        return shorter.dropFirst(sharedPrefix + skippedInShorter)
+            .elementsEqual(longer.dropFirst(sharedPrefix + 1))
+    }
+}

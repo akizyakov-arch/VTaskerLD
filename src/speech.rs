@@ -46,16 +46,19 @@ impl SpeechConfig {
     }
 
     pub fn from_env_with_speaker_detection(enabled: bool) -> Result<Self> {
+        Self::from_env_with_model(enabled, None)
+    }
+
+    pub(crate) fn from_env_with_model(enabled: bool, model: Option<&str>) -> Result<Self> {
+        let model = model.map(PathBuf::from).or_else(|| std::env::var_os("VTRACKER_WHISPER_MODEL").map(PathBuf::from))
+            .context("set VTRACKER_WHISPER_MODEL to a local multilingual ggml model")?;
         Ok(Self {
             engine: resolve(
                 &std::env::var_os("VTRACKER_WHISPER_BIN")
                     .map(PathBuf::from)
                     .unwrap_or_else(|| "whisper-cli".into()),
             )?,
-            model: std::fs::canonicalize(
-                std::env::var_os("VTRACKER_WHISPER_MODEL")
-                    .context("set VTRACKER_WHISPER_MODEL to a local multilingual ggml model")?,
-            )?,
+            model: std::fs::canonicalize(model)?,
             ffmpeg: resolve(
                 &std::env::var_os("VTRACKER_FFMPEG_BIN")
                     .map(PathBuf::from)
@@ -722,6 +725,35 @@ pub(crate) fn run_command(command: &mut Command, timeout: Duration) -> Result<()
         std::thread::sleep(Duration::from_millis(interval).min(timeout - elapsed));
     }
 }
+pub(crate) const ASSISTANT_AUDIO_SECONDS: usize = 30;
+
+pub(crate) fn assistant_transcript(config: SpeechConfig, audio: &[u8], sample_rate: u32) -> Result<String> {
+    if audio.is_empty() || audio.len() % 2 != 0 ||
+        audio.len() > sample_rate as usize * 2 * ASSISTANT_AUDIO_SECONDS {
+        bail!("Некорректная длительность голосовой команды");
+    }
+    let scratch = tempfile::tempdir()?;
+    let wav = scratch.path().join("voice.wav");
+    let mut writer = hound::WavWriter::create(&wav, hound::WavSpec {
+        channels: 1, sample_rate, bits_per_sample: 16, sample_format: hound::SampleFormat::Int,
+    })?;
+    for pair in audio.chunks_exact(2) {
+        writer.write_sample(i16::from_le_bytes([pair[0], pair[1]]))?;
+    }
+    writer.finalize()?;
+    let input = scratch.path().join("input.wav");
+    config.normalize_audio(&wav, &input, Duration::from_secs(5))?;
+    let prefix = scratch.path().join("result");
+    run_command(Command::new(&config.engine)
+        .arg("-m").arg(&config.model).arg("-f").arg(input).arg("-l").arg(&config.language)
+        .args(["-t", "4", "-oj", "-of"]).arg(&prefix), Duration::from_secs(25))?;
+    let output: Value = serde_json::from_reader(std::fs::File::open(prefix.with_extension("json"))?)?;
+    let rows = output["transcription"].as_array().context("Whisper не вернул расшифровку")?;
+    let text = rows.iter().filter_map(|row| row["text"].as_str()).map(str::trim)
+        .filter(|text| !text.is_empty()).collect::<Vec<_>>().join(" ");
+    Ok(text)
+}
+
 pub(crate) fn parse_segments(
     output: &Value,
     duration: u64,

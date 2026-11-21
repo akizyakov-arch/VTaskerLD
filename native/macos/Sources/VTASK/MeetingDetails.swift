@@ -391,7 +391,8 @@ struct MeetingProposalRow: View {
                 Image(systemName: icon).foregroundStyle(.secondary)
                 VStack(alignment: .leading, spacing: 3) {
                     Text(proposal.title ?? "Предложение").font(.callout.weight(.medium))
-                    Text("На подтверждении").font(.caption).foregroundStyle(.secondary)
+                    Text(proposal.suggestedExistingTaskId == nil ? "На подтверждении" : "Уточнение к задаче · На подтверждении")
+                        .font(.caption).foregroundStyle(.secondary)
                 }
                 Spacer(minLength: 8)
                 Image(systemName: "chevron.right").font(.caption).foregroundStyle(.secondary)

@@ -3,6 +3,7 @@ use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 pub fn server_address() -> Result<String> {
@@ -169,6 +170,7 @@ pub fn serve(path: &Path) -> Result<()> {
     let mut final_waiting: Option<i64> = None;
     let mut auto_seen = Value::Null;
     let mut auto_error: Option<String> = None;
+    let assistant_speech_busy = Arc::new(AtomicBool::new(false));
     loop {
         groq.poll(&store)?;
         worker.poll()?;
@@ -283,6 +285,48 @@ pub fn serve(path: &Path) -> Result<()> {
             request.respond(Response::from_string("Invalid origin").with_status_code(403))?;
             continue;
         }
+        if method == Method::Post && url == "/api/assistant/transcribe" {
+            let prepare = || -> Result<(u32, crate::speech::SpeechConfig)> {
+                let sample_rate = query.strip_prefix("rate=").and_then(|rate| rate.parse::<u32>().ok())
+                    .filter(|rate| (8000..=192000).contains(rate))
+                    .context("Некорректная частота записи")?;
+                if !request.headers().iter().any(|header| {
+                    header.field.equiv("Content-Type") && header.value.as_str() == "application/octet-stream"
+                }) {
+                    bail!("Нужна голосовая команда в формате PCM");
+                }
+                if !capture_status["active"].is_null() || worker.status()["running"] == true {
+                    bail!("Whisper занят обработкой совещания. Повторите команду позже.");
+                }
+                let config = worker.local_config(false)
+                    .and_then(|config| { config.validate()?; Ok(config) })
+                    .context("Локальный Whisper недоступен. Проверьте модель в настройках распознавания.")?;
+                if assistant_speech_busy.swap(true, Ordering::AcqRel) {
+                    bail!("Whisper ещё распознаёт предыдущую команду.");
+                }
+                Ok((sample_rate, config))
+            };
+            match prepare() {
+                Err(error) => send_json(request, Err(error))?,
+                Ok((sample_rate, config)) => {
+                    let busy = Arc::clone(&assistant_speech_busy);
+                    std::thread::spawn(move || {
+                        let result = (|| -> Result<Value> {
+                            let limit = sample_rate as usize * 2 * crate::speech::ASSISTANT_AUDIO_SECONDS;
+                            let size = request.body_length().filter(|size| *size <= limit)
+                                .context("Длительность голосовой команды превышает 30 секунд")?;
+                            let mut audio = Vec::with_capacity(size);
+                            request.as_reader().take(size as u64).read_to_end(&mut audio)?;
+                            if audio.len() != size { bail!("Голосовая команда получена не полностью"); }
+                            Ok(json!({"text":crate::speech::assistant_transcript(config, &audio, sample_rate)?}))
+                        })();
+                        busy.store(false, Ordering::Release);
+                        let _ = send_json(request, result);
+                    });
+                }
+            }
+            continue;
+        }
         if let Some(id) = url.strip_prefix("/api/people/photo/") {
             let id = id.parse::<i64>().context("Некорректный участник");
             match method {
@@ -373,8 +417,10 @@ pub fn serve(path: &Path) -> Result<()> {
                     let data = store.export(value.parse()?)?;
                     Ok(if query == "format=txt" {
                         format!(
-                            "{}\n{}",
-                            data["meeting"]["title"].as_str().unwrap_or_default(),
+                            "{}\nПроект: {}\nДата совещания: {}\n\n{}",
+                            data["meeting"]["protocol_title"].as_str().or_else(|| data["meeting"]["display_title"].as_str()).unwrap_or_default(),
+                            data["meeting"]["project_name"].as_str().unwrap_or("Без проекта"),
+                            data["meeting"]["meeting_date"].as_str().unwrap_or("Не указана"),
                             crate::speech::transcript_text(&data["transcript"])
                         )
                     } else {

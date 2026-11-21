@@ -19,6 +19,7 @@ struct AssistantSearch: View {
     let meetingRecording: Bool
     let liveTranscript: LiveTranscript?
     @Binding var liveRequests: [String]
+    let transcribe: (Data, Int) async throws -> String
     let interpret: (String, Bool, Bool, Bool, AssistantTaskUpdate?) async throws -> AssistantIntent
     let submitLocalCommand: (String, Int?, Int?, AssistantTaskUpdate?) async -> (id: Int?, error: String?)
     let close: () -> Void
@@ -43,6 +44,7 @@ struct AssistantSearch: View {
         var action: String
         var title: String
         var editsDeadline = false
+        var unresolvedAssignee: String?
         var update: AssistantTaskUpdate?
         var scope: TaskCommandScope?
         var search = ""
@@ -91,6 +93,8 @@ struct AssistantSearch: View {
     }
 
     @State private var searchQuery = ""
+    @State private var showAllTaskResults = false
+    @Environment(\.colorScheme) private var scheme
     @State private var refinement: Refinement?
     @State private var refinedAssignee: Person?
     @State private var refinedProject: Project?
@@ -98,6 +102,7 @@ struct AssistantSearch: View {
     @State private var refinedDeadlineLabel: String?
     @State private var semanticTaskFilters = AssistantTaskFilters()
     @State private var messages = [Message(text: "Слушаю. Что найти или изменить?", isUser: false)]
+    @AppStorage(AssistantVoicePreferences.engineKey) private var voiceEngine: AssistantRecognitionEngine = .macOS
     @AppStorage(AssistantVoicePreferences.silenceKey)
     private var silenceMilliseconds = AssistantVoicePreferences.defaultSilence
     @AppStorage(AssistantVoicePreferences.speakRepliesKey)
@@ -153,6 +158,12 @@ struct AssistantSearch: View {
     }
 
     private func resultsForQuery(_ searchQuery: String, includeRefinements: Bool = false) -> SearchResults {
+        let exact = lookup(searchQuery, includeRefinements: includeRefinements, tolerateTaskVariations: false)
+        guard !searchQuery.isEmpty && exact.isEmpty && !exact.projectListOnly else { return exact }
+        return lookup(searchQuery, includeRefinements: includeRefinements, tolerateTaskVariations: true)
+    }
+
+    private func lookup(_ searchQuery: String, includeRefinements: Bool, tolerateTaskVariations: Bool) -> SearchResults {
         let refinedAssignee = includeRefinements ? self.refinedAssignee : nil
         let refinedProject = includeRefinements ? self.refinedProject : nil
         let refinedDeadline = includeRefinements ? self.refinedDeadline : nil
@@ -216,7 +227,8 @@ struct AssistantSearch: View {
                           proposal.reviewDraft?.data.description ?? proposal.description,
                           proposal.source?.quote, proposal.source?.topic, target?.title, target?.description]
             return MeetingTopics.matchesSearchTopics(searchTopic.topics, fields: fields)
-                && matches(searchTopic.words, in: fields + [project, person, meeting?.title])
+                && matches(searchTopic.words, in: fields + [project, person, meeting?.visibleTitle],
+                           tolerateTaskVariations: tolerateTaskVariations)
         }
         let matchingTasks = tasks.filter { task in
             guard !projectListOnly, canMatch,
@@ -236,11 +248,12 @@ struct AssistantSearch: View {
             let project = projects.first { $0.id == task.projectId }?.title
             let person = people.first { $0.id == task.assigneeId }?.name
             let context = (task.sources ?? []).flatMap { source in
-                [source.quote, meetings.first { $0.id == source.meetingId }?.title]
+                [source.quote, meetings.first { $0.id == source.meetingId }?.visibleTitle]
             }
             let fields = [task.title, task.description] + (task.sources ?? []).map(\.quote)
             return MeetingTopics.matchesSearchTopics(searchTopic.topics, fields: fields)
-                && matches(searchTopic.words, in: [task.title, task.description, project, person] + context)
+                && matches(searchTopic.words, in: [task.title, task.description, project, person] + context,
+                           tolerateTaskVariations: tolerateTaskVariations)
         }
         let foundProjects = scopeIndex == nil
             ? projects.filter { !words.isEmpty && matches(words, in: [$0.title, $0.description]) }
@@ -316,6 +329,7 @@ struct AssistantSearch: View {
                             }
                         }
                         if !searchQuery.isEmpty {
+                            Color.clear.frame(height: 0).id("search-results")
                             if !results.projectListOnly {
                                 Label(results.projectScope ?? "Все проекты", systemImage: "folder")
                                     .font(.caption.weight(.semibold))
@@ -330,31 +344,8 @@ struct AssistantSearch: View {
                             } else if results.tasks.isEmpty && results.projects.isEmpty && results.proposals.isEmpty {
                                 Text("Ничего не найдено. Попробуйте уточнить название.").foregroundStyle(.secondary)
                             }
-                            ForEach(results.tasks) { task in
-                                VStack(alignment: .leading, spacing: 3) {
-                                    Button(task.title + " · " + (task.overdue ? "Просрочена" : task.stageTitle)) {
-                                        openTask(task.id)
-                                    }.buttonStyle(.link)
-                                    if results.projectScope == nil {
-                                        Text(projectName(task.projectId)).font(.caption).foregroundStyle(.secondary)
-                                    }
-                                    if meetingRecording {
-                                        let assignee = people.first { $0.id == task.assigneeId }?.name ?? "Без исполнителя"
-                                        let due = task.dueDate.map { [$0, task.dueTime].compactMap { $0 }.joined(separator: " ") }
-                                        Text(assignee + " · " + (due ?? "Без срока"))
-                                            .font(.caption).foregroundStyle(.secondary)
-                                    }
-                                }
-                            }
-                            ForEach(results.proposals) { proposal in
-                                VStack(alignment: .leading, spacing: 3) {
-                                    Button((proposal.reviewDraft?.data.title ?? proposal.displayTitle) + " · На подтверждение") {
-                                        openProposal(proposal)
-                                    }.buttonStyle(.link)
-                                    if results.projectScope == nil {
-                                        Text(projectName(proposalProjectID(proposal))).font(.caption).foregroundStyle(.secondary)
-                                    }
-                                }
+                            if !results.tasks.isEmpty || !results.proposals.isEmpty {
+                                taskResults(results)
                             }
                             ForEach(results.projects) { project in
                                 Button("Проект · " + project.title) { openProject(project.id) }.buttonStyle(.link)
@@ -364,7 +355,14 @@ struct AssistantSearch: View {
                     }
                     .padding(14)
                 }
-                .onChange(of: messages.count) { _ in scroll.scrollTo("chat-end", anchor: .bottom) }
+                .onChange(of: messages.count) { _ in
+                    showAllTaskResults = false
+                    if searchQuery.isEmpty || pendingTaskCommand != nil || !statusTaskChoices.isEmpty {
+                        scroll.scrollTo("chat-end", anchor: .bottom)
+                    } else {
+                        scroll.scrollTo("search-results", anchor: .top)
+                    }
+                }
             }
             Divider()
             if changingStatus {
@@ -416,7 +414,7 @@ struct AssistantSearch: View {
             // Give the output device time to finish playing the synthesized audio.
             do { try await Task.sleep(for: .milliseconds(250)) } catch { return }
             guard listeningRequest != nil, !Task.isCancelled else { return }
-            await voice.start(silenceMilliseconds: silenceMilliseconds)
+            await voice.start(silenceMilliseconds: silenceMilliseconds, recognitionEngine: voiceEngine, transcribe: transcribe)
         }
         .onChange(of: voice.text) { value in
             if !value.isEmpty { query = value }
@@ -463,6 +461,71 @@ struct AssistantSearch: View {
             voice.stop()
             speech.stop()
         }
+    }
+
+    private func taskResults(_ results: SearchResults) -> some View {
+        let total = results.tasks.count + results.proposals.count
+        let limit = showAllTaskResults ? total : 6
+        let shownTasks = results.tasks.prefix(limit)
+        let shownProposals = results.proposals.prefix(limit - shownTasks.count)
+        let palette = PanelPalette(dark: scheme == .dark)
+        let showsProject = results.projectScope == nil
+
+        return LazyVStack(alignment: .leading, spacing: 0) {
+            ForEach(shownTasks) { task in
+                taskSearchRow(
+                    title: task.title, project: showsProject ? projectName(task.projectId) : nil,
+                    assignee: people.first { $0.id == task.assigneeId }?.name, due: task.dueDate, time: task.dueTime,
+                    status: task.overdue ? "Просрочена" : task.stageTitle,
+                    color: task.overdue ? palette.recordingInk : palette.muted
+                ) { openTask(task.id) }
+                if task.id != shownTasks.last?.id || !shownProposals.isEmpty { Divider() }
+            }
+            ForEach(shownProposals) { proposal in
+                let deadline = proposal.reviewDeadline
+                taskSearchRow(
+                    title: proposal.reviewDraft?.data.title ?? proposal.displayTitle,
+                    project: showsProject ? projectName(proposalProjectID(proposal)) : nil,
+                    assignee: people.first { $0.id == proposal.reviewAssigneeId }?.name,
+                    due: deadline.date, time: deadline.time, status: "На подтверждении", color: palette.accent
+                ) { openProposal(proposal) }
+                if proposal.id != shownProposals.last?.id { Divider() }
+            }
+            if total > limit {
+                Divider()
+                Button("Показать ещё \(total - limit)") {
+                    showAllTaskResults = true
+                }
+                .buttonStyle(.link)
+                .padding(10)
+            }
+        }
+        .panelCard(inset: 0)
+    }
+
+    private func taskSearchRow(title: String, project: String?, assignee: String?, due: String?, time: String?,
+                               status: String, color: Color, action: @escaping () -> Void) -> some View {
+        let deadline = due.map { [ProjectDateField.display($0), time].compactMap { $0 }.joined(separator: " ") }
+        let context = [project, assignee, deadline].compactMap { $0 }.joined(separator: " · ")
+        return Button(action: action) {
+            HStack(spacing: 10) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(title).font(.callout.weight(.semibold)).foregroundStyle(.primary)
+                    if !context.isEmpty {
+                        Text(context).font(.caption).foregroundStyle(.secondary)
+                    }
+                    Text(status).font(.caption.weight(.medium)).foregroundStyle(color)
+                }
+                Spacer(minLength: 6)
+                Image(systemName: "chevron.right")
+                    .font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                    .accessibilityHidden(true)
+            }
+            .padding(10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
     }
 
     private func liveProtocol(_ transcript: LiveTranscript) -> some View {
@@ -665,7 +728,7 @@ struct AssistantSearch: View {
             }.map(TaskCommandTarget.proposal)
         }
         let words = tokens(query).filter { !["про", "по", "о", "об", "ту", "где", "которая", "которую"].contains($0) }
-        return targets.filter { target in
+        let exact = targets.filter { target in
             let title = tokens(target.title)
             return words.allSatisfy { word in
                 title.contains { candidate in
@@ -677,6 +740,10 @@ struct AssistantSearch: View {
                 }
             }
         }
+        guard exact.isEmpty, !words.isEmpty else { return exact }
+        let varied = targets.filter { matches(words, in: [$0.title], tolerateTaskVariations: true) }
+        guard varied.isEmpty, command.update != nil, words.count > 1 else { return varied }
+        return targets.filter { AssistantTaskText.matchesAnchor(words, in: tokens($0.title)) }
     }
 
     private func beginTaskCommand(_ command: PendingTaskCommand, scope: TaskCommandScope?) {
@@ -685,6 +752,14 @@ struct AssistantSearch: View {
         next.search = scope == nil ? "" : command.title
         pendingTaskCommand = next
         guard let scope else {
+            if command.update != nil && !command.title.isEmpty && command.search.isEmpty {
+                let scopes = projects.map { TaskCommandScope.project($0.id) } + [.unassigned]
+                let found = scopes.filter { !commandTargets(command, in: $0, matching: command.title).isEmpty }
+                if found.count == 1, let only = found.first {
+                    beginTaskCommand(command, scope: only)
+                    return
+                }
+            }
             append("О каком проекте идёт речь? Назовите его или выберите ниже.")
             return
         }
@@ -714,7 +789,20 @@ struct AssistantSearch: View {
             return
         }
         if let target = command.selected {
+            if command.unresolvedAssignee != nil && !accepted && !["нет", "другая", "другую"].contains(normalized) {
+                if let person = assignmentPerson(text) {
+                    chooseAssignee(person, command: command, target: target)
+                } else {
+                    pendingTaskCommand?.unresolvedAssignee = text
+                    append("Уточните исполнителя или выберите его ниже.")
+                }
+                return
+            }
             if accepted {
+                if command.unresolvedAssignee != nil {
+                    append("Сначала выберите исполнителя.")
+                    return
+                }
                 if command.update?.fields.isEmpty == true {
                     append("Укажите срок или исполнителя.")
                 } else {
@@ -770,7 +858,16 @@ struct AssistantSearch: View {
 
     @ViewBuilder
     private func taskCommandChoices(_ command: PendingTaskCommand) -> some View {
-        if let target = command.selected, command.update?.fields.isEmpty == false {
+        if let target = command.selected, let unresolved = command.unresolvedAssignee {
+            let prefix = tokens(unresolved).first?.prefix(3) ?? ""
+            let suggestions = prefix.count == 3 ? people.filter {
+                tokens($0.speakerPickerName).contains { $0.hasPrefix(prefix) }
+            } : []
+            ForEach((suggestions.isEmpty ? people : suggestions).prefix(8)) { person in
+                Button(person.speakerPickerName) { chooseAssignee(person, command: command, target: target) }
+                    .buttonStyle(.link)
+            }
+        } else if let target = command.selected, command.update?.fields.isEmpty == false {
             Button("Сохранить предложение") {
                 sendTaskCommand(command.action, to: target, update: command.update)
             }
@@ -810,12 +907,41 @@ struct AssistantSearch: View {
         var next = command
         next.selected = target
         pendingTaskCommand = next
+        if let unresolved = command.unresolvedAssignee {
+            let heard = unresolved.isEmpty ? "" : " Услышал «\(unresolved)»."
+            let date = update.preview.isEmpty ? "" : " Срок · " + update.preview + "."
+            append("«\(target.label)»." + date + heard + " Укажите исполнителя или выберите его ниже.")
+            return
+        }
         if update.fields.isEmpty {
             append("Выбрана задача «\(target.label)». Укажите срок или исполнителя.")
             return
         }
         append([target.label, update.preview].filter { !$0.isEmpty }.joined(separator: " · ") +
                ". Сохранить предложение?")
+    }
+
+    private func assignmentPerson(_ text: String) -> Person? {
+        let words = tokens(text)
+        guard !words.isEmpty else { return nil }
+        let exact = people.filter {
+            [$0.name, $0.nickname, $0.lastName, $0.speakerPickerName].compactMap { $0 }.contains { tokens($0) == words }
+        }
+        if exact.count == 1 { return exact.first }
+        guard exact.isEmpty, words.count == 1 else { return nil }
+        let inflected = people.filter {
+            guard let name = tokens($0.name).first else { return false }
+            let root = name.last.map { "ая".contains($0) } == true ? String(name.dropLast()) : name
+            return root.count >= 3 && ["е", "у", "ю"].contains { words[0] == root + $0 }
+        }
+        return inflected.count == 1 ? inflected.first : nil
+    }
+
+    private func chooseAssignee(_ person: Person, command: PendingTaskCommand, target: TaskCommandTarget) {
+        var next = command
+        next.unresolvedAssignee = nil
+        next.update?.assignee = person.speakerPickerName
+        chooseTaskCommand(next, target: target)
     }
 
     private func sendTaskCommand(_ action: String, to target: TaskCommandTarget?, update: AssistantTaskUpdate? = nil) {
@@ -868,6 +994,25 @@ struct AssistantSearch: View {
         }
         if AssistantRequest.isCreationRequest(text) {
             append("Чтобы создать задачу, проект, совещание или решение, откройте меню «+».")
+            return
+        }
+        if let assignment = AssistantRequest.searchAndAssignment(text) {
+            clearStatusRequest()
+            pendingTaskCommand = nil
+            localProposalID = nil
+            clearRefinements()
+            let due = assignment.deadline.flatMap { AssistantRequest.assignmentDeadline($0, today: today) }
+            if assignment.deadline != nil && due == nil {
+                if semanticInterpretation { interpretRequest(text) }
+                else { append("Уточните срок, указав дату или ближайшее число.") }
+                return
+            }
+            let person = assignmentPerson(assignment.assignee)
+            let update = AssistantTaskUpdate(dueDate: due, assignee: person?.speakerPickerName)
+            let command = PendingTaskCommand(action: text, title: assignment.title,
+                                             unresolvedAssignee: person == nil ? assignment.assignee : nil,
+                                             update: update)
+            beginTaskCommand(command, scope: currentProject.map { .project($0.id) })
             return
         }
         if AssistantRequest.isSearchRequest(text) {
@@ -992,8 +1137,12 @@ struct AssistantSearch: View {
         case .searchTasks, .refineTasks:
             applyTaskIntent(intent, title: title, request: text)
         case .updateTask:
-            let update = AssistantTaskUpdate(intent)
-            let command = PendingTaskCommand(action: text, title: title, update: update)
+            var update = AssistantTaskUpdate(intent)
+            let heard = update.assignee
+            if let heard { update.assignee = assignmentPerson(heard)?.speakerPickerName }
+            let command = PendingTaskCommand(action: text, title: title,
+                                             unresolvedAssignee: update.assignee == nil ? heard : nil,
+                                             update: update)
             let projectName = intent.project?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             if !projectName.isEmpty {
                 let exact = projects.filter { tokens($0.title) == tokens(projectName) }
@@ -1267,9 +1416,14 @@ struct AssistantSearch: View {
             || (first.count >= 5 && second.count >= 5 && first.dropLast() == second.dropLast())
     }
 
-    private func matches(_ words: [String], in fields: [String?]) -> Bool {
+    private func matches(_ words: [String], in fields: [String?], tolerateTaskVariations: Bool = false) -> Bool {
         let searchable = tokens(fields.compactMap { $0 }.joined(separator: " "))
-        return words.allSatisfy { word in searchable.contains { similar(word, $0) } }
+        return words.allSatisfy { word in
+            searchable.contains { candidate in
+                similar(word, candidate) ||
+                    (tolerateTaskVariations && AssistantTaskText.matchesVariation(word, candidate))
+            }
+        }
     }
 
     private func assigneeMatch(in terms: [String]) -> (word: String, people: [Person])? {

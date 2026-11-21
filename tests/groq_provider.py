@@ -12,6 +12,54 @@ class Response:
  def __exit__(self,*args):pass
  def read(self,n):return json.dumps(self.value).encode()
 class Provider(unittest.TestCase):
+ def test_recap_reuses_specific_tasks_without_merging_other_work(self):
+  segments = [
+   {'id': 1, 'text': 'Решить со световиками, как вешать панели.'},
+   {'id': 2, 'text': 'Что осталось решить?'},
+   {'id': 3, 'text': 'Со световиками.'},
+  ]
+  detailed = {'title': 'Решить со световиками, как вешать панели', 'source_segment_ids': [1, 3]}
+  recap = {'title': 'Решить вопрос со световиками', 'source_segment_ids': [3]}
+  different_due = {**recap, 'due_date': '2026-12-07'}
+  different_project = {**recap, 'project_id': 2}
+  independent = {**recap, 'title': 'Решить вопрос с пожарной сигнализацией'}
+  self.assertEqual(g.remove_recap_tasks(
+      [detailed, recap, independent, different_due, different_project], segments),
+      [detailed, independent, different_due, different_project])
+  second_match = {**detailed, 'title': 'Решить со световиками, где поставить стойки'}
+  self.assertEqual(g.remove_recap_tasks([detailed, second_match, recap], segments),
+                   [detailed, second_match, recap])
+  self.assertEqual(g.remove_recap_tasks([detailed, recap], segments[:1] + segments[2:]),
+                   [detailed, recap])
+
+ def test_industry_terms_are_optional_context_separate_from_the_prompt(self):
+  result = {'summary':'Итоги','tasks':[],'decisions':[],'open_questions':[]}
+  glossary = [{'title':'Лабораторные работы','prefixes':['пипет'],'phrases':['серия проб']}]
+  with patch.object(g, 'meeting_topic_rules', return_value=glossary):
+   with patch.object(g, 'request', return_value=result) as request:
+    g.analyze({'input':{'segments':[{'id':1,'text':'Проверить пипетки'}]}})
+    data = request.call_args.args[1]
+    self.assertEqual(data['topic_glossary'], [{'topic':'Лабораторные работы','terms':['пипет']}])
+    self.assertNotIn('Лабораторные работы', request.call_args.kwargs['system'])
+    g.analyze({'input':{'segments':[{'id':1,'text':'Подготовить инструкцию'}]}})
+    self.assertNotIn('topic_glossary', request.call_args.args[1])
+
+ def test_local_fields_require_evidence_in_the_linked_segments(self):
+  result = {'tasks':[
+   {'source_segment_ids':[1], 'assignee_name':'Марина','due_date':'2026-12-07'},
+   {'source_segment_ids':[2,3], 'assignee_name':'Марина','due_date':'2026-12-07'},
+  ]}
+  g.check_local_field_evidence(result, {'segments':[
+   {'id':1,'text':'Подготовить инструкцию для администраторов.'},
+   {'id':2,'text':'Инструкцию экскурсоводам поручаем Марине.'},
+   {'id':3,'text':'Срок — до понедельника.'},
+  ]})
+  self.assertIsNone(result['tasks'][0]['assignee_name'])
+  self.assertIsNone(result['tasks'][0]['due_date'])
+  self.assertTrue(result['tasks'][0]['needs_clarification'])
+  self.assertEqual(result['tasks'][1]['assignee_name'],'Марина')
+  self.assertEqual(result['tasks'][1]['due_date'],'2026-12-07')
+
  def test_ollama_flags_bad_dates_without_discarding_other_tasks(self):
   result = {'tasks':[{'due_date':'2026-02-30','due_time':'18:00'},
                      {'due_date':'2026-12-01','due_time':'18:00'}]}
@@ -112,13 +160,41 @@ class Provider(unittest.TestCase):
    self.assertNotIn('material_ids', fields)
    self.assertIn('material_ids', g.SCHEMA['properties']['tasks']['items']['required'])
 
+ def test_automatic_analysis_receives_scope_without_manual_project_records(self):
+  snapshot = {
+   'project_id': 1, 'analysis_projects': [{'id': 1, 'title': 'Тенты'}],
+   'project_tasks': [{'id': 5, 'title': 'Купить ткань на шторы', 'project_id': 1}],
+   'segments': [{'id': 1, 'text':'Перенести закупку ткани на шторы'}],
+  }
+  result = {'summary':'Итоги', 'tasks':[], 'decisions':[], 'open_questions':[]}
+  with patch.object(g, 'request', return_value=result) as request:
+   g.analyze({'model':'deepseek:deepseek-flash', 'input':snapshot, 'automatic':True})
+   payload = request.call_args.args[1]
+   self.assertEqual(payload['project_id'], 1)
+   self.assertEqual(payload['analysis_projects'], snapshot['analysis_projects'])
+   self.assertNotIn('project_tasks', payload)
+   g.analyze({'model':'deepseek:deepseek-flash', 'input':snapshot})
+   self.assertEqual(request.call_args.args[1]['project_tasks'], snapshot['project_tasks'])
+
+ def test_completed_task_context_requires_explicit_reference_in_the_block(self):
+  snapshot = {'project_tasks':[
+   {'id':1, 'title':'Купить ткань на шторы', 'stage_kind':'done'},
+   {'id':2, 'title':'Купить ткань на столы', 'stage_kind':'active'},
+  ]}
+  tasks, _, _ = g.relevant_context(snapshot, [{'text':'Купить ткань на шторы'}], [])
+  self.assertEqual([task['id'] for task in tasks], [2])
+  tasks, _, _ = g.relevant_context(snapshot, [{'text':'Вернёмся к задаче #1'}], [])
+  self.assertEqual([task['id'] for task in tasks], [1])
+
  def test_ollama_automatic_analysis_still_splits_large_text(self):
   model = 'ollama:qwen3:4b-instruct-2507-q4_K_M'
   result = {'summary':'Итоги', 'tasks':[], 'decisions':[], 'open_questions':[]}
+  result['protocol_title'] = 'План квартальной отчётности'
   segments = [{'id':i, 'text':'x'*30000} for i in range(3)]
   with patch.object(g, 'request', return_value=result) as request:
-   g.analyze({'model':model, 'input':{'segments':segments}, 'automatic':True})
+   analyzed = g.analyze({'model':model, 'input':{'segments':segments}, 'automatic':True})
    self.assertEqual(request.call_count, 4)
+   self.assertEqual(analyzed['protocol_title'], result['protocol_title'])
  def test_empty_and_oversized_transcripts_do_not_call_provider(self):
   with patch.object(g,'request') as call:
    for segments in ([],[{'text':'x'*45001}]):

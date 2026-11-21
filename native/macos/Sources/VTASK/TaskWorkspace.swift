@@ -6,11 +6,6 @@ struct TaskWorkspace: View {
     let projects: [Project]
     let people: [Person]
     @Binding var selection: Int?
-    @Binding var board: Bool
-    let grouping: String?
-    @State private var marked: Set<Int> = []
-    @State private var action: BatchAction?
-
     @State private var dropColumn: BoardColumn?
     @Environment(\.colorScheme) private var colorScheme
 
@@ -27,76 +22,22 @@ struct TaskWorkspace: View {
         Color(red: 0.98, green: 0.58, blue: 0.66)
     ]
 
-    enum BatchAction: String, CaseIterable, Identifiable {
-        case assignee = "Назначить исполнителя"
-        case due = "Изменить срок"
-        case stage = "Изменить статус"
-        var id: Self { self }
-    }
-
-    private var selectedTasks: [TaskItem] { tasks.filter { marked.contains($0.id) } }
     private var palette: PanelPalette { PanelPalette(dark: colorScheme == .dark) }
 
     private func stages(for project: Int?) -> [Stage] {
         projects.first { $0.id == project }?.stages ?? model.workspace?.defaultStages ?? []
     }
 
-    private var commonStages: [Stage] {
-        let selected = selectedTasks
-        guard let first = selected.first else { return [] }
-        return stages(for: first.projectId).filter { stage in
-            selected.allSatisfy { task in
-                stages(for: task.projectId).contains { $0.id == stage.id && $0.title == stage.title && $0.kind == stage.kind }
-            }
-        }
-    }
-
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             toolbar
-            if !board && !selectedTasks.isEmpty {
-                HStack {
-                    Text("Выбрано: \(selectedTasks.count)").font(.callout.weight(.medium)).monospacedDigit()
-                    Menu {
-                        ForEach(BatchAction.allCases) { item in
-                            Button(item.rawValue) { action = item }
-                                .disabled(item == .stage && commonStages.isEmpty)
-                        }
-                    } label: {
-                        Label("Действия", systemImage: "ellipsis.circle")
-                    }
-                    .disabled(model.saving || model.loading)
-                    Button("Снять выбор") { marked.removeAll() }.buttonStyle(.link)
-                }
-                .panelCard(inset: 10)
-            }
             if tasks.isEmpty {
                 Label("Задач нет", systemImage: "checklist")
                     .foregroundStyle(.secondary)
                     .panelCard()
-            } else if board {
-                boardView
-            } else if let grouping, ["project", "assignee", "stage"].contains(grouping) {
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 14) {
-                        ForEach(groupedTasks, id: \.label) { group in
-                            Text(group.label).font(.headline).accessibilityAddTraits(.isHeader)
-                            taskTable(group.tasks)
-                                .frame(height: min(280, CGFloat(group.tasks.count) * 32 + 42))
-                        }
-                    }
-                }
             } else {
-                taskTable(tasks)
+                boardView
             }
-        }
-        .onChange(of: tasks.map(\.id)) { ids in marked.formIntersection(ids) }
-        .sheet(item: $action) { action in
-            BatchEditor(model: model, action: action, tasks: selectedTasks, people: people, stages: commonStages) {
-                marked.removeAll()
-                self.action = nil
-            }
-            .sheetCloseButton(disabled: model.saving)
         }
     }
 
@@ -120,31 +61,7 @@ struct TaskWorkspace: View {
                 .accessibilityLabel("Отменить последнее действие")
                 .disabled(model.saving || model.loading)
             }
-            Picker("Представление задач", selection: $board) {
-                Label("Список", systemImage: "list.bullet").tag(false)
-                Label("Доска", systemImage: "rectangle.split.3x1").tag(true)
-            }
-            .labelsHidden()
-            .pickerStyle(.segmented)
-            .fixedSize()
         }
-    }
-
-    private func taskTable(_ rows: [TaskItem]) -> some View {
-        TaskTable(tasks: rows, projects: projects, people: people, selection: $selection, marked: $marked)
-            .panelCard(inset: 1)
-            .clipShape(RoundedRectangle(cornerRadius: 10))
-    }
-
-    private var groupedTasks: [(label: String, tasks: [TaskItem])] {
-        let groups = Dictionary(grouping: tasks) { task in
-            switch grouping {
-            case "project": return projects.first { $0.id == task.projectId }?.title ?? "Без проекта"
-            case "assignee": return people.first { $0.id == task.assigneeId }?.name ?? "Без исполнителя"
-            default: return task.stageTitle
-            }
-        }
-        return groups.keys.sorted().map { ($0, groups[$0] ?? []) }
     }
 
     private var boardView: some View {
@@ -268,10 +185,79 @@ private struct StickerPaper: Shape {
     }
 }
 
+struct TaskBatchBar: View {
+    enum Action: String, CaseIterable, Identifiable {
+        case assignee = "Назначить исполнителя"
+        case due = "Изменить срок"
+        case stage = "Изменить статус"
+
+        var id: Self { self }
+    }
+
+    @ObservedObject var model: WorkspaceModel
+    let workspace: Workspace
+    let tasks: [TaskItem]
+    @Binding var selection: Set<Int>
+    @State private var action: Action?
+
+    private var selectedTasks: [TaskItem] { tasks.filter { selection.contains($0.id) } }
+
+    private func stages(for task: TaskItem) -> [Stage] {
+        workspace.projects.first { $0.id == task.projectId }?.stages ?? workspace.defaultStages
+    }
+
+    private var commonStages: [Stage] {
+        guard let first = selectedTasks.first else { return [] }
+        return stages(for: first).filter { stage in
+            selectedTasks.allSatisfy { task in
+                stages(for: task).contains { $0.id == stage.id && $0.title == stage.title && $0.kind == stage.kind }
+            }
+        }
+    }
+
+    var body: some View {
+        if !selectedTasks.isEmpty || model.lastBatchID != nil {
+            HStack(spacing: 10) {
+                if !selectedTasks.isEmpty {
+                    Text("Выбрано: \(selectedTasks.count)").font(.callout.weight(.medium)).monospacedDigit()
+                    Menu {
+                        ForEach(Action.allCases) { item in
+                            Button(item.rawValue) { action = item }
+                                .disabled(item == .stage && commonStages.isEmpty)
+                        }
+                    } label: {
+                        Label("Действия", systemImage: "ellipsis.circle")
+                    }
+                    .disabled(model.saving || model.loading)
+                    Button("Снять выбор") { selection.removeAll() }.buttonStyle(.link)
+                }
+                Spacer(minLength: 4)
+                if model.lastBatchID != nil {
+                    Button {
+                        Task { await model.undoBatch() }
+                    } label: {
+                        Label("Отменить действие", systemImage: "arrow.uturn.backward")
+                    }
+                    .disabled(model.saving || model.loading)
+                }
+            }
+            .panelCard(inset: 10)
+            .sheet(item: $action) { action in
+                BatchEditor(model: model, action: action, tasks: selectedTasks, people: workspace.people,
+                            stages: commonStages) {
+                    selection.removeAll()
+                    self.action = nil
+                }
+                .sheetCloseButton(disabled: model.saving)
+            }
+        }
+    }
+}
+
 private struct BatchEditor: View {
     @Environment(\.dismiss) private var dismiss
     @ObservedObject var model: WorkspaceModel
-    let action: TaskWorkspace.BatchAction
+    let action: TaskBatchBar.Action
     let tasks: [TaskItem]
     let people: [Person]
     let stages: [Stage]

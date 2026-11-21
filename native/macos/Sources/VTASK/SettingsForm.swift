@@ -67,6 +67,12 @@ struct AssistantVoiceSettingsForm: View {
 
     @AppStorage(AssistantVoicePreferences.silenceKey)
     private var silenceMilliseconds = AssistantVoicePreferences.defaultSilence
+    @AppStorage(AssistantVoicePreferences.engineKey)
+    private var recognitionEngine: AssistantRecognitionEngine = .macOS
+    @State private var analyzerMessage = ""
+    @State private var analyzerNeedsModel = false
+    @State private var analyzerInstalling = false
+
 
     var body: some View {
         Form {
@@ -86,6 +92,25 @@ struct AssistantVoiceSettingsForm: View {
                 Text("Выбранная модель получает текст нераспознанной команды. Поиск по проектам и задачам выполняется на Mac.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                Picker("Распознавание команд", selection: $recognitionEngine) {
+                    ForEach(AssistantRecognitionEngine.allCases) { engine in
+                        Text(engine.title).tag(engine)
+                            .disabled(engine == .speechAnalyzer && !supportsSpeechAnalyzer)
+                    }
+                }
+                if recognitionEngine == .whisper {
+                    Text("Используется локальная модель из настроек распознавания. Текст появляется после паузы.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                if recognitionEngine == .speechAnalyzer {
+                    Text(analyzerMessage).font(.caption).foregroundStyle(.secondary)
+                    if analyzerInstalling {
+                        ProgressView("Загружается модель Apple")
+                    } else if analyzerNeedsModel {
+                        Button("Загрузить русскую модель") { Task { await checkAnalyzer(install: true) } }
+                    }
+                }
                 Stepper(value: $silenceMilliseconds, in: AssistantVoicePreferences.silenceRange, step: 100) {
                     LabeledContent("Пауза перед отправкой") {
                         let seconds = Double(silenceMilliseconds) / 1000
@@ -100,8 +125,42 @@ struct AssistantVoiceSettingsForm: View {
             }
         }
         .formStyle(.grouped)
+        .task(id: recognitionEngine) {
+            if recognitionEngine == .speechAnalyzer { await checkAnalyzer() }
+        }
         .onChange(of: replyVoice) { _ in preview.stop() }
         .onChange(of: canPreview) { allowed in if !allowed { preview.stop() } }
         .onDisappear { preview.stop() }
+    }
+
+    private var supportsSpeechAnalyzer: Bool {
+        if #available(macOS 26.0, *) { return true }
+        return false
+    }
+
+    @MainActor
+    private func checkAnalyzer(install: Bool = false) async {
+        guard #available(macOS 26.0, *) else {
+            analyzerMessage = "Для SpeechAnalyzer требуется macOS 26."
+            return
+        }
+        if install { analyzerInstalling = true }
+        defer { if install { analyzerInstalling = false } }
+        do {
+            let module = try await AppleSpeechAnalyzer.russianModule()
+            if install { try await AppleSpeechAnalyzer.install(module) }
+            let installed = await AppleSpeechAnalyzer.isInstalled(module)
+            guard !Task.isCancelled else { return }
+            analyzerNeedsModel = !installed
+            if installed {
+                analyzerMessage = module.usesDictation
+                    ? "Русская модель диктовки Apple установлена. Распознавание работает на Mac."
+                    : "Русская модель SpeechTranscriber установлена. Распознавание работает на Mac."
+            } else {
+                analyzerMessage = "Для работы скачайте системную языковую модель Apple."
+            }
+        } catch {
+            if !Task.isCancelled { analyzerMessage = error.localizedDescription }
+        }
     }
 }

@@ -823,8 +823,11 @@ impl Store {
         };
         people.retain(|p| person_ids.contains(&p["id"].as_i64().unwrap()));
         let mut meetings = Vec::new();
-        let mut stmt=self.0.prepare("SELECT id,title,status,created_at,project_id,scheduled_at FROM meetings WHERE is_demo=?1 ORDER BY id DESC")?;
-        let rows=stmt.query_map([demo],|r|Ok(json!({"id":r.get::<_,i64>(0)?,"title":r.get::<_,String>(1)?,"status":r.get::<_,String>(2)?,"created_at":r.get::<_,String>(3)?,"project_id":r.get::<_,Option<i64>>(4)?,"scheduled_at":r.get::<_,Option<String>>(5)?,"is_demo":demo})))?;
+        let mut stmt=self.0.prepare("SELECT m.id,m.title,m.status,m.created_at,m.project_id,m.scheduled_at,
+            (SELECT min(created_at) FROM capture_sources WHERE meeting_id=m.id),
+            json_extract(p.data_json,'$.title') FROM meetings m LEFT JOIN projects p ON p.id=m.project_id
+            WHERE m.is_demo=?1 ORDER BY m.id DESC")?;
+        let rows=stmt.query_map([demo],|r|Ok(json!({"id":r.get::<_,i64>(0)?,"title":r.get::<_,String>(1)?,"status":r.get::<_,String>(2)?,"created_at":r.get::<_,String>(3)?,"project_id":r.get::<_,Option<i64>>(4)?,"scheduled_at":r.get::<_,Option<String>>(5)?,"recorded_at":r.get::<_,Option<String>>(6)?,"project_name":r.get::<_,Option<String>>(7)?,"is_demo":demo})))?;
         // Jobs are ordered by ID. Inserting in that order keeps the latest job per meeting.
         let Value::Array(jobs) = self.jobs()? else {
             unreachable!("jobs always returns an array");
@@ -844,7 +847,9 @@ impl Store {
                 .collect::<rusqlite::Result<Vec<_>>>()?);
             m["recordings"] = self.recordings(mid)?;
             m["manual_notes"] = self.meeting_notes(mid)?;
-            m["analysis"] = self.groq_analysis(mid)?;
+            let analysis = self.groq_analysis(mid)?;
+            crate::groq::decorate_meeting_protocol(&mut m, &analysis, tz);
+            m["analysis"] = analysis;
             m["processing"] = latest_job.remove(&mid).unwrap_or(Value::Null);
             meetings.push(m);
         }
@@ -863,6 +868,11 @@ impl Store {
             p["id"] = json!(i);
             p["status"] = json!(status);
             p["created_at"] = json!(created);
+            if status == "pending" {
+                if let Some(task_id) = crate::groq::suggested_task_refinement(&p, &tasks) {
+                    p["suggested_existing_task_id"] = json!(task_id);
+                }
+            }
             proposals.push(p);
         }
         let mut stmt = self.0.prepare(
@@ -1499,9 +1509,20 @@ fn review(c: &Connection, body: &Value, demo: bool, linked_decision: Option<i64>
                     sources.push(source.clone());
                 }
                 data["sources"] = json!(sources);
-                if body["apply_due"] == true || body["apply_assignee"] == true {
-                    if body["task_revision"] != old["revision"] {
-                        bail!("Задача изменилась. Откройте предложение заново");
+                let apply_description = body["apply_description"] == true;
+                if (body["apply_due"] == true || body["apply_assignee"] == true || apply_description)
+                    && body["task_revision"] != old["revision"] {
+                    bail!("Задача изменилась. Откройте предложение заново");
+                }
+                if apply_description {
+                    if proposal["project_id"] != old["project_id"] {
+                        bail!("Уточнение должно относиться к тому же проекту");
+                    }
+                    let detail = text(approved, "description").trim();
+                    let previous = text(&old, "description").trim_end();
+                    if !detail.is_empty() && !previous.split("\n\n").any(|part| part.trim() == detail) {
+                        data["description"] = json!(if previous.is_empty() { detail.to_owned() }
+                            else { format!("{previous}\n\n{detail}") });
                     }
                 }
                 if body["apply_assignee"] == true {
@@ -1511,9 +1532,10 @@ fn review(c: &Connection, body: &Value, demo: bool, linked_decision: Option<i64>
                     data["due_date"] = approved["due_date"].clone();
                     data["due_time"] = approved["due_time"].clone();
                 }
-                if body["apply_due"] == true || body["apply_assignee"] == true {
+                if body["apply_due"] == true || body["apply_assignee"] == true || apply_description {
                     validate_task(c, &mut data, demo, Some(existing))?;
-                    task_changed = ["assignee_id", "due_date", "due_time"].iter().any(|key| data[*key] != old[*key]);
+                    task_changed = ["assignee_id", "due_date", "due_time", "description"]
+                        .iter().any(|key| data[*key] != old[*key]);
                 }
                 result = save(c, "tasks", data, Some(&old), demo, None)?;
             } else {

@@ -18,7 +18,70 @@ pub const MODELS: [&str; 9] = [
     "openai:gpt-4.1-mini", "gemini:gemini-2.5-flash",
     "mistral:mistral-small-latest", "anthropic:claude-sonnet-4-5", OLLAMA_MODEL,
 ];
-const ANALYSIS_POLICY: &str = "vtask-groq-context-tasks-v17";
+const ANALYSIS_POLICY: &str = "vtask-groq-context-tasks-v21";
+
+fn generic_meeting_title(title: &str) -> bool {
+    matches!(title.trim().to_lowercase().as_str(),
+        "" | "совещание" | "новое совещание" | "встреча" | "новая встреча" | "без названия" | "meeting" | "new meeting")
+}
+
+fn short_protocol_heading(text: &str) -> Option<String> {
+    let text = text.trim_matches(|ch: char| ch.is_whitespace() || "«»\"“”#*.:".contains(ch));
+    if generic_meeting_title(text) { return None; }
+    let mut words = Vec::new();
+    let mut length = 0;
+    for word in text.split_whitespace() {
+        let extra = word.chars().count() + usize::from(!words.is_empty());
+        if length + extra > 90 { break; }
+        length += extra;
+        words.push(word);
+    }
+    while words.last().is_some_and(|word| {
+        matches!(*word, "в" | "с" | "на" | "для" | "по" | "и" | "или" | "к" | "от" | "до" | "из" | "о" | "об" | "как")
+    }) {
+        words.pop();
+    }
+    let heading = words.join(" ");
+    let mut chars = heading.chars();
+    let first = chars.next()?.to_uppercase();
+    Some(first.collect::<String>() + chars.as_str())
+}
+
+fn protocol_heading(result: &Value) -> Option<String> {
+    if let Some(heading) = result["protocol_title"].as_str().and_then(short_protocol_heading) {
+        return Some(heading);
+    }
+    let first = result["summary"].as_str()?.lines().find(|line| !line.trim().is_empty())?.trim();
+    let first = first.split(". ").next()?.split(',').next()?.trim();
+    let topic = [
+        "В ходе обсуждения рассматриваются ", "На совещании обсуждались ", "На совещании обсудили ",
+        "На встрече обсуждались ", "На встрече обсудили ", "Участники обсудили ", "Обсуждается ", "Обсуждались ",
+    ].into_iter().find_map(|prefix| first.strip_prefix(prefix)).unwrap_or(first);
+    let mut heading = short_protocol_heading(topic)?;
+    if topic.chars().count() > 90 {
+        if let Some((clause, _)) = heading.rsplit_once(" и ") {
+            if clause.split_whitespace().count() >= 4 {
+                heading.truncate(clause.len());
+            }
+        }
+    }
+    Some(heading)
+}
+
+pub(crate) fn decorate_meeting_protocol(meeting: &mut Value, analysis: &Value, timezone: chrono_tz::Tz) {
+    let heading = protocol_heading(&analysis["saved"]["result"]);
+    meeting["display_title"] = if generic_meeting_title(meeting["title"].as_str().unwrap_or_default()) {
+        heading.as_ref().map_or_else(|| meeting["title"].clone(), |title| json!(title))
+    } else {
+        meeting["title"].clone()
+    };
+    meeting["protocol_title"] = json!(heading);
+    let date = ["scheduled_at", "recorded_at", "created_at"].into_iter().find_map(|field| {
+        chrono::DateTime::parse_from_rfc3339(meeting[field].as_str()?).ok()
+    }).map(|date| date.with_timezone(&timezone));
+    meeting["meeting_at"] = json!(date.as_ref().map(|date| date.to_rfc3339()));
+    meeting["meeting_date"] = json!(date.as_ref().map(|date| date.date_naive().to_string()));
+}
 
 #[derive(Default, Clone, Copy)]
 struct ProjectScope<'a> {
@@ -81,6 +144,44 @@ fn search_terms(text: &str) -> impl Iterator<Item = String> + '_ {
     text.split(|ch: char| !ch.is_alphanumeric())
         .filter(|word| word.chars().count() >= 4)
         .map(|word| word.to_lowercase().replace('ё', "е").chars().take(4).collect())
+}
+
+pub(crate) fn suggested_task_refinement(proposal: &Value, tasks: &[Value]) -> Option<i64> {
+    if proposal["kind"] != "create_task" || proposal["origin"] != "groq"
+        || !proposal["related_task_id"].is_null() {
+        return None;
+    }
+    let candidates = proposal["candidate_task_ids"].as_array()?;
+    let source = &proposal["source"];
+    let meeting = source["meeting_id"].as_i64()?;
+    let title = proposal["title"].as_str()?;
+    let title_terms: std::collections::HashSet<_> = search_terms(title).collect();
+    let quote = source["quote"].as_str()?;
+    let mut matches = tasks.iter().filter(|task| {
+        candidates.contains(&task["id"]) && task["project_id"] == proposal["project_id"]
+            && task["stage_kind"] == "active"
+            && task["title"].as_str().is_some_and(|name| {
+                if same_action_title(name, title) { return true; }
+                let normalized = name.to_lowercase().replace('ё', "е");
+                let specific = title.to_lowercase();
+                if !["решить вопрос ", "решить проблему "].iter().any(|prefix| normalized.starts_with(prefix))
+                    || !specific.starts_with("решить ") {
+                    return false;
+                }
+                let terms = search_terms(&normalized)
+                    .filter(|term| !["реши", "вопр", "проб"].contains(&term.as_str()))
+                    .collect::<Vec<_>>();
+                !terms.is_empty() && terms.iter().all(|term| title_terms.contains(term))
+            })
+            && task["sources"].as_array().into_iter().flatten().any(|prior| {
+                prior["meeting_id"] == meeting && prior["quote"].as_str().is_some_and(|prior_quote| {
+                    prior_quote.lines().any(|line| line.split_whitespace().count() >= 3
+                        && quote.lines().any(|other| same_action_title(line, other)))
+                })
+            })
+    });
+    let id = matches.next()?["id"].as_i64()?;
+    matches.next().is_none().then_some(id)
 }
 
 fn administrative_change_title(title: &str) -> bool {
@@ -566,7 +667,7 @@ impl Store {
         }
         Ok(value)
     }
-    fn workspace_timezone(&self) -> Result<String> {
+    pub(crate) fn workspace_timezone(&self) -> Result<String> {
         let raw: Option<String> = self
             .0
             .query_row(
@@ -644,7 +745,8 @@ impl Store {
                     let previous: Value = serde_json::from_str(&raw)?;
                     let same_context = ["analysis_mode", "analysis_policy", "source_revision"].iter()
                         .all(|key| input[*key] == previous[*key])
-                        && (mode == Some("automatic") || ["analysis_projects", "project_tasks", "project_decisions", "project_materials"].iter()
+                        && input["analysis_projects"] == previous["analysis_projects"]
+                        && (mode == Some("automatic") || ["project_tasks", "project_decisions", "project_materials"].iter()
                             .all(|key| input[*key] == previous[*key]));
                     if previous_model == model && same_context {
                         return Ok((id, input, true));
@@ -753,15 +855,16 @@ impl Store {
                 let quote = source["quote"].as_str().unwrap_or_default().to_owned();
                 let finding_id = format!("{id}:{}", findings.len() + 1);
                 source["finding_ids"] = json!([finding_id]);
+                let unclear_project = item["needs_project_clarification"] == true;
                 let requested_task = item["task_id"].as_i64();
-                let related_task = snapshot_task(&input, item["related_task_id"].as_i64());
-                let target_task = snapshot_task(&input, requested_task);
+                let related_task = snapshot_task(&input, item["related_task_id"].as_i64()).filter(|_| !unclear_project);
+                let target_task = snapshot_task(&input, requested_task).filter(|_| !unclear_project);
                 let requested_project = &item["project_id"];
-                let selected_project = result_project(&input, requested_project);
+                let selected_project = if unclear_project { Value::Null } else { result_project(&input, requested_project) };
                 let reference = if kind == "create_task" { related_task.or(target_task) } else { target_task };
                 let project = reference.filter(|task| requested_project.is_null() || task["project_id"] == selected_project)
                     .map(|task| task["project_id"].clone()).unwrap_or(selected_project);
-                let project_required = input["analysis_projects"].as_array().is_some_and(|projects| projects.len() > 1)
+                let project_required = unclear_project || input["analysis_projects"].as_array().is_some_and(|projects| projects.len() > 1)
                     || (requested_project.as_i64().is_some() && project.is_null());
                 let mut p = json!({"kind":kind,"title":title,"description":"","project_id":project,
                     "project_required":project_required,"assignee_id":null,"due_date":null,"origin":origin,"source":source});
@@ -864,7 +967,7 @@ impl Store {
                     }
                     let title_terms: std::collections::HashSet<_> = search_terms(&title).collect();
                     let candidates: Vec<_> = input["project_tasks"].as_array().into_iter().flatten()
-                        .filter(matches_project)
+                        .filter(|task| !unclear_project && matches_project(task))
                         .filter(|task| item["task_id"].as_i64().is_some() && task["id"] == item["task_id"]
                             || task["title"].as_str().is_some_and(|name|
                                 same_action_title(name, &title)
@@ -880,7 +983,7 @@ impl Store {
                     }
                 }
                 if kind.starts_with("change_") {
-                    let candidates = change_candidates(&input, &project, &title, &quote);
+                    let candidates = if unclear_project { Vec::new() } else { change_candidates(&input, &project, &title, &quote) };
                     let target_was_change_card = target_task.is_some_and(|task| task["legacy_change_card"] == true)
                         && !candidates.is_empty();
                     if let Some(task) = target_task.filter(|task| task["project_id"] == project && !target_was_change_card) {

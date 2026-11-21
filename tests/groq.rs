@@ -30,6 +30,45 @@ fn output(seg: i64) -> Value {
     json!({"summary":"Agreed to prepare a report.","open_questions":["Who reviews it?"],"decisions":[{"text":"Prepare report","source_segment_ids":[seg]}],"tasks":[{"title":"Prepare report","description":"Draft report","assignee_name":null,"due_date":null,"source_segment_ids":[seg]}]})
 }
 #[test]
+fn protocol_titles_use_analysis_and_keep_meeting_metadata() {
+    let (_dir, store, meeting, segment) = setup();
+    let project = store.workspace_action(&json!({"op":"save_project","data":{
+        "title":"Отчётность","status":"active","stages":vtracker::workspace::default_stages()
+    }})).unwrap();
+    store.workspace_action(&json!({"op":"save_meeting","id":meeting,"data":{
+        "title":"Совещание","project_id":project["id"],"participants":[],
+        "scheduled_at":"2026-11-20T22:30:00Z"
+    }})).unwrap();
+    let (old_run, _, _) = store.groq_prepare(meeting, MODELS[0], true).unwrap();
+    let mut result = output(segment);
+    result["summary"] = json!("В ходе обсуждения рассматриваются возможности использования жмыха как сырья для производства алкоголя и как отдельного продукта.");
+    store.groq_complete(old_run, &result).unwrap();
+    assert_eq!(store.export(meeting).unwrap()["meeting"]["display_title"], "Возможности использования жмыха как сырья для производства алкоголя");
+
+    let (new_run, _, _) = store.groq_prepare_run(meeting, MODELS[0], true, true).unwrap();
+    result["protocol_title"] = json!("Подготовка квартального отчёта");
+    store.groq_complete(new_run, &result).unwrap();
+    let workspace = store.workspace(false, None).unwrap();
+    let listed = &workspace["meetings"][0];
+    let exported = &store.export(meeting).unwrap()["meeting"];
+    for metadata in [listed, exported] {
+        assert_eq!(metadata["title"], "Совещание");
+        assert_eq!(metadata["display_title"], "Подготовка квартального отчёта");
+        assert_eq!(metadata["protocol_title"], "Подготовка квартального отчёта");
+        assert_eq!(metadata["project_name"], "Отчётность");
+        assert_eq!(metadata["meeting_date"], "2026-11-21");
+        assert_eq!(metadata["meeting_at"], "2026-11-21T01:30:00+03:00");
+    }
+    assert_eq!(store.groq_analysis(meeting).unwrap()["stale"], false);
+    store.workspace_action(&json!({"op":"save_meeting","id":meeting,"data":{
+        "title":"Сверка с командой","project_id":project["id"],"participants":[]
+    }})).unwrap();
+    let exported = &store.export(meeting).unwrap()["meeting"];
+    assert_eq!(exported["display_title"], "Сверка с командой");
+    assert_eq!(exported["protocol_title"], "Подготовка квартального отчёта");
+}
+
+#[test]
 fn ollama_profile_persists_and_prepares_analysis_without_cloud_consent() {
     let (dir, store, meeting, _) = setup();
     let path = dir.path().join("db");
@@ -569,6 +608,52 @@ fn continued_meeting_keeps_the_approved_task_and_proposes_only_the_new_deadline(
 }
 
 #[test]
+fn protocol_refinement_can_extend_the_confirmed_task_without_creating_another() {
+    let (_dir, store, meeting, segment) = setup();
+    let project = store.workspace_action(&json!({"op":"save_project","data":{
+        "title":"Оформление","status":"active","stages":vtracker::workspace::default_stages()
+    }})).unwrap();
+    store.workspace_action(&json!({"op":"save_meeting","id":meeting,"data":{
+        "title":"Подготовка","project_id":project["id"],"participants":[]
+    }})).unwrap();
+    let description = "Проверить исходные материалы.";
+    let detail = "Согласовать способ крепления.";
+    let (initial_run, _, _) = store.groq_prepare(meeting, MODELS[0], true).unwrap();
+    let first = json!({"summary":"Обсудили оформление","open_questions":[],"decisions":[],"tasks":[
+        {"title":"Решить вопрос со световиками","description":description,"source_segment_ids":[segment]}
+    ]});
+    store.groq_complete(initial_run, &first).unwrap();
+    let initial = store.workspace(false, None).unwrap();
+    store.workspace_action(&json!({"op":"review","id":initial["proposals"][0]["id"],
+        "data":{"title":"Решить вопрос со световиками","description":description,"project_id":project["id"],
+            "stage_id":"todo","priority":"normal","blocked":false}
+    })).unwrap();
+    let (next_run, _, _) = store.groq_prepare_run(meeting, MODELS[0], true, true).unwrap();
+    let refined = json!({"summary":"Обсудили оформление","open_questions":[],"decisions":[],"tasks":[
+        {"title":"Решить со световиками, как вешать панели","description":detail,"source_segment_ids":[segment]},
+        {"title":"Заказать ткань для штор","description":"Другая работа","source_segment_ids":[segment]}
+    ]});
+    store.groq_complete(next_run, &refined).unwrap();
+    let pending = store.workspace(false, None).unwrap();
+    let task = &pending["tasks"][0];
+    let proposals = pending["proposals"].as_array().unwrap();
+    let suggestion = proposals.iter().find(|item| item["description"] == detail).unwrap();
+    let separate = proposals.iter().find(|item| item["description"] == "Другая работа").unwrap();
+    assert_eq!(suggestion["suggested_existing_task_id"], task["id"]);
+    assert!(separate["suggested_existing_task_id"].is_null());
+    let mut review = json!({"op":"review","id":suggestion["id"],"existing_task_id":task["id"],
+        "task_revision":0,"apply_description":true,"data":{"description":detail}});
+    assert!(store.workspace_action(&review).is_err());
+    review["task_revision"] = task["revision"].clone();
+    store.workspace_action(&review).unwrap();
+    let complete = store.workspace(false,None).unwrap();
+    assert_eq!(complete["tasks"].as_array().unwrap().len(), 1);
+    assert_eq!(complete["tasks"][0]["id"], task["id"]);
+    assert_eq!(complete["tasks"][0]["description"], format!("{description}\n\n{detail}"));
+    assert_eq!(complete["tasks"][0]["sources"].as_array().unwrap().len(), 2);
+}
+
+#[test]
 fn purchases_with_different_purposes_survive_reanalysis() {
     let (_dir, store, meeting, segment) = setup();
     let (first, _, _) = store.groq_prepare(meeting, MODELS[0], true).unwrap();
@@ -1018,6 +1103,28 @@ fn local_commands_carry_task_changes_across_two_meetings_without_spending_tokens
     assert_eq!(other["blocked"], false);
     assert_eq!(store.ai_budget(None).unwrap()["today_tokens"], 0);
     assert_eq!(conn.query_row("SELECT count(*) FROM ai_usage", [], |row| row.get::<_,i64>(0)).unwrap(), 0);
+}
+
+#[test]
+fn model_uncertainty_does_not_assign_a_task_to_the_only_selected_project() {
+    let (_dir, store, meeting, segment) = setup();
+    let project = store.workspace_action(&json!({"op":"save_project","data":{
+        "title":"Тенты","status":"active","stages":vtracker::workspace::default_stages()
+    }})).unwrap();
+    store.workspace_action(&json!({"op":"save_meeting","id":meeting,"data":{
+        "title":"Тенты","project_id":project["id"],"participants":[]
+    }})).unwrap();
+    let (id, _, _) = store.groq_prepare_projects(meeting, MODELS[0], true, false, &[], false).unwrap();
+    let mut result = output(segment);
+    result["tasks"][0]["needs_project_clarification"] = json!(true);
+    result["tasks"][0]["project_id"] = project["id"].clone();
+    store.groq_complete(id, &result).unwrap();
+    let workspace = store.workspace(false, None).unwrap();
+    let proposal = workspace["proposals"].as_array().unwrap().iter()
+        .find(|item| item["kind"] == "create_task").unwrap();
+    assert!(proposal["project_id"].is_null());
+    assert_eq!(proposal["project_required"], true);
+    assert_eq!(proposal["needs_clarification"], true);
 }
 
 #[test]

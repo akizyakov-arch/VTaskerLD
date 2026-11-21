@@ -299,6 +299,33 @@ struct TaskHistoryEntry: Decodable, Identifiable {
     let after: Snapshot
 }
 
+private struct TaskCardDisclosureStyle: DisclosureGroupStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Button {
+                configuration.isExpanded.toggle()
+            } label: {
+                HStack(spacing: 8) {
+                    configuration.label
+                    Spacer(minLength: 8)
+                    Image(systemName: configuration.isExpanded ? "chevron.down" : "chevron.right")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                        .accessibilityHidden(true)
+                }
+                .frame(maxWidth: .infinity, minHeight: 22, alignment: .leading)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityValue(configuration.isExpanded ? "Развёрнуто" : "Свёрнуто")
+
+            if configuration.isExpanded {
+                configuration.content
+            }
+        }
+    }
+}
+
 struct TaskEditor: View {
     @Environment(\.colorScheme) private var scheme
     @ObservedObject var model: WorkspaceModel
@@ -454,6 +481,7 @@ struct TaskEditor: View {
             }
             historyField
         }
+        .disclosureGroupStyle(TaskCardDisclosureStyle())
         .onChange(of: hasDraft, perform: draftChanged)
         .onDisappear { draftChanged(false) }
         .formStyle(.grouped)

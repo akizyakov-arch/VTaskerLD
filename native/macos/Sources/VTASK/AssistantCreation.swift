@@ -11,9 +11,55 @@ enum Creation: String, CaseIterable, Identifiable {
 }
 
 enum AssistantRequest {
+    private static let searchPrefix = #"^(?:(?:валли|а|пожалуйста|можешь|можете|мне)[\s,:]+)*(?:покажи(?:те)?|найди(?:те)?|выведи(?:те)?)\b"#
+
     static func isSearchRequest(_ text: String) -> Bool {
-        let pattern = #"^(?:(?:валли|а|пожалуйста|можешь|можете|мне)[\s,:]+)*(?:покажи(?:те)?|найди(?:те)?|выведи(?:те)?)\b"#
-        return normalize(text).range(of: pattern, options: .regularExpression) != nil
+        normalize(text).range(of: searchPrefix, options: .regularExpression) != nil
+    }
+
+    static func searchAndAssignment(_ text: String) -> (title: String, assignee: String, deadline: String?)? {
+        let text = normalize(text)
+        guard let prefix = text.range(of: searchPrefix, options: .regularExpression) else { return nil }
+        let rest = String(text[prefix.upperBound...]).trimmingCharacters(in: .whitespaces)
+        let verb = #"\s+(?:и\s+)?(?:назначь(?:те)?|назначить|поручи(?:те)?)\b"#
+        guard let action = rest.range(of: verb, options: .regularExpression) else { return nil }
+        let title = String(rest[..<action.lowerBound]).replacingOccurrences(
+            of: #"^(?:задач[ауи]|поручение)\s+"#, with: "", options: .regularExpression)
+        guard !title.isEmpty else { return nil }
+        let changes = String(rest[action.upperBound...]).replacingOccurrences(
+            of: #"^\s*(?:(?:ее|задачу|исполнителя)(?:\s+|$))*"#, with: "", options: .regularExpression)
+        guard let date = changes.range(of: #"(?:^|\s+)(?:на|к|до)\s+(?=\S)"#,
+                                       options: .regularExpression) else {
+            return (title, clean(changes), nil)
+        }
+        return (title, clean(String(changes[..<date.lowerBound])), clean(String(changes[date.upperBound...])))
+    }
+
+    static func assignmentDeadline(_ text: String, today: String) -> String? {
+        let parsed = AssistantTaskFilters.parse(text, today: today)
+        if case .dates(let dates) = parsed.filters.deadline, dates.lowerBound == dates.upperBound,
+           parsed.remaining.trimmingCharacters(in: .whitespaces).isEmpty {
+            return dates.lowerBound
+        }
+        let digits = text.prefix { $0.isASCII && $0.isNumber }
+        guard let day = Int(digits), (1...31).contains(day),
+              ["", "-е", "е", " число", "-е число", "е число"].contains(String(text.dropFirst(digits.count))) else {
+            return nil
+        }
+        let iso = Date.ISO8601FormatStyle().year().month().day().dateSeparator(.dash)
+        guard let reference = try? iso.parse(today) else { return nil }
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = .gmt
+        guard let month = calendar.dateInterval(of: .month, for: reference)?.start else { return nil }
+        for offset in 0...2 {
+            guard let start = calendar.date(byAdding: .month, value: offset, to: month) else { continue }
+            var parts = calendar.dateComponents([.year, .month], from: start)
+            parts.day = day
+            if parts.isValidDate(in: calendar), let date = calendar.date(from: parts), date >= reference {
+                return iso.format(date)
+            }
+        }
+        return nil
     }
 
     static func isCreationRequest(_ text: String) -> Bool {
@@ -109,6 +155,11 @@ struct AssistantTaskUpdate {
     var dueDate: String?
     var dueTime: String?
     var assignee: String?
+
+    init(dueDate: String?, assignee: String?) {
+        self.dueDate = dueDate
+        self.assignee = assignee
+    }
 
     init(_ intent: AssistantIntent) {
         func cleaned(_ value: String?) -> String? {

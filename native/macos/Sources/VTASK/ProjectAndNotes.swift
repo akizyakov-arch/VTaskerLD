@@ -276,7 +276,6 @@ struct ProjectOverview: View {
     @Environment(\.colorScheme) private var scheme
     let project: Project
     let workspace: Workspace
-    let openMeeting: (Int) -> Void
     let openTask: (Int) -> Void
     let openTasks: () -> Void
     @State private var selectedMetric: Metric?
@@ -342,16 +341,6 @@ struct ProjectOverview: View {
                     detail("Цель", project.goal)
                     detail("Материалы", project.materials)
                     detail("Блокировка проекта", project.blocker)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .panelCard()
-                VStack(alignment: .leading, spacing: 10) {
-                    Text("Встречи").font(.headline)
-                    let meetings = workspace.meetings.filter { $0.projectId == project.id }
-                    if meetings.isEmpty { Text("Встреч пока нет").foregroundStyle(.secondary) }
-                    ForEach(meetings) { meeting in
-                        Button(meeting.title) { openMeeting(meeting.id) }.buttonStyle(.link)
-                    }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .panelCard()
@@ -495,81 +484,72 @@ struct ProjectOverview: View {
     }
 }
 
-struct ProjectDecisionCard: View {
+struct ProjectDecisionDetails: View {
     @ObservedObject var model: WorkspaceModel
     let workspace: Workspace
     let decision: Decision
     let prior: Decision?
     let openMeeting: (Int) -> Void
     let openTask: (Int) -> Void
-    @State private var expanded = false
     @State private var confirmingCancellation = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Button {
-                expanded.toggle()
-            } label: {
-                HStack(spacing: 10) {
-                    Image(systemName: "checkmark.seal").frame(width: 34, height: 34)
-                        .foregroundStyle(.secondary)
-                        .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 8))
-                        .accessibilityHidden(true)
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text(decision.text).font(.headline).lineLimit(expanded ? nil : 2)
-                        Text("Решение · \(decision.active ? "Согласовано" : decision.statusLabel)")
-                            .font(.caption).foregroundStyle(.secondary)
-                    }
-                    Spacer(minLength: 8)
-                    Image(systemName: expanded ? "chevron.down" : "chevron.right")
-                        .font(.caption.weight(.semibold)).foregroundStyle(.secondary)
-                        .accessibilityHidden(true)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .contentShape(Rectangle())
+        let project = workspace.projects.first { $0.id == decision.projectId }
+        let linkedTasks = workspace.visibleTasks.filter { (decision.taskIds ?? []).contains($0.id) }
+        Form {
+            Section {
+                Text(decision.text).font(.headline).textSelection(.enabled)
+                LabeledContent("Статус", value: decision.active ? "Согласовано" : decision.statusLabel)
+                if let project { LabeledContent("Проект", value: project.title) }
             }
-            .buttonStyle(.plain)
-            .accessibilityValue(expanded ? "Развёрнуто" : "Свёрнуто")
-            if expanded {
-                Divider()
-                details
+            if decision.reason != nil || prior != nil {
+                Section("Контекст решения") {
+                    if let reason = decision.reason {
+                        LabeledContent("Обоснование", value: reason).textSelection(.enabled)
+                    }
+                    if let prior {
+                        LabeledContent("Заменяет решение", value: prior.text).textSelection(.enabled)
+                    }
+                }
+            }
+            if !linkedTasks.isEmpty {
+                Section("Связанные задачи") {
+                    ForEach(linkedTasks) { task in
+                        Button(task.title) { openTask(task.id) }.buttonStyle(.link)
+                    }
+                }
+            }
+            if decision.meetingId != nil || decision.source != nil {
+                Section("Источник") {
+                    if let id = decision.meetingId {
+                        Button(workspace.meetings.first { $0.id == id }?.visibleTitle ?? "Открыть совещание") {
+                            openMeeting(id)
+                        }
+                        .buttonStyle(.link)
+                    }
+                    if let quote = decision.source?.quote, !quote.isEmpty {
+                        Text(quote).textSelection(.enabled)
+                    }
+                    ForEach(decision.source?.materialLinks ?? []) { link in
+                        if let target = link.target { Link(link.label, destination: target) }
+                    }
+                }
+            }
+            if decision.active {
+                Section {
+                    Button("Отменить решение", role: .destructive) { confirmingCancellation = true }
+                        .disabled(model.saving)
+                }
             }
         }
-        .panelCard()
+        .formStyle(.grouped)
+        .scrollContentBackground(.hidden)
+        .frame(maxHeight: .infinity)
         .confirmationDialog("Отменить решение?", isPresented: $confirmingCancellation) {
             Button("Отменить решение", role: .destructive) {
                 Task { await model.command(["op": "cancel_decision", "id": decision.id]) }
             }
         } message: { Text(decision.text) }
-    }
-
-    @ViewBuilder
-    private var details: some View {
-        if let reason = decision.reason {
-            LabeledContent("Обоснование", value: reason).textSelection(.enabled)
-        }
-        if let prior {
-            LabeledContent("Заменяет решение", value: prior.text).textSelection(.enabled)
-        }
-        ForEach(decision.source?.materialLinks ?? []) { link in
-            if let target = link.target { Link(link.label, destination: target) }
-        }
-        let linkedTasks = workspace.visibleTasks.filter { (decision.taskIds ?? []).contains($0.id) }
-        if !linkedTasks.isEmpty {
-            Text("Связанные задачи").font(.caption).foregroundStyle(.secondary)
-            ForEach(linkedTasks) { task in
-                Button(task.title) { openTask(task.id) }.buttonStyle(.link)
-            }
-        }
-        HStack {
-            if let id = decision.meetingId {
-                Button("К встрече") { openMeeting(id) }.buttonStyle(.link)
-            }
-            if decision.active {
-                Button("Отменить решение") { confirmingCancellation = true }.buttonStyle(.link)
-                    .disabled(model.saving)
-            }
-        }
     }
 }
 
