@@ -547,6 +547,45 @@ fn task_save(c: &Connection, body: &Value, demo: bool, batch: Option<&str>) -> R
     validate_task(c, &mut data, demo, old.as_ref().and_then(|v| id(v, "id")))?;
     save(c, "tasks", data, old.as_ref(), demo, batch)
 }
+fn project_title_key(title: &str) -> String {
+    title.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase().replace('ё', "е")
+}
+
+fn work_period_date<'a>(period: &'a Value, field: &str) -> Result<Option<&'a str>> {
+    match &period[field] {
+        Value::Null => Ok(None),
+        Value::String(value) if value.is_empty() => Ok(None),
+        Value::String(value) => {
+            date(value).context("Некорректная дата этапа работ")?;
+            Ok(Some(value))
+        }
+        _ => bail!("Дата этапа работ должна быть строкой"),
+    }
+}
+
+fn project_work_periods(value: &Value) -> Result<Value> {
+    let rows = value.as_array().context("Этапы работ должны быть списком")?;
+    let mut ids = HashSet::new();
+    let mut periods = Vec::with_capacity(rows.len());
+    for row in rows {
+        let id = text(row, "id").trim();
+        let title = text(row, "title").trim();
+        if id.is_empty() || !ids.insert(id) {
+            bail!("У каждого этапа работ должен быть уникальный идентификатор");
+        }
+        if title.is_empty() {
+            bail!("Укажите название этапа работ");
+        }
+        let start = work_period_date(row, "start_date")?;
+        let end = work_period_date(row, "end_date")?;
+        if start.zip(end).is_some_and(|(start, end)| start > end) {
+            bail!("У этапа «{title}» дата окончания раньше начала");
+        }
+        periods.push(json!({"id":id,"title":title,"start_date":start,"end_date":end}));
+    }
+    Ok(Value::Array(periods))
+}
+
 fn project_save(c: &Connection, body: &Value, demo: bool) -> Result<Value> {
     let old = if let Some(i) = id(body, "id") {
         let p = entity(c, "projects", i)?;
@@ -563,6 +602,17 @@ fn project_save(c: &Connection, body: &Value, demo: bool) -> Result<Value> {
         bail!("Укажите название проекта");
     }
     data["title"] = json!(text(&data, "title").trim());
+    let title = project_title_key(text(&data, "title"));
+    if old.as_ref().is_none_or(|project| project_title_key(text(project, "title")) != title) {
+        if let Some(existing) = entities(c, "projects", demo)?.iter()
+            .find(|project| project_title_key(text(project, "title")) == title)
+        {
+            if existing["archived"] == true {
+                bail!("Проект «{}» уже есть в архиве. Выберите другое название или восстановите проект", text(existing, "title"));
+            }
+            bail!("Проект «{}» уже существует. Откройте его или выберите другое название", text(existing, "title"));
+        }
+    }
     for (key, limit) in [
         ("goal", 4000),
         ("next_milestone", 500),
@@ -619,6 +669,11 @@ fn project_save(c: &Connection, body: &Value, demo: bool) -> Result<Value> {
             bail!("Дата завершения раньше начала");
         }
     }
+    if let Some(periods) = body["data"].get("work_periods") {
+        data["work_periods"] = project_work_periods(periods)?;
+    } else if let Some(periods) = old.as_ref().and_then(|project| project.get("work_periods")) {
+        data["work_periods"] = periods.clone();
+    }
     if let Some(members) = data["members"].as_array() {
         for member in members {
             person(
@@ -627,6 +682,11 @@ fn project_save(c: &Connection, body: &Value, demo: bool) -> Result<Value> {
                 demo,
             )?;
         }
+    }
+    if let Some(industries) = body["data"].get("terminology_industries") {
+        data["terminology_industries"] = json!(validate_industries(c, industries)?);
+    } else if let Some(industries) = old.as_ref().and_then(|project| project.get("terminology_industries")) {
+        data["terminology_industries"] = industries.clone();
     }
     data["archived"] = json!(old.as_ref().is_some_and(|p| p["archived"] == true));
     let result = save(c, "projects", data, old.as_ref(), demo, None)?;
@@ -662,15 +722,70 @@ fn settings(c: &Connection) -> Result<Value> {
             |r| r.get(0),
         )
         .optional()?;
-    Ok(match raw {
+    let mut prefs: Value = match raw {
         Some(s) => serde_json::from_str(&s)?,
         None => {
             json!({"timezone":"Europe/Moscow","me_id":null,"theme":"system","font_size":16,"auto_process":true,"saved_views":[],"initialized":false})
         }
-    })
+    };
+    if let Some(industry) = prefs["industry_template"].as_str() {
+        prefs["industry_template"] = json!(crate::glossary::normalize_industry(industry));
+    }
+    Ok(prefs)
 }
 pub(crate) fn industry_template(c: &Connection) -> Result<String> {
-    Ok(settings(c)?["industry_template"].as_str().unwrap_or("decor").to_owned())
+    Ok(settings(c)?["industry_template"].as_str().unwrap_or("events").to_owned())
+}
+
+fn validate_industries(db: &Connection, input: &Value) -> Result<Vec<String>> {
+    let ids = input.as_array().context("Укажите список отраслей для словаря")?;
+    let mut result = Vec::new();
+    for value in ids {
+        let id = value.as_str().context("Выберите отрасль справочника")?;
+        let id = crate::glossary::normalize_industry(id);
+        if !crate::glossary::has_dictionary_scope(db, id)? {
+            bail!("Отраслевой словарь недоступен");
+        }
+        if !result.iter().any(|entry| entry == id) {
+            result.push(id.to_owned());
+        }
+    }
+    Ok(result)
+}
+
+fn read_industries(input: &Value) -> Vec<String> {
+    input.as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_owned).collect()
+}
+
+pub(crate) fn meeting_industries(db: &Connection, meeting_id: i64, project_ids: &[i64]) -> Result<Vec<String>> {
+    let saved: Option<String> = db.query_row(
+        "SELECT industries_json FROM meeting_terminology WHERE meeting_id=?1",
+        [meeting_id], |row| row.get(0),
+    ).optional()?;
+    if let Some(saved) = saved {
+        let explicit: Vec<String> = serde_json::from_str(&saved)?;
+        if !explicit.is_empty() {
+            return Ok(explicit);
+        }
+    }
+    let fallback = industry_template(db)?;
+    let mut industries = Vec::new();
+    for project_id in project_ids {
+        let project = entity(db, "projects", *project_id)?;
+        let mut selection = read_industries(&project["terminology_industries"]);
+        if selection.is_empty() {
+            selection.push(fallback.clone());
+        }
+        for industry in selection {
+            if !industries.contains(&industry) {
+                industries.push(industry);
+            }
+        }
+    }
+    if industries.is_empty() {
+        industries.push(fallback);
+    }
+    Ok(industries)
 }
 
 fn annotate(task: &mut Value, stages: &Value, now: DateTime<Utc>, tz: Tz) -> Result<()> {
@@ -829,9 +944,12 @@ impl Store {
         let mut meetings = Vec::new();
         let mut stmt=self.0.prepare("SELECT m.id,m.title,m.status,m.created_at,m.project_id,m.scheduled_at,
             (SELECT min(created_at) FROM capture_sources WHERE meeting_id=m.id),
-            json_extract(p.data_json,'$.title') FROM meetings m LEFT JOIN projects p ON p.id=m.project_id
+            json_extract(p.data_json,'$.title'), mt.industries_json
+            FROM meetings m LEFT JOIN projects p ON p.id=m.project_id
+            LEFT JOIN meeting_terminology mt ON mt.meeting_id=m.id
             WHERE m.is_demo=?1 ORDER BY m.id DESC")?;
-        let rows=stmt.query_map([demo],|r|Ok(json!({"id":r.get::<_,i64>(0)?,"title":r.get::<_,String>(1)?,"status":r.get::<_,String>(2)?,"created_at":r.get::<_,String>(3)?,"project_id":r.get::<_,Option<i64>>(4)?,"scheduled_at":r.get::<_,Option<String>>(5)?,"recorded_at":r.get::<_,Option<String>>(6)?,"project_name":r.get::<_,Option<String>>(7)?,"is_demo":demo})))?;
+        let rows=stmt.query_map([demo],|r|Ok(json!({"id":r.get::<_,i64>(0)?,"title":r.get::<_,String>(1)?,"status":r.get::<_,String>(2)?,"created_at":r.get::<_,String>(3)?,"project_id":r.get::<_,Option<i64>>(4)?,"scheduled_at":r.get::<_,Option<String>>(5)?,"recorded_at":r.get::<_,Option<String>>(6)?, "project_name":r.get::<_,Option<String>>(7)?,
+            "terminology_industries":r.get::<_,Option<String>>(8)?.and_then(|raw| serde_json::from_str::<Value>(&raw).ok()),"is_demo":demo})))?;
         // Jobs are ordered by ID. Inserting in that order keeps the latest job per meeting.
         let Value::Array(jobs) = self.jobs()? else {
             unreachable!("jobs always returns an array");
@@ -916,13 +1034,18 @@ impl Store {
             }));
         }
         let company_terms = if demo { Vec::new() } else { crate::glossary::list(&self.0)? };
-        let industry_terms = crate::glossary::industry_terms(prefs["industry_template"].as_str().unwrap_or("decor"));
+        let industry_terms = crate::glossary::industry_terms(&self.0, prefs["industry_template"].as_str().unwrap_or("events"))?;
         let glossary_terms = crate::glossary::effective_terms(&company_terms, &industry_terms);
+        let term_proposals = if demo { Vec::new() } else {
+            crate::glossary::proposals(&self.0, &glossary_terms)?
+        };
         Ok(json!({"schema_version":1,"mode":if demo {"demo"}else{"real"},"now":now.to_rfc3339(),
             "today":now.with_timezone(&tz).date_naive().to_string(),"settings":prefs,"default_stages":default_stages,
             "people":people,"projects":projects,"tasks":tasks,"meetings":meetings,"proposals":proposals,
             "decisions":decisions,"notifications":notifications,"company_terms":company_terms,
-            "industry_terms":industry_terms,"glossary_terms":glossary_terms}))
+            "work_period_catalog":crate::work_period_catalog::list(&self.0, demo)?,
+            "event_work_period_lists":crate::work_period_catalog::event_lists(&self.0, demo)?,
+            "industry_catalog":crate::glossary::industry_catalog(&self.0)?,"specialization_catalog":crate::glossary::specialization_catalog(&self.0)?,"industry_terms":industry_terms,"glossary_terms":glossary_terms,"term_proposals":term_proposals}))
     }
     pub fn workspace_action(&self, body: &Value) -> Result<Value> {
         if body.get("demo").is_some_and(|v| !v.is_boolean()) {
@@ -934,12 +1057,28 @@ impl Store {
         }
         let tx = self.0.unchecked_transaction()?;
         let result = match text(body, "op") {
-            "save_company_term" | "delete_company_term" => {
+            "save_company_term" | "delete_company_term" | "review_term_proposal" => {
                 if demo { bail!("Справочник доступен в рабочей базе"); }
-                if text(body, "op") == "save_company_term" {
-                    crate::glossary::save(&tx, body)?
-                } else {
-                    crate::glossary::remove(&tx, body)?
+                match text(body, "op") {
+                    "save_company_term" => crate::glossary::save(&tx, body)?,
+                    "review_term_proposal" => crate::glossary::review_proposal(&tx, body, &industry_template(&tx)?)?,
+                    _ => crate::glossary::remove(&tx, body)?,
+                }
+            }
+
+            "browse_glossary" => crate::glossary::browse(&tx)?,
+            "scoped_glossary" => {
+                let selection = validate_industries(&tx, &body["scopes"])?;
+                let entries = crate::glossary::industry_terms_for(&tx, &selection)?;
+                let company = if demo { Vec::new() } else { crate::glossary::list(&tx)? };
+                json!(crate::glossary::effective_terms(&company, &entries))
+            }
+            "preview_dictionary_import" | "apply_dictionary_import" | "export_dictionary" => {
+                if demo { bail!("Справочник доступен в рабочей базе"); }
+                match text(body, "op") {
+                    "export_dictionary" => crate::glossary::export(&tx, text(body, "scope"), &industry_template(&tx)?)?,
+                    "preview_dictionary_import" => crate::glossary::import(&tx, body, false)?,
+                    _ => crate::glossary::import(&tx, body, true)?,
                 }
             }
 
@@ -970,6 +1109,8 @@ impl Store {
             )?,
             "save_task" => task_save(&tx, body, demo, None)?,
             "save_project" => project_save(&tx, body, demo)?,
+            "save_work_period_template" => crate::work_period_catalog::save(&tx, demo, &body["data"])?,
+            "save_work_period_list" => crate::work_period_catalog::save_list(&tx, demo, &body["data"])?,
             "archive_project" => {
                 let old = entity(&tx, "projects", id(body, "id").context("Укажите проект")?)?;
                 same_scope(&old, demo)?;
@@ -1002,10 +1143,15 @@ impl Store {
                     {
                         bail!("Неизвестная настройка");
                     }
-                    if key == "industry_template" && !matches!(value.as_str(), Some("universal" | "decor" | "it" | "construction")) {
-                        bail!("Выберите отраслевой шаблон");
-                    }
-                    prefs[key] = value.clone();
+                    prefs[key] = if key == "industry_template" {
+                        let industry = value.as_str().context("Выберите отраслевой шаблон")?;
+                        if !crate::glossary::has_industry(&tx, industry)? {
+                            bail!("Выберите отраслевой шаблон");
+                        }
+                        json!(crate::glossary::normalize_industry(industry))
+                    } else {
+                        value.clone()
+                    };
                 }
                 text(&prefs, "timezone")
                     .parse::<Tz>()
@@ -1110,6 +1256,18 @@ impl Store {
                         "UPDATE meetings SET scheduled_at=?2 WHERE id=?1",
                         params![mid, schedule],
                     )?;
+                }
+                if let Some(selection) = body["data"].get("terminology_industries") {
+                    let industries = validate_industries(&tx, selection)?;
+                    if industries.is_empty() {
+                        tx.execute("DELETE FROM meeting_terminology WHERE meeting_id=?1", [mid])?;
+                    } else {
+                        tx.execute(
+                            "INSERT INTO meeting_terminology(meeting_id,industries_json) VALUES (?1,?2)
+                             ON CONFLICT(meeting_id) DO UPDATE SET industries_json=excluded.industries_json",
+                            params![mid,json!(industries).to_string()],
+                        )?;
+                    }
                 }
                 tx.execute("DELETE FROM meeting_people WHERE meeting_id=?1", [mid])?;
                 if let Some(participants) = body["data"]["participants"].as_array() {

@@ -614,8 +614,9 @@ impl Store {
                 task["project_id"].as_i64().map_or(project_ids.is_empty(), |id| project_ids.contains(&id))
                     && !task["title"].as_str().is_some_and(administrative_change_title)
             }).collect();
-        let industry = crate::workspace::industry_template(&self.0)?;
-        let entries = crate::glossary::active_terms(&self.0, &industry)?;
+        let industries = crate::workspace::meeting_industries(&self.0, mid, &project_ids)?;
+        let industry_terms = crate::glossary::industry_terms_for(&self.0, &industries)?;
+        let entries = crate::glossary::effective_terms(&crate::glossary::list(&self.0)?, &industry_terms);
         let glossary = crate::glossary::Glossary::new(&entries);
         let company_terms = glossary.relevant(segments.iter().filter_map(|segment| segment["text"].as_str()));
         let mut project_tasks = Vec::new();
@@ -669,7 +670,8 @@ impl Store {
             "analysis_projects":analysis_projects,"model_run_id":run,"source_revision":revision(&self.0,mid)?,
             "participants":people,"segments":segments,"discussed_tasks":discussed_tasks,
             "project_tasks":project_tasks,"project_decisions":project_decisions,"project_materials":project_materials});
-        if industry != "decor" { value["industry_template"] = json!(industry); }
+        value["industry_template"] = json!(crate::glossary::parent_industry(&industries[0]));
+        value["industry_templates"] = json!(industries);
         if !company_terms.is_empty() { value["company_terms"] = json!(company_terms); }
         if value.to_string().len() > 350_000 {
             bail!("Транскрипт слишком большой для одного анализа");
@@ -752,7 +754,7 @@ impl Store {
                 ).optional()?;
                 if let Some((id, previous_model, raw)) = previous {
                     let previous: Value = serde_json::from_str(&raw)?;
-                    let same_context = ["analysis_mode", "analysis_policy", "source_revision", "company_terms", "industry_template"].iter()
+                    let same_context = ["analysis_mode", "analysis_policy", "source_revision", "company_terms", "industry_templates"].iter()
                         .all(|key| input[*key] == previous[*key])
                         && input["analysis_projects"] == previous["analysis_projects"]
                         && (mode == Some("automatic") || ["project_tasks", "project_decisions", "project_materials"].iter()
@@ -775,7 +777,7 @@ impl Store {
         }
         let source_revision = input["source_revision"].as_str().unwrap();
         let cache_revision = if !input["company_terms"].is_null() || !input["industry_template"].is_null() {
-            let vocabulary = json!([input["industry_template"],input["company_terms"]]);
+            let vocabulary = json!([input["industry_templates"],input["company_terms"]]);
             format!("{source_revision}:run:glossary:{:x}", Sha256::digest(vocabulary.to_string()))
         } else {
             source_revision.to_owned()
@@ -1087,11 +1089,18 @@ impl Store {
                 let kind = item["kind"].as_str()
                     .filter(|kind| ["status_update", "question", "information", "unclear_term"].contains(kind))
                     .context("Неизвестный тип наблюдения")?;
-                let text = bounded(item, "text", 4000, true)?;
-                let mut source = analysis_source(&input, mid, id, item)?;
-                if kind == "unclear_term" && !crate::glossary::valid_suggestion(&text, source["quote"].as_str().unwrap_or("")) {
-                    continue;
-                }
+                let parsed = || -> Result<_> {
+                    Ok((bounded(item, "text", 4000, true)?, analysis_source(&input, mid, id, item)?))
+                };
+                let (text, mut source) = if kind == "unclear_term" {
+                    let Ok((text, source)) = parsed() else { continue };
+                    if !crate::glossary::valid_suggestion(&text, source["quote"].as_str().unwrap_or("")) {
+                        continue;
+                    }
+                    (text, source)
+                } else {
+                    parsed()?
+                };
                 let project = result_project(&input, &item["project_id"]);
                 let task = snapshot_task(&input, item["task_id"].as_i64()).filter(|task| {
                     item["project_id"].is_null() || task["project_id"] == project
@@ -1688,9 +1697,9 @@ impl GroqWorker {
         if count < self.preview_cursor + 6 {
             return Ok(());
         }
-        let Some((title, date)) = store.0.query_row(
-            "SELECT title,created_at FROM meetings WHERE id=?1 AND is_demo=0", [meeting],
-            |row| Ok((row.get::<_,String>(0)?, row.get::<_,String>(1)?)),
+        let Some((title, date, project)) = store.0.query_row(
+            "SELECT title,created_at,project_id FROM meetings WHERE id=?1 AND is_demo=0", [meeting],
+            |row| Ok((row.get::<_,String>(0)?, row.get::<_,String>(1)?, row.get::<_,Option<i64>>(2)?)),
         ).optional()? else {
             return Ok(());
         };
@@ -1715,15 +1724,16 @@ impl GroqWorker {
         let model = self.live_model.as_deref().unwrap_or(&self.model);
         let key = if provider(model) == provider(&self.model) { self.key.as_deref() } else { self.live_key.as_deref() };
         let load_account = (model != OLLAMA_MODEL && key.is_none()).then(|| key_account(&self.base_account, model));
-        let industry = crate::workspace::industry_template(&store.0)?;
-        let glossary_entries = crate::glossary::active_terms(&store.0, &industry)?;
+        let industries = crate::workspace::meeting_industries(&store.0, meeting, project.as_slice())?;
+        let industry_terms = crate::glossary::industry_terms_for(&store.0, &industries)?;
+        let glossary_entries = crate::glossary::effective_terms(&crate::glossary::list(&store.0)?, &industry_terms);
         let terms = crate::glossary::Glossary::new(&glossary_entries)
             .relevant(segments.iter().filter_map(|segment| segment["text"].as_str()));
         let payload = json!({
             "mode":"analyze","key":key,"load_account":load_account,"model":model,
             "input":{"title":title,"created_at":date,"timezone":store.workspace_timezone()?,
                      "participants":[],"segments":segments,"company_terms":terms,
-                     "industry_template":industry}
+                     "industry_template":crate::glossary::parent_industry(&industries[0]),"industry_templates":industries}
         });
         self.preview_cursor = count;
         self.preview["running"] = json!(true);

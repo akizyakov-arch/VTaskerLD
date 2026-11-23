@@ -349,6 +349,30 @@ fn proposals_update_only_after_review_and_duplicates_link_without_extra_tasks() 
 }
 
 #[test]
+fn project_names_remain_unique_after_normalizing_case_and_spaces() {
+    let (_tmp, store) = open();
+    let create = |title: &str| {
+        store.workspace_action(&json!({
+            "op": "save_project", "data": {"title": title, "status": "active"}
+        }))
+    };
+    let project = create("Лён и ткани").unwrap();
+    assert!(create("  ЛЕН   и ткани  ").unwrap_err().to_string().contains("уже существует"));
+    let other = create("Другой проект").unwrap();
+    let rename = store.workspace_action(&json!({
+        "op": "save_project", "id": other["id"], "revision": other["revision"],
+        "data": {"title": "лён и ткани", "status": "active"}
+    }));
+    assert!(rename.is_err());
+    store.workspace_action(&json!({
+        "op": "archive_project", "id": project["id"], "revision": project["revision"], "archived": true
+    })).unwrap();
+    assert!(create("Лён и ткани").unwrap_err().to_string().contains("уже есть в архиве"));
+    let workspace = store.workspace(false, None).unwrap();
+    assert_eq!(workspace["projects"].as_array().unwrap().len(), 2);
+}
+
+#[test]
 fn project_archive_preserves_tasks_and_project_details() {
     let (_tmp, store) = open();
     let project = store
@@ -395,7 +419,7 @@ fn participant_profile_survives_upgrade_and_reopen() {
     drop(store);
 
     let old = rusqlite::Connection::open(&path).unwrap();
-    old.execute_batch("DROP TABLE company_terms; DROP TABLE live_voice_hints; DROP TABLE task_notifications; DROP TABLE task_links; DROP TABLE decision_tasks; DROP TABLE decision_context; DROP TABLE ai_extraction_cache; DROP TABLE ai_usage; DROP TABLE person_profiles; DROP TABLE speech_blocks; DROP TABLE speaker_blocks; ALTER TABLE live_chunks DROP COLUMN last_sequence; ALTER TABLE live_sessions DROP COLUMN speaker_turns_json; ALTER TABLE live_sessions DROP COLUMN speaker_profiles_json; ALTER TABLE processing_jobs DROP COLUMN stage; ALTER TABLE processing_jobs DROP COLUMN started_at; ALTER TABLE processing_jobs DROP COLUMN finished_at; PRAGMA user_version=17;")
+    old.execute_batch("DROP TABLE meeting_terminology; DROP INDEX meeting_analyses_term_findings; DROP TABLE term_reviews; DROP TABLE company_terms; DROP TABLE live_voice_hints; DROP TABLE task_notifications; DROP TABLE task_links; DROP TABLE decision_tasks; DROP TABLE decision_context; DROP TABLE ai_extraction_cache; DROP TABLE ai_usage; DROP TABLE person_profiles; DROP TABLE speech_blocks; DROP TABLE speaker_blocks; ALTER TABLE live_chunks DROP COLUMN last_sequence; ALTER TABLE live_sessions DROP COLUMN speaker_turns_json; ALTER TABLE live_sessions DROP COLUMN speaker_profiles_json; ALTER TABLE processing_jobs DROP COLUMN stage; ALTER TABLE processing_jobs DROP COLUMN started_at; ALTER TABLE processing_jobs DROP COLUMN finished_at; PRAGMA user_version=17;")
         .unwrap();
     drop(old);
 
@@ -420,4 +444,169 @@ fn participant_profile_survives_upgrade_and_reopen() {
     assert_eq!(people[0]["email"], "elena@example.test");
     assert_eq!(people[0]["phone"], "+7 900 000 00 00");
     assert_eq!(people[0]["notes"], "Работает над макетом");
+}
+
+#[test]
+fn work_periods_are_independent_of_task_statuses_and_survive_legacy_updates() {
+    let (_tmp, store) = open();
+    let original = store.workspace_action(&json!({
+        "op": "save_project", "data": {"title": "Оформление", "status": "planned"}
+    })).unwrap();
+    let edit = |revision: &Value, data: Value| {
+        store.workspace_action(&json!({
+            "op": "save_project", "id": original["id"], "revision": revision, "data": data
+        }))
+    };
+    let saved = edit(&original["revision"], json!({
+        "title": "Оформление", "status": "planned",
+        "start_date": "2026-12-01", "end_date": "2026-12-19",
+        "work_periods": [
+            {"id": "prep", "title": " Подготовка ", "end_date": "2026-12-16"},
+            {"id": "setup", "title": "Монтаж", "start_date": "2026-12-17", "end_date": "2026-12-18"},
+            {"id": "close", "title": "Демонтаж"}
+        ]
+    })).unwrap();
+    assert_eq!(saved["stages"], original["stages"]);
+    assert_eq!(saved["work_periods"][0], json!({
+        "id":"prep", "title":"Подготовка", "start_date":null, "end_date":"2026-12-16"
+    }));
+    assert_eq!(saved["work_periods"][2]["end_date"], Value::Null);
+    let legacy = edit(&saved["revision"], json!({"title": "Оформление", "status": "active"})).unwrap();
+    assert_eq!(legacy["work_periods"], saved["work_periods"]);
+
+    for invalid in [
+        json!([{"id":"x", "title":"Монтаж","start_date":"2026-12-18","end_date":"2026-12-17"}]),
+        json!([{"id":"x", "title":"Монтаж","start_date":"2026-02-30"}]),
+        json!([{"id":"x", "title":"   "}]),
+        json!([{"id":"x","title":"Монтаж"},{"id":"x","title":"Демонтаж"}]),
+        json!({"title":"Монтаж"}),
+    ] {
+        assert!(edit(&legacy["revision"], json!({
+            "title": "Оформление", "status": "active", "work_periods": invalid
+        })).is_err());
+    }
+    let workspace = store.workspace(false, None).unwrap();
+    assert_eq!(workspace["projects"][0]["work_periods"], saved["work_periods"]);
+    let cleared = edit(&legacy["revision"], json!({
+        "title":"Оформление", "status":"active", "work_periods":[]
+    })).unwrap();
+    assert_eq!(cleared["work_periods"], json!([]));
+}
+
+#[test]
+fn work_period_catalog_has_industry_defaults_and_editable_company_entries() {
+    let (tmp, store) = open();
+    let snapshot = store.workspace(false, None).unwrap();
+    let entries = snapshot["work_period_catalog"].as_array().unwrap();
+    for industry in snapshot["industry_catalog"].as_array().unwrap() {
+        assert!(entries.iter().any(|entry| entry["industry_id"] == industry["id"]));
+    }
+    assert!(entries.iter().any(|entry| {
+        entry["industry_id"] == "events" && entry["title"] == "Монтаж" && entry["built_in"] == true
+    }));
+    for (slug, phase) in [
+        ("venue", "Бриф и планирование"),
+        ("invitations", "Программа и работа с гостями"),
+        ("decor-design", "Площадка, декор и техническая подготовка"),
+        ("setup", "Монтаж и готовность к открытию"),
+        ("event", "День мероприятия"),
+        ("settlement", "Демонтаж и закрытие"),
+    ] {
+        let id = format!("builtin:events:{slug}");
+        assert!(entries.iter().any(|entry| entry["id"] == id && entry["phase"] == phase));
+    }
+    let store_template = |workspace: &Store, demo, data: Value| {
+        workspace.workspace_action(&json!({
+            "op": "save_work_period_template", "demo": demo, "data": data
+        }))
+    };
+    let created = store_template(&store, false, json!({
+        "title": "  Примерка декораций  ", "industry_id": "events"
+    })).unwrap();
+    assert_eq!(created["title"], "Примерка декораций");
+    assert_eq!(created["built_in"], false);
+    assert!(store_template(&store, false, json!({
+        "title": "ПРИМЕРКА   декораций", "industry_id": "events"
+    })).is_err());
+    assert!(store_template(&store, false, json!({
+        "title": "Подбор и бронирование площадки", "industry_id": "events"
+    })).is_err());
+    assert!(store_template(&store, false, json!({
+        "id": "builtin:events:setup", "title": "Переименование", "industry_id": "events"
+    })).is_err());
+    assert!(store_template(&store, false, json!({
+        "title": "Черновик", "industry_id": "unknown"
+    })).is_err());
+
+    let renamed = store_template(&store, false, json!({
+        "id": created["id"], "title": "Примерка на площадке", "industry_id": "universal"
+    })).unwrap();
+    assert_eq!(renamed["id"], created["id"]);
+    assert!(store_template(&store, true, json!({
+        "id": created["id"], "title": "Демо", "industry_id": "universal"
+    })).is_err());
+
+    let project = store.workspace_action(&json!({
+        "op": "save_project", "data": {
+            "title": "Декор", "status": "planned", "work_periods": [{"id": "local", "title": "Монтаж"}]
+        }
+    })).unwrap();
+    let project = store.workspace_action(&json!({
+        "op": "save_project", "id": project["id"], "revision": project["revision"], "data": {
+            "title": "Декор", "status": "planned", "work_periods": [{"id": "local", "title": "Монтаж сцены"}]
+        }
+    })).unwrap();
+    assert_eq!(project["work_periods"][0]["title"], "Монтаж сцены");
+    drop(store);
+
+    let reopened = Store::open(&tmp.path().join("db.sqlite3")).unwrap();
+    let current = reopened.workspace(false, None).unwrap();
+    assert!(current["work_period_catalog"].as_array().unwrap().contains(&renamed));
+    assert!(current["work_period_catalog"].as_array().unwrap().iter().any(|entry| entry["title"] == "Монтаж"));
+    assert_eq!(current["projects"][0]["work_periods"][0]["title"], "Монтаж сцены");
+    assert!(!reopened.workspace(true, None).unwrap()["work_period_catalog"].as_array().unwrap().contains(&renamed));
+}
+
+#[test]
+fn event_work_period_lists_are_independent_and_preserve_projects() {
+    let (tmp, store) = open();
+    let project = store.workspace_action(&json!({
+        "op": "save_project", "data": {
+            "title": "Оформление зала", "status": "planned",
+            "work_periods": [{"id":"local","title":"Концепция"}]
+        }
+    })).unwrap();
+    let snapshot = store.workspace(false, None).unwrap();
+    let lists = &snapshot["event_work_period_lists"];
+    let decor = lists["decor"].as_array().unwrap();
+    let base: Vec<_> = decor.iter().map(|entry| json!({
+        "id": entry["id"], "title": entry["title"]
+    })).collect();
+    let changed = json!([
+        {"id": base[1]["id"], "title": "Концепция оформления"},
+        base[0],
+        {"id": "custom:00112233445566778899aabbccddeeff", "title": "Примерка на площадке"}
+    ]);
+    let save = |base: &[Value], items: Value, kind: &str| store.workspace_action(&json!({
+        "op":"save_work_period_list", "data":{
+            "industry_id":"events", "project_type":kind, "base":base, "items":items
+        }
+    }));
+    assert!(save(&base, changed.clone(), "decor").is_ok());
+    assert!(save(&base, changed.clone(), "decor").is_ok());
+    assert!(save(&base, json!([]), "decor").is_err());
+    assert!(save(&base, changed.clone(), "organization").is_err());
+
+    let reopened = Store::open(&tmp.path().join("db.sqlite3")).unwrap();
+    let after = reopened.workspace(false, None).unwrap();
+    let updated = after["event_work_period_lists"]["decor"].as_array().unwrap();
+    assert_eq!(updated.len(), 3);
+    for (row, item) in updated.iter().zip(changed.as_array().unwrap()) {
+        assert_eq!(row["id"], item["id"]);
+        assert_eq!(row["title"], item["title"]);
+    }
+    assert_eq!(after["event_work_period_lists"]["organization"], lists["organization"]);
+    assert_eq!(after["projects"][0]["work_periods"], project["work_periods"]);
+    let demo = reopened.workspace(true, None).unwrap();
+    assert_eq!(demo["event_work_period_lists"]["decor"], lists["decor"]);
 }

@@ -40,10 +40,31 @@ struct MeetingTopics {
     private let workTopics: [Topic]
 
     init(industry: IndustryTemplate) {
-        workTopics = Self.catalog.filter { $0.industries?.contains(industry) ?? true }
+        self.init(industries: [industry])
+    }
+
+    init(industries: [IndustryTemplate]) {
+        let selected = Set(industries.map(\.parent))
+        workTopics = Self.catalog.filter { $0.industries.map { !selected.isDisjoint(with: $0) } ?? true }
     }
 
     var sectionTitles: [String] { workTopics.map(\.title) }
+
+    func missingWorkPeriod(in stageTitles: [String]) -> (String) -> Bool {
+        let stages = stageTitles.map { title in
+            let words = Self.words(in: title)
+            return (words, " " + words.joined(separator: " ") + " ")
+        }
+        let covered = Set(workTopics.filter { topic in
+            stages.contains { topic.matches($0.0, phrase: $0.1) }
+        }.map(\.title))
+        return { title in
+            let words = Self.words(in: title)
+            guard !words.isEmpty, title != Self.ungrouped, words.first != "зона" else { return false }
+            let phrase = " " + words.joined(separator: " ") + " "
+            return !covered.contains(title) && !stages.contains { $0.1.contains(phrase) }
+        }
+    }
 
     private static func words(in text: String) -> [Substring] {
         text.lowercased().replacingOccurrences(of: "ё", with: "е").split { !$0.isLetter }
@@ -134,7 +155,7 @@ struct MeetingTopics {
 }
 
 private struct MeetingTopicsKey: EnvironmentKey {
-    static let defaultValue = MeetingTopics(industry: .decor)
+    static let defaultValue = MeetingTopics(industry: .events)
 }
 
 extension EnvironmentValues {
@@ -172,6 +193,8 @@ struct MeetingTopicList<Row: Identifiable, Content: View>: View {
     let topic: (Row) -> String
     var visibleRange: Range<Int>? = nil
     var collapsible = false
+    var expandOnlyFirst = false
+    var missingWorkPeriod: ((String) -> Bool)? = nil
     @ViewBuilder let content: (Row) -> Content
 
     var body: some View {
@@ -190,7 +213,9 @@ struct MeetingTopicList<Row: Identifiable, Content: View>: View {
         ForEach(sections, id: \.key) { section in
             if collapsible {
                 MeetingDisclosure(title: section.title, icon: "folder",
-                                  count: section.rows.count, initiallyExpanded: true) {
+                                  count: section.rows.count,
+                                  initiallyExpanded: !expandOnlyFirst || section.key == sections.first?.key,
+                                  trailingIndicator: expandOnlyFirst) {
                     LazyVStack(alignment: .leading, spacing: 8) {
                         ForEach(section.rows, content: content)
                     }
@@ -203,6 +228,15 @@ struct MeetingTopicList<Row: Identifiable, Content: View>: View {
                             .foregroundStyle(.secondary)
                             .accessibilityAddTraits(.isHeader)
                             .padding(.bottom, 2)
+                    }
+                    if missingWorkPeriod?(section.title) == true {
+                        Label("Нет в справочнике этапов", systemImage: "plus.circle")
+                            .font(.caption.weight(.medium))
+                            .foregroundStyle(.primary)
+                            .padding(.horizontal, 7)
+                            .padding(.vertical, 3)
+                            .background(.yellow.opacity(0.20), in: Capsule())
+                            .help("Рассмотрите добавление этой темы как этапа работ")
                     }
                     ForEach(section.rows, content: content)
                 }

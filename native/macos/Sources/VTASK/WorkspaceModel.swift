@@ -8,6 +8,7 @@ final class WorkspaceModel: ObservableObject {
     @Published private(set) var loading = false
 
     @Published private(set) var saving = false
+    @Published private(set) var dictionaryGeneration = 0
     @Published private(set) var capture: CaptureStatus?
     private var savedViewPayloads: [[String: Any]] = []
     private var projectPayloads: [Int: [String: Any]] = [:]
@@ -163,11 +164,15 @@ final class WorkspaceModel: ObservableObject {
         return try decode(MeetingVoicePlan.self, from: data)
     }
 
+    func captureActivity() async throws -> CaptureStatus {
+        let data = try await request("api/recording/activity")
+        return try decode(CaptureStatus.self, from: data)
+    }
+
     func pollCapture() async {
         var lastSpeechPoll = Date.distantPast
         while !Task.isCancelled {
-            if let data = try? await request("api/recording/activity"),
-               let result = try? decode(CaptureStatus.self, from: data) {
+            if let result = try? await captureActivity() {
                 if capture?.active != nil && result.active == nil { await reload() }
                 if capture != result { capture = result }
             }
@@ -252,6 +257,29 @@ final class WorkspaceModel: ObservableObject {
         throw URLError(.timedOut)
     }
 
+    func browseGlossary() async throws -> GlossaryLibrary {
+        let data = try await request("api/workspace/action", payload: ["op": "browse_glossary"])
+        return try decode(GlossaryLibrary.self, from: data)
+    }
+
+    func scopedGlossary(for scopes: [String]) async throws -> [CompanyTerm] {
+        let data = try await request("api/workspace/action", payload: ["op": "scoped_glossary", "scopes": scopes])
+        return try decode([CompanyTerm].self, from: data)
+    }
+
+    func previewDictionaryImport(_ document: [String: Any]) async throws -> DictionaryImportPreview {
+        let data = try await request("api/workspace/action", payload: [
+            "op": "preview_dictionary_import", "document": document
+        ])
+        return try decode(DictionaryImportPreview.self, from: data)
+    }
+
+    func exportDictionary(scope: String) async throws -> Data {
+        let data = try await request("api/workspace/action", payload: ["op": "export_dictionary", "scope": scope])
+        let document = try JSONSerialization.jsonObject(with: data)
+        return try JSONSerialization.data(withJSONObject: document, options: [.prettyPrinted, .sortedKeys])
+    }
+
     func createEntity(_ payload: [String: Any]) async -> Int? {
         struct Created: Decodable { let id: Int }
         guard let data = await commandResponse(payload, path: "api/workspace/action") else { return nil }
@@ -270,6 +298,9 @@ final class WorkspaceModel: ObservableObject {
         do {
             let data = try await request(path, payload: payload)
             await reload()
+            if payload["op"] as? String == "apply_dictionary_import" {
+                dictionaryGeneration += 1
+            }
             return data
         } catch {
             self.error = error.localizedDescription

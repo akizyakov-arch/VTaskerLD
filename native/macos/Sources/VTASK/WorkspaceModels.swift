@@ -12,8 +12,51 @@ struct Workspace: Decodable {
     let decisions: [Decision]
     let notifications: [TaskNotification]?
     let companyTerms: [CompanyTerm]?
+    let termProposals: [TermProposal]?
+    let industryCatalog: [IndustryOption]?
+    let specializationCatalog: [SpecializationOption]?
     let industryTerms: [CompanyTerm]?
     let glossaryTerms: [CompanyTerm]?
+    let workPeriodCatalog: [WorkPeriodTemplate]?
+    let eventWorkPeriodLists: [String: [WorkPeriodTemplate]]?
+
+    var industryOptions: [IndustryOption] { industryCatalog ?? IndustryOption.legacy }
+
+    func workPeriodTitles(for terminology: [String]) -> [String]? {
+        guard let workPeriodCatalog else { return nil }
+        let scopes = terminology.isEmpty ? [settings.industryTemplate ?? .events]
+            : terminology.map { IndustryTemplate(rawValue: $0) }
+        let industries = Set(scopes.map { $0.parent.rawValue } + ["universal"])
+        var titles = workPeriodCatalog.filter { entry in
+            industries.contains(entry.industryId)
+                && (entry.industryId != "events" || eventWorkPeriodLists == nil || !entry.builtIn)
+        }.map(\.title)
+        if industries.contains("events"), let lists = eventWorkPeriodLists {
+            let eventScopes = scopes.filter { $0.parent == .events }
+            let keys = eventScopes.contains(where: { $0.eventWorkPeriodListKey == nil })
+                ? Set(lists.keys) : Set(eventScopes.compactMap(\.eventWorkPeriodListKey))
+            titles.append(contentsOf: keys.flatMap { lists[$0]?.map(\.title) ?? [] })
+        }
+        return titles
+    }
+
+    func terminologySelection(projectID: Int?, meeting: Meeting? = nil) -> [String] {
+        if let ids = meeting?.terminologyIndustries, !ids.isEmpty {
+            return ids
+        }
+        return projects.first { $0.id == (meeting?.projectId ?? projectID) }?.terminologyIndustries ?? []
+    }
+
+    func terminologyTitles(_ ids: [String]) -> String {
+        let selection = ids.isEmpty ? [(settings.industryTemplate ?? .events).rawValue] : ids
+        return selection.compactMap { id in
+            industryOptions.first { $0.id == id }?.title ?? specializationCatalog?.first { $0.id == id }?.title
+        }.joined(separator: ", ")
+    }
+
+    var industryTitle: String {
+        industryOptions.first { $0.template == (settings.industryTemplate ?? .events) }?.title ?? "Мероприятия и декор"
+    }
 
     var visibleTasks: [TaskItem] {
         let archivedIDs = Set(projects.filter { $0.archived == true }.map(\.id))
@@ -31,6 +74,7 @@ struct Project: Decodable, Identifiable {
     let stages: [Stage]
     let startDate: String?
     let endDate: String?
+    let updatedAt: String?
     let revision: Int
     let goal: String?
     let materials: String?
@@ -40,6 +84,23 @@ struct Project: Decodable, Identifiable {
     let nextMilestoneDate: String?
     let blocker: String?
     let status: String
+    let terminologyIndustries: [String]?
+
+    let workPeriods: [ProjectWorkPeriod]?
+
+    var isCurrent: Bool { archived != true && (status == "planned" || status == "active") }
+}
+
+struct ProjectWorkPeriod: Decodable, Identifiable {
+    let id: String
+    var title: String
+    var startDate: String?
+    var endDate: String?
+
+    var datesAreReversed: Bool {
+        if let startDate, let endDate { return startDate > endDate }
+        return false
+    }
 }
 
 struct TaskItem: Decodable, Identifiable {
@@ -119,6 +180,7 @@ struct Meeting: Decodable, Identifiable {
     let projectId: Int?
     let status: String
     let participants: [Int]
+    let terminologyIndustries: [String]?
     let recordings: [Recording]
     let processing: ProcessingJob?
     let manualNotes: MeetingNotes?
@@ -126,15 +188,19 @@ struct Meeting: Decodable, Identifiable {
 
     var visibleTitle: String { displayTitle ?? title }
 
-    func meetingDateLabel(in zone: TimeZone) -> String? {
+    var date: Date? {
         if let meetingAt {
             let parser = ISO8601DateFormatter()
             parser.formatOptions.insert(.withFractionalSeconds)
             if let date = parser.date(from: meetingAt) ?? ISO8601DateFormatter().date(from: meetingAt) {
-                return formatMeetingDate(date, in: zone)
+                return date
             }
         }
-        return scheduleLabel(in: zone)
+        return scheduledDate
+    }
+
+    func meetingDateLabel(in zone: TimeZone) -> String? {
+        date.map { formatMeetingDate($0, in: zone) }
     }
 
     var scheduledDate: Date? {
@@ -200,6 +266,7 @@ struct CaptureStatus: Decodable, Equatable {
         let canPause: Bool
         let sessionId: String?
         let elapsedMs: Int?
+        let positionMs: Int?
         let savedMs: Int?
         let level: Double?
     }

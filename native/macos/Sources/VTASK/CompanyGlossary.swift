@@ -4,6 +4,7 @@ struct CompanyTerm: Decodable, Identifiable, Equatable {
     struct Variant: Decodable, Equatable {
         var text: String
         var language: String
+        var context: String? = nil
     }
 
     let id: Int
@@ -11,12 +12,17 @@ struct CompanyTerm: Decodable, Identifiable, Equatable {
     let term: String
     let language: String
     let section: String
+    let definition: String?
+    let lookupOnly: Bool?
+    let industryId: String?
+    let category: String?
     let variants: [Variant]
 }
 
 struct CompanyGlossary {
     private struct Spelling {
         let words: [String]
+        let context: [String]
         let entry: CompanyTerm
     }
 
@@ -24,7 +30,8 @@ struct CompanyGlossary {
 
     init(_ entries: [CompanyTerm] = []) {
         let all = entries.flatMap { entry in
-            ([entry.term] + entry.variants.map(\.text)).map { Spelling(words: Self.words($0), entry: entry) }
+            [Spelling(words: Self.words(entry.term), context: [], entry: entry)] +
+                entry.variants.map { Spelling(words: Self.words($0.text), context: Self.words($0.context ?? ""), entry: entry) }
         }.filter { !$0.words.isEmpty }
         spellings = Dictionary(grouping: all, by: { $0.words[0] }).mapValues {
             $0.sorted { $0.words.count > $1.words.count }
@@ -38,8 +45,8 @@ struct CompanyGlossary {
 
     func contains(_ spelling: String) -> Bool {
         let words = Self.words(spelling)
-        guard !words.isEmpty, let match = match(at: words[...]) else { return false }
-        return match.words.count == words.count
+        guard let first = words.first else { return false }
+        return spellings[first]?.contains { $0.words == words } ?? false
     }
 
     func expand(_ words: [String]) -> [String] {
@@ -47,7 +54,7 @@ struct CompanyGlossary {
         var result = [String]()
         var offset = 0
         while offset < words.count {
-            if let spelling = match(at: words[offset...]) {
+            if let spelling = match(in: words, at: offset) {
                 result += Self.words(spelling.entry.term)
                 offset += spelling.words.count
             } else {
@@ -64,7 +71,7 @@ struct CompanyGlossary {
         var sections = Set<String>()
         var offset = 0
         while offset < words.count {
-            if let spelling = match(at: words[offset...]) {
+            if let spelling = match(in: words, at: offset) {
                 if !spelling.entry.section.isEmpty { sections.insert(spelling.entry.section) }
                 offset += spelling.words.count
             } else {
@@ -74,9 +81,22 @@ struct CompanyGlossary {
         return sections.count == 1 ? sections.first : nil
     }
 
-    private func match(at words: ArraySlice<String>) -> Spelling? {
-        guard let first = words.first else { return nil }
-        return spellings[first]?.first { words.starts(with: $0.words) }
+    private func match(in tokens: [String], at offset: Int) -> Spelling? {
+        let matches = (spellings[tokens[offset]] ?? []).filter {
+            $0.entry.lookupOnly != true && tokens[offset...].starts(with: $0.words)
+        }
+        guard let length = matches.first?.words.count else { return nil }
+        let end = offset + length
+        let nearby = [tokens[max(0, offset - 5)..<offset], tokens[end..<min(tokens.count, end + 5)]]
+        let longest = matches.prefix { $0.words.count == length }
+        let contextual = longest.filter { item in
+            !item.context.isEmpty && nearby.contains { words in
+                words.indices.contains { words[$0...].starts(with: item.context) }
+            }
+        }
+        let choices = contextual.isEmpty ? longest.filter { $0.context.isEmpty } : contextual
+        guard let first = choices.first, choices.allSatisfy({ $0.entry.id == first.entry.id }) else { return nil }
+        return first
     }
 }
 
@@ -91,12 +111,43 @@ extension EnvironmentValues {
     }
 }
 
+struct TermProposal: Decodable, Identifiable {
+    struct Source: Decodable, Identifiable {
+        let meetingId: Int
+        let quote: String
+
+        var id: Int { meetingId }
+    }
+
+    enum Status: String, Decodable {
+        case proposed, approved, merged, rejected
+
+        var title: String {
+            switch self {
+            case .proposed: "На проверке"
+            case .approved: "Подтверждён"
+            case .merged: "Добавлен как вариант"
+            case .rejected: "Отклонён"
+            }
+        }
+    }
+
+    let id: String
+    let text: String
+    let status: Status
+    let sources: [Source]
+    let termId: Int?
+}
+
 struct CompanyTermDraft: Identifiable {
     let id = UUID()
     var existing: CompanyTerm?
+    var proposal: TermProposal?
+    var merging = false
     var term = ""
     var language = ""
     var section = ""
+    var definition = ""
     var variants = [CompanyTerm.Variant(text: "", language: "")]
 
     init(existing: CompanyTerm? = nil, term: String = "", variants: [CompanyTerm.Variant] = []) {
@@ -104,12 +155,13 @@ struct CompanyTermDraft: Identifiable {
         self.term = existing?.term ?? term
         language = existing?.language ?? ""
         section = existing?.section ?? ""
+        definition = existing?.definition ?? ""
         if let existing { self.variants = existing.variants }
         else if !variants.isEmpty { self.variants = variants }
     }
 
     var valid: Bool {
-        !CompanyGlossary.words(term).isEmpty && variants.contains { !CompanyGlossary.words($0.text).isEmpty }
+        !CompanyGlossary.words(term).isEmpty
     }
 
     func save(using model: WorkspaceModel) async -> Bool {
@@ -119,10 +171,16 @@ struct CompanyTermDraft: Identifiable {
                 "term": term,
                 "language": language,
                 "section": section,
+                "definition": definition,
                 "variants": variants.filter { !CompanyGlossary.words($0.text).isEmpty }
-                    .map { ["text": $0.text, "language": $0.language] }
+                    .map { ["text": $0.text, "language": $0.language, "context": $0.context ?? ""] }
             ]
         ]
+        if let proposal {
+            request["op"] = "review_term_proposal"
+            request["proposal_id"] = proposal.id
+            request["status"] = merging ? "merged" : "approved"
+        }
         if let existing {
             request["id"] = existing.id
             request["revision"] = existing.revision
@@ -131,216 +189,35 @@ struct CompanyTermDraft: Identifiable {
     }
 }
 
-struct CompanyGlossaryView: View {
-    @ObservedObject var model: WorkspaceModel
-    let entries: [CompanyTerm]
-    let industry: IndustryTemplate
-    let starterTerms: [CompanyTerm]
-    let meetings: [Meeting]
-    let openMeeting: (Int) -> Void
-    @Environment(\.companyGlossary) private var glossary
+struct TermMergePicker: View {
+    let item: TermProposal
+    let terms: [CompanyTerm]
+    let select: (CompanyTerm) -> Void
     @State private var query = ""
-    @State private var source = Source.all
-    @State private var editing: CompanyTermDraft?
-    @State private var deleting: CompanyTerm?
-    @State private var showingSuggestions = false
-
-    private enum Source: String, CaseIterable, Identifiable {
-        case all = "Все"
-        case industry = "Отрасль"
-        case company = "Компания"
-
-        var id: Self { self }
-    }
-
-    private struct Suggestion: Identifiable {
-        let id: String
-        let text: String
-        let meeting: Meeting
-        let quote: String?
-    }
-
-    private var suggestions: [Suggestion] {
-        var seen = Set<String>()
-        return meetings.sorted { $0.id > $1.id }.flatMap { meeting in
-            (meeting.analysis?.saved?.result?.findings ?? []).compactMap { finding in
-                let normalized = CompanyGlossary.words(finding.text).joined(separator: " ")
-                guard finding.kind == "unclear_term", !normalized.isEmpty, !glossary.contains(finding.text),
-                      seen.insert(normalized).inserted else { return nil }
-                return Suggestion(id: normalized, text: finding.text, meeting: meeting, quote: finding.source?.quote)
-            }
-        }
-    }
 
     var body: some View {
-        ScrollView {
-            LazyVStack(alignment: .leading, spacing: 10) {
-                ViewThatFits(in: .horizontal) {
-                    HStack { searchField; controls }
-                    VStack(alignment: .leading, spacing: 8) { searchField; controls }
-                }
-                Picker("Источник терминов", selection: $source) {
-                    ForEach(Source.allCases) { item in Text(item.rawValue).tag(item) }
-                }
-                .labelsHidden()
-                .pickerStyle(.segmented)
-                .frame(maxWidth: 300)
-                if showingSuggestions { suggestionList }
-
-                let industryResults = matches(in: starterTerms)
-                let companyResults = matches(in: entries)
-                if source != .company && !industryResults.isEmpty {
-                    Text("Словарь отрасли · \(industry.title)").font(.headline).accessibilityAddTraits(.isHeader)
-                    ForEach(industryResults, content: starterRow)
-                }
-                if source != .industry && !companyResults.isEmpty {
-                    Text("Термины компании").font(.headline).accessibilityAddTraits(.isHeader)
-                    ForEach(companyResults, content: termRow)
-                }
-                if (source == .company || industryResults.isEmpty) && (source == .industry || companyResults.isEmpty) {
-                    Label(query.isEmpty && source == .company ? "У компании пока нет своих терминов" : "Термины не найдены",
-                          systemImage: query.isEmpty ? "book.closed" : "magnifyingglass")
-                        .foregroundStyle(.secondary).panelCard()
-                }
-            }
-            .padding(24)
-            .frame(maxWidth: 860)
-            .frame(maxWidth: .infinity)
-        }
-        .sheet(item: $editing) { draft in
-            CompanyTermEditor(model: model, draft: draft)
-                .sheetCloseButton(disabled: model.saving)
-        }
-        .alert("Удалить термин?", isPresented: Binding(get: { deleting != nil }, set: { if !$0 { deleting = nil } }),
-               presenting: deleting) { term in
-            Button("Отмена", role: .cancel) {}
-            Button("Удалить", role: .destructive) {
-                Task { await model.command(["op": "delete_company_term", "id": term.id, "revision": term.revision]) }
-            }
-        } message: { term in Text(term.term) }
-    }
-
-    private var searchField: some View {
-        PanelSearchField(placeholder: "Поиск по терминам и вариантам", query: $query)
-    }
-
-    private var controls: some View {
-        HStack(spacing: 8) {
-            Button {
-                showingSuggestions.toggle()
-            } label: {
-                Label("Анализ протоколов", systemImage: "text.magnifyingglass")
-            }
-            .buttonStyle(.bordered)
-            .accessibilityValue(showingSuggestions ? "Развёрнуто" : "Свёрнуто")
-            Button {
-                editing = CompanyTermDraft()
-            } label: {
-                Label("Добавить термин", systemImage: "plus")
-            }
-            .buttonStyle(.borderedProminent)
-            .disabled(model.saving)
-        }
-        .fixedSize()
-    }
-
-    private var suggestionList: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text("Термины для уточнения").font(.headline).accessibilityAddTraits(.isHeader)
-            if suggestions.isEmpty {
-                Text("В сохранённых разборах пока нет терминов для уточнения.")
-                    .foregroundStyle(.secondary)
-            }
-            ForEach(suggestions) { item in
-                Divider()
-                HStack(alignment: .top, spacing: 8) {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text(item.text).font(.callout.weight(.semibold))
-                        if let quote = item.quote, !quote.isEmpty {
-                            Text(quote).font(.caption).foregroundStyle(.secondary).lineLimit(3)
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Добавить «\(item.text)» как вариант").font(.headline)
+            PanelSearchField(placeholder: "Найти основной термин", query: $query)
+            List {
+                ForEach(terms.filter { query.isEmpty || $0.term.localizedStandardContains(query) }
+                    .sorted { $0.term.localizedStandardCompare($1.term) == .orderedAscending }) { term in
+                    Button {
+                        select(term)
+                    } label: {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(term.term)
+                            if let definition = term.definition, !definition.isEmpty {
+                                Text(definition).font(.caption).foregroundStyle(.secondary)
+                            }
                         }
-                        Button(item.meeting.visibleTitle) { openMeeting(item.meeting.id) }.buttonStyle(.link)
-                    }
-                    Spacer(minLength: 8)
-                    Button("Добавить") {
-                        editing = CompanyTermDraft(variants: [.init(text: item.text, language: "")])
-                    }
-                    .accessibilityLabel("Добавить термин «" + item.text + "»")
+                    }.buttonStyle(.plain)
+                        .disabled(term.id > 0 && term.variants.count >= 30)
                 }
             }
         }
-        .panelCard()
-    }
-
-    private func matches(in terms: [CompanyTerm]) -> [CompanyTerm] {
-        let words = CompanyGlossary.words(query)
-        return terms.filter { term in
-            let searchable = ([term.term, term.section, term.language] +
-                              term.variants.flatMap { [$0.text, $0.language] }).joined(separator: " ")
-            return words.allSatisfy { searchable.localizedStandardContains($0) }
-        }.sorted { $0.term.localizedStandardCompare($1.term) == .orderedAscending }
-    }
-
-    private func starterRow(_ starter: CompanyTerm) -> some View {
-        HStack(spacing: 10) {
-            termText(starter)
-            if !starter.section.isEmpty {
-                Text(starter.section).font(.caption).foregroundStyle(.secondary).lineLimit(1)
-            }
-            Button {
-                let termWords = CompanyGlossary.words(starter.term)
-                let existing = entries.first { CompanyGlossary.words($0.term) == termWords }
-                var draft = CompanyTermDraft(existing: existing, term: starter.term)
-                if existing == nil {
-                    draft.language = starter.language
-                    draft.section = starter.section
-                } else if draft.variants.count < 30 {
-                    draft.variants.append(.init(text: "", language: ""))
-                }
-                editing = draft
-            } label: {
-                Label("Добавить вариант", systemImage: "plus")
-            }
-            .buttonStyle(.bordered)
-            .disabled(model.saving)
-        }
-        .panelCard()
-    }
-
-    private func termText(_ term: CompanyTerm) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text(term.term).font(.headline)
-            Text(term.variants.map(\.text).joined(separator: " · "))
-                .font(.callout).foregroundStyle(.secondary)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-    }
-
-    private func termRow(_ term: CompanyTerm) -> some View {
-        HStack(spacing: 10) {
-            Button {
-                editing = CompanyTermDraft(existing: term)
-            } label: {
-                termText(term)
-                    .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            if !term.language.isEmpty {
-                Text(term.language).font(.caption.monospaced()).foregroundStyle(.secondary)
-            }
-            if !term.section.isEmpty {
-                Text(term.section).font(.caption).foregroundStyle(.secondary).lineLimit(1)
-            }
-            Menu {
-                Button("Редактировать") { editing = CompanyTermDraft(existing: term) }
-                Button("Удалить", role: .destructive) { deleting = term }
-            } label: {
-                Image(systemName: "ellipsis.circle").accessibilityLabel("Действия термина")
-            }
-            .fixedSize()
-            .disabled(model.saving)
-        }
-        .panelCard()
+        .padding(20)
+        .frame(width: 480, height: 360)
     }
 }
 
@@ -358,21 +235,29 @@ struct CompanyTermEditor: View {
             Form {
                 Section("Значение") {
                     TextField("Основной термин", text: $draft.term, prompt: Text("Сотовый поликарбонат"))
+                    TextField("Определение", text: $draft.definition, prompt: Text("Необязательно"), axis: .vertical)
+                        .lineLimit(1...3)
                     TextField("Язык", text: $draft.language, prompt: Text("Например, ru или en"))
                     TextField("Раздел", text: $draft.section, prompt: Text("Необязательно"))
                 }
                 Section("Как ещё говорят") {
                     ForEach(draft.variants.indices, id: \.self) { index in
-                        HStack {
-                            TextField("Вариант", text: $draft.variants[index].text)
-                            TextField("Язык", text: $draft.variants[index].language).frame(width: 80)
-                            Button {
-                                draft.variants.remove(at: index)
-                            } label: {
-                                Image(systemName: "minus.circle").accessibilityLabel("Убрать вариант")
+                        VStack(alignment: .leading, spacing: 6) {
+                            HStack {
+                                TextField("Вариант", text: $draft.variants[index].text)
+                                TextField("Язык", text: $draft.variants[index].language).frame(width: 80)
+                                Button {
+                                    draft.variants.remove(at: index)
+                                } label: {
+                                    Image(systemName: "minus.circle").accessibilityLabel("Убрать вариант")
+                                }
+                                .buttonStyle(.borderless)
+                                .disabled(draft.variants.count == 1)
                             }
-                            .buttonStyle(.borderless)
-                            .disabled(draft.variants.count == 1)
+                            TextField("Фраза рядом (необязательно)", text: Binding(
+                                get: { draft.variants[index].context ?? "" },
+                                set: { draft.variants[index].context = $0 }
+                            ), prompt: Text("Например, плиту"))
                         }
                     }
                     Button("Добавить вариант") {

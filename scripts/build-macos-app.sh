@@ -22,7 +22,9 @@ app="$package/.build/VTASK.app"
 resources="$app/Contents/Resources"
 mkdir -p "$app/Contents/MacOS" "$resources/scripts"
 cp "$package/Resources/VTASK.icns" "$package/Sources/VTASK/Resources/meeting-topics.json" \
-    "$package/Sources/VTASK/Resources/recording-wave.png" "$resources/"
+    "$package/Sources/VTASK/Resources/recording-wave.png" \
+    "$package/Sources/VTASK/Resources/settings-ribbon.png" \
+    "$package/Sources/VTASK/Resources/VTASK-user-guide.html" "$resources/"
 cp -R "$package/Sources/VTASK/Resources/Manrope" "$package/Sources/VTASK/Resources/ValliAvatar" "$resources/"
 cp "$repo_dir/web/vtask-light.svg" "$repo_dir/web/vtask-dark.svg" "$resources/"
 # Replace executables atomically so a running core keeps its signed inode.

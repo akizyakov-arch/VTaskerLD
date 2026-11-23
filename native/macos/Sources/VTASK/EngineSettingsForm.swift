@@ -62,7 +62,10 @@ struct SpeechPreferences: Decodable {
 }
 
 struct EngineSettingsForm: View {
+    enum Area { case providers, analysis, speech }
+
     @ObservedObject var model: WorkspaceModel
+    let area: Area
     @State private var status: EngineSettings?
     @State private var provider = "local"
     @State private var localModel = ""
@@ -106,183 +109,188 @@ struct EngineSettingsForm: View {
             if let error { Text(error).foregroundStyle(.red) }
             if let message { Text(message).foregroundStyle(.secondary) }
             if let status {
-                Section("ИИ для полного анализа") {
-                    Text("Формирует итоги, задачи и решения из протокола совещания.")
-                        .font(.caption).foregroundStyle(.secondary)
-                    Picker("Провайдер", selection: Binding(get: { aiProvider }, set: { id in
-                        aiProvider = id
-                        aiModel = aiDefaults[id] ?? ""
-                        groqKey = ""
-                    })) {
-                        ForEach(aiProviders, id: \.self) { id in Text(aiNames[id] ?? id).tag(id) }
-                    }
-                    if aiProvider == "ollama" {
-                        localModelInfo
-                    } else {
-                        TextField("Модель API", text: $aiModel)
-                        Text(status.groq.hasKey && status.groq.model == (aiProvider == "groq" ? aiModel : aiProvider + ":" + aiModel)
-                             ? "Ключ подключён." : "Добавьте API-ключ выбранного провайдера.")
+                switch area {
+                case .providers:
+                    Section("ИИ для полного анализа") {
+                        Text("Формирует итоги, задачи и решения из протокола совещания.")
                             .font(.caption).foregroundStyle(.secondary)
-                        VStack(alignment: .leading, spacing: 6) {
-                            Text("API-ключ").font(.headline)
-                            SecureField("Вставьте ключ " + (aiNames[aiProvider] ?? aiProvider), text: $groqKey)
-                                .textFieldStyle(.roundedBorder)
-                                .accessibilityLabel("API-ключ выбранного провайдера")
-                        }
-                        Toggle("Сохранить ключ в Связке ключей macOS", isOn: $persistAIKey)
-                    }
-                    Button("Сохранить настройки ИИ") {
-                        Task {
-                            let selected = aiProvider == "groq" ? aiModel : aiProvider + ":" + aiModel
-                            if await model.command(["api_key": groqKey, "model": selected,
-                                                    "persist": persistAIKey],
-                                                   path: "api/groq/settings") {
-                                groqKey = ""
-                                message = "Настройки ИИ сохранены."
-                                await load()
-                            }
-                        }
-                    }
-                    .disabled(aiModel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || status.groq.busy)
-                    if aiProvider != "ollama" { Button("Удалить ключ выбранного провайдера", role: .destructive) {
-                        Task {
-                            if await model.command(["clear_key": true], path: "api/groq/settings") {
-                                message = "Ключ активного провайдера удалён."
-                                await load()
-                            }
-                        }
-                    }
-                    .disabled(status.groq.busy || !status.groq.hasKey ||
-                              status.groq.model != (aiProvider == "groq" ? aiModel : aiProvider + ":" + aiModel))
-                    }
-                }
-                Section("ИИ для Валли") {
-                    Picker("Модель разбора команд", selection: Binding(get: { assistantModel }, set: { id in
-                        assistantModel = id
-                        assistantKey = ""
-                    })) {
-                        Text("Как для анализа протокола").tag("")
-                        ForEach(assistantOptions(status.groq), id: \.self) { id in
-                            Text(assistantModelLabel(id)).tag(id)
-                        }
-                    }
-                    if assistantModel.hasPrefix("ollama:") {
-                        localModelInfo
-                    } else if !assistantModel.isEmpty {
-                        SecureField("API-ключ провайдера", text: $assistantKey)
-                            .textFieldStyle(.roundedBorder)
-                        Toggle("Сохранить ключ в Связке ключей macOS", isOn: $persistAssistantKey)
-                        Text("Если ключ уже сохранён для этого провайдера, поле можно оставить пустым.")
-                            .font(.caption).foregroundStyle(.secondary)
-                    }
-                    Text("Модель используется для свободных команд. Поиск по словарю идёт на Mac.")
-                        .font(.caption).foregroundStyle(.secondary)
-                    Button("Сохранить модель Валли") {
-                        Task {
-                            if await model.command(["profile": "assistant", "model": assistantModel,
-                                                    "use_full_profile": assistantModel.isEmpty, "api_key": assistantKey,
-                                                    "persist": persistAssistantKey], path: "api/groq/settings") {
-                                assistantKey = ""
-                                message = "Модель Валли сохранена."
-                                await load()
-                            }
-                        }
-                    }
-                    .disabled(status.groq.busy || (assistantModel == (status.groq.assistantModel ?? "") && assistantKey.isEmpty))
-                }
-                budgetSection
-                Section("ИИ для анализа на лету") {
-                    Toggle("Анализировать фрагменты во время записи Live", isOn: $livePreview)
-                    Toggle("Автоматически анализировать после записи", isOn: $automaticAI)
-                    Toggle("Использовать профиль полного анализа", isOn: $useFullProfile)
-                    if !useFullProfile {
-                        Picker("Провайдер", selection: Binding(get: { liveProvider }, set: { id in
-                            liveProvider = id
-                            liveModel = aiDefaults[id] ?? ""
-                            liveKey = ""
+                        Picker("Провайдер", selection: Binding(get: { aiProvider }, set: { id in
+                            aiProvider = id
+                            aiModel = aiDefaults[id] ?? ""
+                            groqKey = ""
                         })) {
                             ForEach(aiProviders, id: \.self) { id in Text(aiNames[id] ?? id).tag(id) }
                         }
-                        if liveProvider == "ollama" {
+                        if aiProvider == "ollama" {
                             localModelInfo
                         } else {
-                            TextField("Модель API", text: $liveModel)
-                            SecureField("API-ключ " + (aiNames[liveProvider] ?? liveProvider), text: $liveKey)
+                            TextField("Модель API", text: $aiModel)
+                            Text(status.groq.hasKey && status.groq.model == (aiProvider == "groq" ? aiModel : aiProvider + ":" + aiModel)
+                                 ? "Ключ подключён." : "Добавьте API-ключ выбранного провайдера.")
+                                .font(.caption).foregroundStyle(.secondary)
+                            VStack(alignment: .leading, spacing: 6) {
+                                Text("API-ключ").font(.headline)
+                                SecureField("Вставьте ключ " + (aiNames[aiProvider] ?? aiProvider), text: $groqKey)
+                                    .textFieldStyle(.roundedBorder)
+                                    .accessibilityLabel("API-ключ выбранного провайдера")
+                            }
+                            Toggle("Сохранить ключ в Связке ключей macOS", isOn: $persistAIKey)
+                        }
+                        Button("Сохранить настройки ИИ") {
+                            Task {
+                                let selected = aiProvider == "groq" ? aiModel : aiProvider + ":" + aiModel
+                                if await model.command(["api_key": groqKey, "model": selected,
+                                                        "persist": persistAIKey],
+                                                       path: "api/groq/settings") {
+                                    groqKey = ""
+                                    message = "Настройки ИИ сохранены."
+                                    await load()
+                                }
+                            }
+                        }
+                        .disabled(aiModel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || status.groq.busy)
+                        if aiProvider != "ollama" { Button("Удалить ключ выбранного провайдера", role: .destructive) {
+                            Task {
+                                if await model.command(["clear_key": true], path: "api/groq/settings") {
+                                    message = "Ключ активного провайдера удалён."
+                                    await load()
+                                }
+                            }
+                        }
+                        .disabled(status.groq.busy || !status.groq.hasKey ||
+                                  status.groq.model != (aiProvider == "groq" ? aiModel : aiProvider + ":" + aiModel))
+                        }
+                    }
+                    Section("ИИ для Валли") {
+                        Picker("Модель разбора команд", selection: Binding(get: { assistantModel }, set: { id in
+                            assistantModel = id
+                            assistantKey = ""
+                        })) {
+                            Text("Как для анализа протокола").tag("")
+                            ForEach(assistantOptions(status.groq), id: \.self) { id in
+                                Text(assistantModelLabel(id)).tag(id)
+                            }
+                        }
+                        if assistantModel.hasPrefix("ollama:") {
+                            localModelInfo
+                        } else if !assistantModel.isEmpty {
+                            SecureField("API-ключ провайдера", text: $assistantKey)
                                 .textFieldStyle(.roundedBorder)
-                            Toggle("Сохранить ключ в Связке ключей macOS", isOn: $persistLiveKey)
+                            Toggle("Сохранить ключ в Связке ключей macOS", isOn: $persistAssistantKey)
+                            Text("Если ключ уже сохранён для этого провайдера, поле можно оставить пустым.")
+                                .font(.caption).foregroundStyle(.secondary)
                         }
-                    }
-                    Text("Предварительный анализ обрабатывает фрагменты текста во время записи и показывает итоги у Валли.")
-                        .font(.caption).foregroundStyle(.secondary)
-                    Button("Сохранить профиль анализа на лету") {
-                        Task {
-                            let name = liveModel.trimmingCharacters(in: .whitespacesAndNewlines)
-                            let selected = liveProvider == "groq" ? name : liveProvider + ":" + name
-                            var settings: [String: Any] = ["profile": "live", "automatic": automaticAI, "live_preview": livePreview,
-                                                           "use_full_profile": useFullProfile]
-                            if !useFullProfile {
-                                settings["model"] = selected
-                                settings["api_key"] = liveKey
-                                settings["persist"] = persistLiveKey
+                        Text("Модель используется для свободных команд. Поиск по словарю идёт на Mac.")
+                            .font(.caption).foregroundStyle(.secondary)
+                        Button("Сохранить модель Валли") {
+                            Task {
+                                if await model.command(["profile": "assistant", "model": assistantModel,
+                                                        "use_full_profile": assistantModel.isEmpty, "api_key": assistantKey,
+                                                        "persist": persistAssistantKey], path: "api/groq/settings") {
+                                    assistantKey = ""
+                                    message = "Модель Валли сохранена."
+                                    await load()
+                                }
                             }
-                            if await model.command(settings, path: "api/groq/settings") {
+                        }
+                        .disabled(status.groq.busy || (assistantModel == (status.groq.assistantModel ?? "") && assistantKey.isEmpty))
+                    }
+                case .analysis:
+                    budgetSection
+                    Section("ИИ для анализа на лету") {
+                        Toggle("Анализировать фрагменты во время записи Live", isOn: $livePreview)
+                        Toggle("Автоматически анализировать после записи", isOn: $automaticAI)
+                        Toggle("Использовать профиль полного анализа", isOn: $useFullProfile)
+                        if !useFullProfile {
+                            Picker("Провайдер", selection: Binding(get: { liveProvider }, set: { id in
+                                liveProvider = id
+                                liveModel = aiDefaults[id] ?? ""
                                 liveKey = ""
-                                message = "Профиль анализа на лету сохранён."
-                                await load()
+                            })) {
+                                ForEach(aiProviders, id: \.self) { id in Text(aiNames[id] ?? id).tag(id) }
+                            }
+                            if liveProvider == "ollama" {
+                                localModelInfo
+                            } else {
+                                TextField("Модель API", text: $liveModel)
+                                SecureField("API-ключ " + (aiNames[liveProvider] ?? liveProvider), text: $liveKey)
+                                    .textFieldStyle(.roundedBorder)
+                                Toggle("Сохранить ключ в Связке ключей macOS", isOn: $persistLiveKey)
                             }
                         }
-                    }
-                    .disabled(status.groq.busy || (!useFullProfile && liveModel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty))
-                }
-                MicrophoneSettingsForm(model: model)
-                Section("Распознавание речи") {
-                    Toggle("Определять говорящих", isOn: Binding(
-                        get: { speakerDetection },
-                        set: { enabled in
+                        Text("Предварительный анализ обрабатывает фрагменты текста во время записи и показывает итоги у Валли.")
+                            .font(.caption).foregroundStyle(.secondary)
+                        Button("Сохранить профиль анализа на лету") {
                             Task {
-                                if await model.command(["enabled": enabled], path: "api/speech/speakers") {
-                                    speakerDetection = enabled
-                                } else {
-                                    error = model.error
+                                let name = liveModel.trimmingCharacters(in: .whitespacesAndNewlines)
+                                let selected = liveProvider == "groq" ? name : liveProvider + ":" + name
+                                var settings: [String: Any] = ["profile": "live", "automatic": automaticAI, "live_preview": livePreview,
+                                                               "use_full_profile": useFullProfile]
+                                if !useFullProfile {
+                                    settings["model"] = selected
+                                    settings["api_key"] = liveKey
+                                    settings["persist"] = persistLiveKey
+                                }
+                                if await model.command(settings, path: "api/groq/settings") {
+                                    liveKey = ""
+                                    message = "Профиль анализа на лету сохранён."
+                                    await load()
                                 }
                             }
                         }
-                    ))
-                    Text("Сохраняется сразу. Для новых записей и заданий выключение пропускает определение голосов. Расшифровка текста остаётся доступной.")
-                        .font(.caption).foregroundStyle(.secondary)
-                    Picker("Поставщик", selection: $provider) {
-                        Text("Локальная модель").tag("local")
-                        Text("Облачный API").tag("cloud")
+                        .disabled(status.groq.busy || (!useFullProfile && liveModel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty))
                     }
-                    TextField("Путь к модели Whisper", text: $localModel)
-                    Picker("Когда распознавать", selection: $mode) {
-                        Text("После записи").tag("post")
-                        Text("В фоне во время записи").tag("live")
-                    }
-                    Toggle("Живой предпросмотр в совещании", isOn: Binding(
-                        get: { liveDisplay },
-                        set: { enabled in
-                            Task {
-                                if await model.command(["enabled": enabled], path: "api/speech/live-display") {
-                                    liveDisplay = enabled
-                                } else {
-                                    error = model.error
+                case .speech:
+                    MicrophoneSettingsForm(model: model)
+                    Section("Распознавание речи") {
+                        Toggle("Определять говорящих", isOn: Binding(
+                            get: { speakerDetection },
+                            set: { enabled in
+                                Task {
+                                    if await model.command(["enabled": enabled], path: "api/speech/speakers") {
+                                        speakerDetection = enabled
+                                    } else {
+                                        error = model.error
+                                    }
                                 }
                             }
+                        ))
+                        Text("Сохраняется сразу. Для новых записей и заданий выключение пропускает определение голосов. Расшифровка текста остаётся доступной.")
+                            .font(.caption).foregroundStyle(.secondary)
+                        Picker("Поставщик", selection: $provider) {
+                            Text("Локальная модель").tag("local")
+                            Text("Облачный API").tag("cloud")
                         }
-                    ))
-                    Text("Показывает текст у Валли и подсветку говорящего при локальном распознавании во время записи. Сохраняется сразу.")
-                        .font(.caption).foregroundStyle(.secondary)
-                    if provider == "cloud" {
-                        TextField("HTTPS-адрес API", text: $endpoint)
-                        TextField("Имя модели", text: $cloudModel)
-                        Picker("Формат ответа", selection: $format) {
-                            Text("JSON").tag("json")
-                            Text("JSON с таймкодами").tag("verbose_json")
+                        TextField("Путь к модели Whisper", text: $localModel)
+                        Picker("Когда распознавать", selection: $mode) {
+                            Text("После записи").tag("post")
+                            Text("В фоне во время записи").tag("live")
                         }
-                        SecureField(status.speech.keyPresent ? "Заменить ключ API" : "Ключ API", text: $speechKey)
+                        Toggle("Живой предпросмотр в совещании", isOn: Binding(
+                            get: { liveDisplay },
+                            set: { enabled in
+                                Task {
+                                    if await model.command(["enabled": enabled], path: "api/speech/live-display") {
+                                        liveDisplay = enabled
+                                    } else {
+                                        error = model.error
+                                    }
+                                }
+                            }
+                        ))
+                        Text("Показывает текст у Валли и подсветку говорящего при локальном распознавании во время записи. Сохраняется сразу.")
+                            .font(.caption).foregroundStyle(.secondary)
+                        if provider == "cloud" {
+                            TextField("HTTPS-адрес API", text: $endpoint)
+                            TextField("Имя модели", text: $cloudModel)
+                            Picker("Формат ответа", selection: $format) {
+                                Text("JSON").tag("json")
+                                Text("JSON с таймкодами").tag("verbose_json")
+                            }
+                            SecureField(status.speech.keyPresent ? "Заменить ключ API" : "Ключ API", text: $speechKey)
+                        }
+                        Button("Сохранить распознавание") { Task { await saveSpeech() } }
                     }
-                    Button("Сохранить распознавание") { Task { await saveSpeech() } }
                 }
 
             } else if error == nil {

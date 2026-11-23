@@ -140,6 +140,20 @@ struct ApprovalsView: View {
         var id: Self { self }
     }
 
+    struct Directory {
+        let projectID: Int?
+        let assigneeID: Int?
+        let unassigned: Bool
+        let selectedTaskID: Int?
+        let changeView: (ItemList.Kind, ItemList.Status) -> Void
+
+        func includes(project: Int?, assignee: Int?) -> Bool {
+            (projectID == nil || project == projectID) &&
+            (assigneeID == nil || assignee == assigneeID) &&
+            (!unassigned || assignee == nil)
+        }
+    }
+
     struct ItemList {
         enum Kind: String, CaseIterable {
             case all = "Все"
@@ -160,6 +174,7 @@ struct ApprovalsView: View {
         let openMeeting: (Int) -> Void
         var acceptedTasks: [TaskItem]? = nil
         var taskGrouping: String? = nil
+        var directory: Directory? = nil
 
         func includesDecision(_ isDecision: Bool) -> Bool {
             kind == .all || (kind == .decisions) == isDecision
@@ -275,51 +290,64 @@ struct ApprovalsView: View {
     var body: some View {
         let pending = pendingRows
         let showsApprovalFilters = itemList.project == nil && itemList.status == .pending
-        let shown = (showsApprovalFilters ? filteredRows(pending) : pending.filter {
+        let inScope = pending.filter { row in
+            itemList.directory?.includes(project: row.project?.id, assignee: row.assignee?.id) ?? true
+        }
+        let availableProposals = showsApprovalFilters ? filteredRows(inScope) : inScope.filter {
             $0.matches(filters.query.split(whereSeparator: \.isWhitespace))
-        }).filter { row in
+        }
+        let shown = availableProposals.filter { row in
             itemList.status != .approved && itemList.includesDecision(row.proposal.kind == "decision")
         }
         let search = filters.query.trimmingCharacters(in: .whitespacesAndNewlines)
-        let acceptedTasks = matchingTasks(search)
+        let availableTasks = matchingTasks(search)
+        let acceptedTasks = itemList.status == .pending || !itemList.includesDecision(false) ? [] : availableTasks
         let decisions = workspace.decisions.filter { decision in
             if let project = itemList.project { return decision.projectId == project.id }
             return !workspace.projects.contains { $0.id == decision.projectId && $0.archived == true }
         }
-        let shownDecisions = decisions.filter { decision in
-            guard itemList.status != .pending, itemList.includesDecision(true) else { return false }
-            return (itemList.status == .all || decision.active) &&
-                (search.isEmpty || decision.text.localizedStandardContains(search) ||
-                    decision.reason?.localizedStandardContains(search) == true)
+        let availableDecisions = decisions.filter { decision in
+            (itemList.directory?.includes(project: decision.projectId, assignee: nil) ?? true) &&
+            (search.isEmpty || decision.text.localizedStandardContains(search) ||
+                decision.reason?.localizedStandardContains(search) == true)
         }
-        HStack(spacing: 0) {
-            proposalList(pending: pending, shown: shown, acceptedTasks: acceptedTasks,
-                         shownDecisions: shownDecisions,
-                         showsApprovalFilters: showsApprovalFilters)
-            switch inspectedItem {
-            case .proposal(let id):
-                if let proposal = pending.first(where: { $0.id == id })?.proposal {
-                    inspectorPanel(proposal.presentation.title) {
-                        ProposalEditor(model: model, workspace: workspace, proposal: proposal, prepare: { payload in
-                            prepared[proposal.id] = payload
-                            markedTasks.removeAll()
-                            markedProposals.insert(proposal.id)
-                            batchResult = nil
-                        }, closePanel: { inspectedItem = nil })
-                        .id(proposal.id)
+        let shownDecisions = itemList.status == .pending || !itemList.includesDecision(true) ? [] :
+            availableDecisions.filter { itemList.status == .all || $0.active }
+        VStack(alignment: .leading, spacing: 0) {
+            if let directory = itemList.directory {
+                directoryChips(directory, tasks: availableTasks.count, decisions: availableDecisions,
+                               proposals: availableProposals)
+                    .padding(.horizontal, 15).padding(.bottom, 7)
+            }
+            HStack(spacing: 0) {
+                proposalList(pending: pending, shown: shown, acceptedTasks: acceptedTasks,
+                             shownDecisions: shownDecisions,
+                             showsApprovalFilters: showsApprovalFilters)
+                switch inspectedItem {
+                case .proposal(let id):
+                    if let proposal = pending.first(where: { $0.id == id })?.proposal {
+                        inspectorPanel(proposal.presentation.title) {
+                            ProposalEditor(model: model, workspace: workspace, proposal: proposal, prepare: { payload in
+                                prepared[proposal.id] = payload
+                                markedTasks.removeAll()
+                                markedProposals.insert(proposal.id)
+                                batchResult = nil
+                            }, closePanel: { inspectedItem = nil })
+                            .id(proposal.id)
+                        }
                     }
-                }
-            case .decision(let id):
-                if let decision = decisions.first(where: { $0.id == id }) {
-                    inspectorPanel("Решение") {
-                        ProjectDecisionDetails(model: model, workspace: workspace, decision: decision,
-                                               prior: decisions.first { $0.id == decision.supersedesId },
-                                               openMeeting: itemList.openMeeting, openTask: itemList.openTask)
-                            .id(decision.id)
+                case .decision(let id):
+                    if let decision = decisions.first(where: { $0.id == id }) {
+                        inspectorPanel("Решение") {
+                            ProjectDecisionDetails(model: model, workspace: workspace, decision: decision,
+                                                   prior: decisions.first { $0.id == decision.supersedesId },
+                                                   openMeeting: itemList.openMeeting, openTask: itemList.openTask)
+                                .id(decision.id)
+                        }
                     }
+                case nil:
+                    EmptyView()
                 }
-            case nil:
-                EmptyView()
             }
         }
         .onChange(of: acceptedTasks.map(\.id)) { ids in markedTasks.formIntersection(ids) }
@@ -331,6 +359,60 @@ struct ApprovalsView: View {
         .onChange(of: decisions.map(\.id)) { ids in
             if case .decision(let id) = inspectedItem, !ids.contains(id) { inspectedItem = nil }
         }
+    }
+
+    private func directoryChips(_ directory: Directory, tasks: Int, decisions: [Decision], proposals: [Row]) -> some View {
+        let taskProposals = proposals.filter { $0.proposal.kind != "decision" }.count
+        let all = itemList.kind == .all && itemList.status == .all
+        return ScrollView(.horizontal) {
+            HStack(spacing: 7) {
+                directoryChip("Все", icon: "tray", count: tasks + decisions.count + proposals.count, selected: all) {
+                    directory.changeView(.all, .all)
+                }
+                directoryChip("Задачи", icon: "checkmark.square", count: tasks + taskProposals,
+                              selected: itemList.kind == .tasks) {
+                    directory.changeView(.tasks, .all)
+                }
+                directoryChip("Решения", icon: "bolt", count: decisions.count + proposals.count - taskProposals,
+                              selected: itemList.kind == .decisions) {
+                    directory.changeView(.decisions, .all)
+                }
+                directoryChip("Согласовано", icon: "checkmark.circle",
+                              count: (itemList.includesDecision(false) ? tasks : 0) +
+                                  (itemList.includesDecision(true) ? decisions.filter(\.active).count : 0),
+                              selected: itemList.status == .approved) {
+                    directory.changeView(itemList.kind, .approved)
+                }
+                directoryChip("На согласовании", icon: "clock",
+                              count: proposals.filter { itemList.includesDecision($0.proposal.kind == "decision") }.count,
+                              selected: itemList.status == .pending) {
+                    directory.changeView(itemList.kind, .pending)
+                }
+            }
+            .padding(1)
+        }
+        .scrollIndicators(.hidden)
+    }
+
+    private func directoryChip(_ title: String, icon: String, count: Int,
+                               selected: Bool, action: @escaping () -> Void) -> some View {
+        let palette = PanelPalette(dark: scheme == .dark)
+        let shape = RoundedRectangle(cornerRadius: 8)
+        return Button(action: action) {
+            HStack(spacing: 5) {
+                Label(title, systemImage: icon).font(.callout.weight(.medium))
+                Text(count.formatted()).font(.caption2.monospacedDigit())
+                    .padding(.horizontal, 5).padding(.vertical, 2)
+                    .background(palette.projectAccent.opacity(selected ? 0.20 : 0.09), in: Capsule())
+            }
+            .foregroundStyle(selected ? palette.projectAccent : palette.text)
+            .padding(.horizontal, 8).padding(.vertical, 6)
+            .background(selected ? palette.projectAccent.opacity(0.13) : palette.surface, in: shape)
+            .overlay { shape.strokeBorder(selected ? palette.projectAccent.opacity(0.50) : palette.border) }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityAddTraits(selected ? .isSelected : [])
     }
 
     private func inspectorPanel<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
@@ -361,7 +443,7 @@ struct ApprovalsView: View {
             LazyVStack(alignment: .leading, spacing: 10) {
                 if showsApprovalFilters {
                     listControls(pending, count: shown.count).padding(.bottom, 4)
-                } else {
+                } else if itemList.directory == nil {
                     PanelSearchField(placeholder: "Поиск по задачам и решениям", query: $filters.query)
                 }
                 if let error = model.error {
@@ -385,8 +467,8 @@ struct ApprovalsView: View {
                 }
                 if itemList.project == nil && itemList.status != .approved { archivedDrafts }
             }
-            .padding(24)
-            .frame(maxWidth: 860)
+            .padding(itemList.directory == nil ? 24 : 15)
+            .frame(maxWidth: itemList.directory == nil ? 860 : .infinity)
             .frame(maxWidth: .infinity)
         }
         .safeAreaInset(edge: .bottom, spacing: 0) {
@@ -412,7 +494,8 @@ struct ApprovalsView: View {
 
     private func groupedRows(tasks: [TaskItem], decisions: [Decision], proposals: [Row]) -> some View {
         let entries = tasks.map(ListEntry.task) + decisions.map(ListEntry.decision) + proposals.map(ListEntry.proposal)
-        return MeetingTopicList(rows: entries, topic: { $0.topic(using: glossary, topics: meetingTopics) }, collapsible: true) { entry in
+        return MeetingTopicList(rows: entries, topic: { $0.topic(using: glossary, topics: meetingTopics) },
+                                collapsible: true, expandOnlyFirst: itemList.directory != nil) { entry in
             switch entry {
             case .task(let task): acceptedTaskRow(task, open: itemList.openTask)
             case .decision(let decision): decisionRow(decision)
@@ -422,8 +505,7 @@ struct ApprovalsView: View {
     }
 
     private func matchingTasks(_ search: String) -> [TaskItem] {
-        guard itemList.project?.archived != true,
-              itemList.status != .pending, itemList.includesDecision(false) else { return [] }
+        guard itemList.project?.archived != true else { return [] }
         return (itemList.acceptedTasks ?? workspace.visibleTasks).filter { task in
             (itemList.project == nil || task.projectId == itemList.project?.id) &&
                 (search.isEmpty || task.title.localizedStandardContains(search) ||
@@ -452,10 +534,16 @@ struct ApprovalsView: View {
 
     private func acceptedTaskRow(_ task: TaskItem, open: @escaping (Int) -> Void) -> some View {
         let palette = PanelPalette(dark: scheme == .dark)
-        let assignee = workspace.people.first { $0.id == task.assigneeId }?.speakerPickerName
-        let due = task.dueDate.map { [ProjectDateField.display($0), task.dueTime].compactMap { $0 }.joined(separator: " ") }
+        let assignee = workspace.people.first { $0.id == task.assigneeId }
+        let project = itemList.project == nil ? workspace.projects.first { $0.id == task.projectId }?.title : nil
+        let topic = meetingTopics.taskTitle(task, sources: task.sources ?? [], glossary: glossary)
         let marked = markedTasks.contains(task.id)
-        return HStack(spacing: 10) {
+        let source = task.sources?.compactMap(\.meetingId).first
+        return workItemRow(title: task.title, icon: task.stageKind == "done" ? "checkmark.circle" : "checkmark.square",
+                           subtitle: rowSubtitle("Задача", project: project, topic: topic),
+                           badge: taskBadge(task, palette: palette), due: dueLabel(task.dueDate, time: task.dueTime),
+                           assignee: assignee, selected: marked || itemList.directory?.selectedTaskID == task.id,
+                           urgent: task.overdue, sourceMeeting: source, action: { open(task.id) }) {
             selectionButton(title: task.title, marked: marked, palette: palette) {
                 if marked { markedTasks.remove(task.id) }
                 else {
@@ -463,30 +551,118 @@ struct ApprovalsView: View {
                     markedTasks.insert(task.id)
                 }
             }
-            Button { open(task.id) } label: {
+        }
+    }
+
+    private struct RowBadge {
+        let title: String
+        let icon: String
+        let tint: Color
+    }
+
+    private func taskBadge(_ task: TaskItem, palette: PanelPalette) -> RowBadge {
+        if task.stageKind == "done" { return RowBadge(title: "Выполнено", icon: "checkmark.circle", tint: successInk) }
+        if task.overdue { return RowBadge(title: "Просрочена", icon: "exclamationmark.clock", tint: palette.recordingInk) }
+        if task.blocked == true { return RowBadge(title: "Заблокирована", icon: "hand.raised", tint: palette.recordingInk) }
+        switch task.priority {
+        case "critical": return RowBadge(title: "Критический", icon: "exclamationmark.triangle", tint: palette.recordingInk)
+        case "high": return RowBadge(title: "Высокий", icon: "chart.bar.fill", tint: palette.recordingInk)
+        case "low": return RowBadge(title: "Низкий", icon: "arrow.down", tint: palette.muted)
+        default: return RowBadge(title: task.stageTitle, icon: "circle", tint: palette.projectAccent)
+        }
+    }
+
+    private var successInk: Color {
+        scheme == .dark ? Color(red: 0.48, green: 0.88, blue: 0.64) : Color(red: 0.06, green: 0.40, blue: 0.25)
+    }
+
+    private func dueLabel(_ date: String?, time: String?) -> String? {
+        date.map { [ProjectDateField.display($0), time].compactMap { $0 }.joined(separator: " ") }
+    }
+
+    private func rowSubtitle(_ kind: String, project: String?, topic: String? = nil) -> String {
+        [kind, project, topic == MeetingTopics.ungrouped ? nil : topic].compactMap { $0 }.joined(separator: " · ")
+    }
+
+    private func workItemRow<Selection: View>(title: String, icon: String, subtitle: String, badge: RowBadge,
+                                               due: String? = nil, assignee: Person? = nil, selected: Bool,
+                                               urgent: Bool = false, sourceMeeting: Int? = nil,
+                                               action: @escaping () -> Void,
+                                               @ViewBuilder selection: () -> Selection) -> some View {
+        let palette = PanelPalette(dark: scheme == .dark)
+        let shape = RoundedRectangle(cornerRadius: 10)
+        return HStack(spacing: 8) {
+            selection()
+            Button(action: action) {
                 HStack(spacing: 10) {
-                    Image(systemName: "checklist")
-                        .foregroundStyle(palette.selectedInk)
-                        .frame(width: 34, height: 34)
-                        .background(palette.selected, in: RoundedRectangle(cornerRadius: 8))
+                    Image(systemName: icon)
+                        .font(.system(size: 15, weight: .medium))
+                        .foregroundStyle(palette.projectAccent)
+                        .frame(width: 32, height: 32)
+                        .background(palette.projectAccent.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
                         .accessibilityHidden(true)
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text(task.title).font(.headline)
-                            .foregroundStyle(task.overdue ? palette.recordingInk : palette.text)
-                        let projectName = itemList.project == nil ? workspace.projects.first { $0.id == task.projectId }?.title : nil
-                        Text(["Задача · Согласовано", projectName, task.stageTitle, assignee ?? "Без исполнителя", due ?? "Без срока"]
-                            .compactMap { $0 }.joined(separator: " · "))
-                            .font(.caption).foregroundStyle(.secondary)
+                    ViewThatFits(in: .horizontal) {
+                        HStack(spacing: 9) {
+                            rowTitle(title, subtitle: subtitle, color: urgent ? palette.recordingInk : palette.text)
+                                .frame(minWidth: 148, maxWidth: .infinity, alignment: .leading)
+                            rowMetadata(badge, due: due, assignee: assignee, palette: palette)
+                                .fixedSize(horizontal: true, vertical: false)
+                        }
+                        VStack(alignment: .leading, spacing: 5) {
+                            rowTitle(title, subtitle: subtitle, color: urgent ? palette.recordingInk : palette.text)
+                            rowMetadata(badge, due: due, assignee: assignee, palette: palette)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
                     }
-                    Spacer(minLength: 8)
-                    Image(systemName: "chevron.right").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
+            .accessibilityAddTraits(selected ? .isSelected : [])
+            .disabled(model.saving || model.loading)
+            Menu {
+                Button("Открыть", action: action)
+                if let sourceMeeting {
+                    Button("Открыть совещание") { itemList.openMeeting(sourceMeeting) }
+                }
+            } label: {
+                Image(systemName: "ellipsis").font(.callout.weight(.semibold))
+                    .accessibilityLabel("Действия записи")
+            }
+            .menuIndicator(.hidden)
+            .fixedSize()
         }
-        .panelCard()
+        .padding(.horizontal, 10)
+        .padding(.vertical, 9)
+        .background(selected ? palette.projectAccent.opacity(0.08) : palette.surface, in: shape)
+        .overlay { shape.strokeBorder(selected ? palette.projectAccent.opacity(0.70) : palette.border)
+            .allowsHitTesting(false) }
+    }
+
+    private func rowTitle(_ title: String, subtitle: String, color: Color) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(title).font(.callout.weight(.semibold)).foregroundStyle(color).lineLimit(3)
+            Text(subtitle).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+        }
+    }
+
+    private func rowMetadata(_ badge: RowBadge, due: String?, assignee: Person?, palette: PanelPalette) -> some View {
+        HStack(spacing: 10) {
+            Label(badge.title, systemImage: badge.icon)
+                .font(.caption.weight(.medium))
+                .foregroundStyle(badge.tint)
+                .padding(.horizontal, 6).padding(.vertical, 4)
+                .background(badge.tint.opacity(0.12), in: Capsule())
+            if let due {
+                Label(due, systemImage: "calendar")
+                    .font(.caption.monospacedDigit()).foregroundStyle(palette.muted)
+            }
+            if let assignee {
+                PersonAvatar(person: assignee, url: model.personPhotoURL(assignee), size: 24)
+                    .help(assignee.speakerPickerName)
+                    .accessibilityLabel(assignee.speakerPickerName)
+            }
+        }
     }
 
     private var pendingRows: [Row] {
@@ -498,6 +674,7 @@ struct ApprovalsView: View {
             let target = (proposal.taskId ?? proposal.suggestedExistingTaskId).flatMap { tasks[$0] }
             let projectID = target?.projectId ?? proposal.projectId
             if let project = itemList.project, projectID != project.id { return nil }
+            if itemList.directory != nil, let projectID, projects[projectID]?.archived == true { return nil }
             let assigneeID = proposal.editsAssignee || proposal.reviewDraft != nil
                 ? proposal.reviewAssigneeId : (proposal.assigneeId ?? target?.assigneeId)
             return Row(proposal: proposal, target: target, project: projectID.flatMap { projects[$0] },
@@ -555,9 +732,13 @@ struct ApprovalsView: View {
                     .buttonStyle(.link)
                 }
             }
-            ViewThatFits(in: .horizontal) {
-                HStack(spacing: 8) { searchField; filterMenus(pending) }
-                VStack(alignment: .leading, spacing: 8) { searchField; filterMenus(pending) }
+            if itemList.directory == nil {
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: 8) { searchField; filterMenus(pending) }
+                    VStack(alignment: .leading, spacing: 8) { searchField; filterMenus(pending) }
+                }
+            } else {
+                filterMenus(pending)
             }
         }
         .panelCard()
@@ -695,41 +876,32 @@ struct ApprovalsView: View {
         let palette = PanelPalette(dark: scheme == .dark)
         let projectName = itemList.project == nil
             ? workspace.projects.first { $0.id == decision.projectId }?.title : nil
-        return Button { inspectedItem = .decision(decision.id) } label: {
-            HStack(spacing: 10) {
-                Image(systemName: "checkmark.seal")
-                    .foregroundStyle(palette.selectedInk)
-                    .frame(width: 34, height: 34)
-                    .background(palette.selected, in: RoundedRectangle(cornerRadius: 8))
-                    .accessibilityHidden(true)
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(decision.text).font(.headline).lineLimit(2)
-                    Text(["Решение", decision.active ? "Согласовано" : decision.statusLabel, projectName]
-                        .compactMap { $0 }.joined(separator: " · "))
-                        .font(.caption).foregroundStyle(.secondary)
-                }
-                Spacer(minLength: 8)
-                Image(systemName: "chevron.right").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
-                    .accessibilityHidden(true)
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .contentShape(Rectangle())
+        let badge = RowBadge(title: decision.active ? "Согласовано" : decision.statusLabel,
+                             icon: decision.active ? "checkmark.circle" : "circle.slash",
+                             tint: decision.active ? successInk : palette.muted)
+        return workItemRow(title: decision.text, icon: "bolt", subtitle: rowSubtitle("Решение", project: projectName),
+                           badge: badge, selected: inspectedItem == .decision(decision.id),
+                           sourceMeeting: decision.meetingId ?? decision.source?.meetingId,
+                           action: { inspectedItem = .decision(decision.id) }) {
+            Color.clear.frame(width: 24, height: 1).accessibilityHidden(true)
         }
-        .buttonStyle(.plain)
-        .disabled(model.saving)
-        .accessibilityAddTraits(inspectedItem == .decision(decision.id) ? .isSelected : [])
-        .panelCard()
     }
 
     private func proposalCard(_ row: Row) -> some View {
         let proposal = row.proposal
         let kind = proposal.presentation
-        let subtitle = [proposal.displayTitle == kind.title ? nil : kind.title,
-                        itemList.project == nil ? row.project?.title : nil, "На согласовании"]
-            .compactMap { $0 }.joined(separator: " · ")
         let palette = PanelPalette(dark: scheme == .dark)
         let marked = markedProposals.contains(proposal.id)
-        return HStack(spacing: 10) {
+        let isPrepared = prepared[proposal.id] != nil
+        let badge = RowBadge(title: isPrepared ? "Готово к согласованию" : "На согласовании",
+                             icon: isPrepared ? "checkmark.seal" : "clock", tint: palette.projectAccent)
+        let (date, time) = proposal.reviewDeadline
+        return workItemRow(title: proposal.displayTitle, icon: proposal.kind == "decision" ? "bolt" : kind.icon,
+                           subtitle: rowSubtitle(kind.title, project: itemList.project == nil ? row.project?.title : nil),
+                           badge: badge, due: dueLabel(date, time: time), assignee: row.assignee,
+                           selected: marked || inspectedItem == .proposal(proposal.id),
+                           sourceMeeting: proposal.source?.meetingId,
+                           action: { inspectedItem = .proposal(proposal.id) }) {
             selectionButton(title: proposal.displayTitle, marked: marked, palette: palette) {
                 if marked { markedProposals.remove(proposal.id) }
                 else {
@@ -737,33 +909,7 @@ struct ApprovalsView: View {
                     markedProposals.insert(proposal.id)
                 }
             }
-            Button { inspectedItem = .proposal(proposal.id) } label: {
-                HStack(spacing: 10) {
-                    Image(systemName: kind.icon)
-                        .foregroundStyle(palette.selectedInk)
-                        .frame(width: 34, height: 34)
-                        .background(palette.selected, in: RoundedRectangle(cornerRadius: 8))
-                        .accessibilityHidden(true)
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text(proposal.displayTitle).font(.headline).lineLimit(2)
-                        Text(subtitle).font(.caption).foregroundStyle(.secondary)
-                    }
-                    Spacer(minLength: 8)
-                    if prepared[proposal.id] != nil {
-                        Image(systemName: "checkmark.seal").foregroundStyle(palette.accent)
-                            .help("Готово к согласованию")
-                            .accessibilityLabel("Готово к согласованию")
-                    }
-                    Image(systemName: "chevron.right").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .disabled(model.saving || model.loading)
-            .accessibilityAddTraits(inspectedItem == .proposal(proposal.id) ? .isSelected : [])
         }
-        .panelCard()
     }
 
     @ViewBuilder

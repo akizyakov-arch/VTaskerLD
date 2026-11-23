@@ -224,7 +224,11 @@ def meeting_topic_rules():
     return []
 
 
-def meeting_topic_glossary(segments, industry='decor'):
+def meeting_topic_glossary(segments, industry='events'):
+    requested = [industry] if isinstance(industry, str) else industry
+    parents = {item.split('/', 1)[0] for item in requested}
+    industries = {'events' if item == 'decor' else item for item in parents}
+
     def words(text):
         return re.findall(r'[^\W_]+', text.casefold().replace('ё', 'е'))
 
@@ -232,7 +236,7 @@ def meeting_topic_glossary(segments, industry='decor'):
     phrase = ' ' + ' '.join(tokens) + ' '
     glossary = []
     for topic in meeting_topic_rules():
-        if 'industries' in topic and industry not in topic['industries']:
+        if 'industries' in topic and not industries.intersection(topic['industries']):
             continue
         matches = [term for key in ('words', 'phrases', 'actions') for term in topic.get(key, [])
                    if ' ' + ' '.join(words(term)) + ' ' in phrase]
@@ -358,7 +362,7 @@ def reusable_prefix(snapshot, previous):
     if not previous:
         return 0, None
     old = previous['input']
-    for key in ('participants', 'created_at', 'timezone', 'title', 'project_id', 'analysis_projects', 'company_terms', 'industry_template'):
+    for key in ('participants', 'created_at', 'timezone', 'title', 'project_id', 'analysis_projects', 'company_terms', 'industry_template', 'industry_templates'):
         if old.get(key) != snapshot.get(key):
             return 0, None
     if snapshot.get('analysis_mode') == 'manual' and any(
@@ -512,10 +516,12 @@ def relevant_company_terms(entries, segments, tasks=()):
 def glossary_index(glossary):
     patterns = {}
     for entry in glossary:
+        if entry.get('lookup_only'):
+            continue
         for variant in entry['variants']:
             parts = glossary_words(variant['text'])
             if parts:
-                patterns.setdefault(parts[0], []).append((parts, entry['term']))
+                patterns.setdefault(parts[0], []).append((parts, entry['term'], glossary_words(variant.get('context', ''))))
     for choices in patterns.values():
         choices.sort(key=lambda pair: -len(pair[0]))
     return patterns
@@ -528,15 +534,29 @@ def expand_glossary(text, patterns):
     result = []
     offset = 0
     while offset < len(words):
-        match = next(((parts, term) for parts, term in patterns.get(words[offset], [])
-                      if words[offset:offset + len(parts)] == parts), None)
-        if match:
-            parts, term = match
-            result.append(term)
-            offset += len(parts)
-        else:
-            result.append(words[offset])
-            offset += 1
+        matches = [item for item in patterns.get(words[offset], [])
+                   if words[offset:offset + len(item[0])] == item[0]]
+        if matches:
+            length = len(matches[0][0])
+            end = offset + length
+            surroundings = (words[max(0, offset - 5):offset], words[end:end + 5])
+            contextual = set()
+            defaults = set()
+            for parts, term, context in matches:
+                if len(parts) != length:
+                    break
+                if not context:
+                    defaults.add(term)
+                elif any(window[i:i + len(context)] == context
+                         for window in surroundings for i in range(len(window))):
+                    contextual.add(term)
+            choices = contextual or defaults
+            if len(choices) == 1:
+                result.append(next(iter(choices)))
+                offset = end
+                continue
+        result.append(words[offset])
+        offset += 1
     return ' '.join(result)
 
 
@@ -559,12 +579,24 @@ def analyze_part(data, payload, depth=0):
                    'Объедини повторы одного поручения, сохранив последнее согласованное уточнение.')
     max_tokens = min(8192, 2800 + len(payload['segments']) * 120) if depth == 0 else 2048
     snapshot = data.get('input', {})
-    glossary = meeting_topic_glossary(payload['segments'], snapshot.get('industry_template', 'decor'))
+    glossary = meeting_topic_glossary(payload['segments'], snapshot.get('industry_templates') or snapshot.get('industry_template', 'events'))
     request_payload = {**payload, 'topic_glossary': glossary} if glossary else payload
+    specializations = [scope for scope in snapshot.get('industry_templates', []) if '/' in scope]
+    if specializations:
+        request_payload = {**request_payload, 'terminology_specializations': specializations}
     company = relevant_company_terms(snapshot.get('company_terms', []), payload['segments'],
                                      payload.get('project_tasks', []))
     if company:
         request_payload = {**request_payload, 'company_terms': company}
+    if any(variant.get('context') for entry in company
+           for variant in entry['variants']):
+        system += ('\nУ одного варианта словаря могут быть разные значения. Поле context — подсказка '
+                   'из соседних слов реплики. Выбирай значение по смыслу; при неясности сохрани '
+                   'исходное выражение. Не изменяй цитаты из протокола.')
+    if any(entry.get('definition') for entry in company):
+        system += ('\nОпределения в словаре — варианты смысла. При совпадении написания учитывай '
+                   'отрасль и контекст реплики. Записи lookup_only служат справкой; не подменяй '
+                   'ими формулировку в цитате.')
     key = cache_key(data, 'extraction', request_payload, system, schema, max_tokens)
     if key and not data.get('force'):
         cached = meter.lookup(key)
@@ -808,12 +840,12 @@ def analyze(data):
 
 ASSISTANT_ACTIONS = (
     'search_tasks', 'refine_tasks', 'list_projects', 'open_project',
-    'update_task', 'clarify',
+    'update_task', 'create_project', 'create_task', 'create_meeting', 'create_decision', 'clarify',
 )
 ASSISTANT_SCHEMA = obj({
     'action': {'type': 'string', 'enum': list(ASSISTANT_ACTIONS)},
     'title': NULLABLE, 'project': NULLABLE, 'assignee': NULLABLE, 'filters': NULLABLE,
-    'due_date': NULLABLE, 'due_time': NULLABLE,
+    'due_date': NULLABLE, 'due_time': NULLABLE, 'description': NULLABLE, 'priority': NULLABLE,
 })
 ASSISTANT_SYSTEM = """Классифицируй запрос VTASK по схеме. Не придумывай названия, имена, даты.
 Неуказанные поля — null. project и assignee заполняй только по фразе, имя в именительном падеже.
@@ -829,7 +861,13 @@ assignee «Давид». Для update_task due_date YYYY-MM-DD
 При has_search уточнение списка — refine_tasks. Для list_projects filters может быть «активные».
 «Покажи задачи про деньги» — search_tasks, title «финансы». При has_project приложение ищет
 в открытом проекте. project оставь null, если пользователь не назвал конкретный проект.
-Для просьбы создать задачу, проект, решение или встречу выбери clarify.
+Для явной просьбы создать проект, задачу, встречу или решение выбери create_project, create_task,
+create_meeting или create_decision. «Запланируй» или «начни совещание» — create_meeting, это форма
+создания встречи. title — название или формулировка решения. project — только явно названный проект.
+Для новой задачи assignee — исполнитель, для нового проекта — владелец. В description сохрани
+явные подробности. Приоритет задачи — low, normal, high или critical только при явном указании.
+Для встречи due_date и due_time означают дату и время; для проекта due_date только явно названный срок завершения.
+Никогда не создавай новую сущность для запросов поиска, открытия и изменения существующей задачи.
 При непонятном запросе выбери clarify."""
 
 TASK_UPDATE_SCHEMA = obj({key: ASSISTANT_SCHEMA['properties'][key] for key in

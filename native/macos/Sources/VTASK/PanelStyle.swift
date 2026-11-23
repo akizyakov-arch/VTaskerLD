@@ -14,6 +14,7 @@ struct PanelPalette {
     var recordingSurface: Color { color(0xFCEFEE, 0x412830) }
     var recordingInk: Color { color(0xA52C38, 0xFFB1B5) }
     var selectedInk: Color { dark ? .white : accent }
+    var projectAccent: Color { color(0x6842D8, 0xC5A8FF) }
 
     private func color(_ light: UInt32, _ darkValue: UInt32) -> Color {
         let rgb = dark ? darkValue : light
@@ -106,15 +107,21 @@ struct ProjectDateField: View {
 struct PanelSearchField: View {
     let placeholder: String
     @Binding var query: String
+    var focus: FocusState<Bool>.Binding? = nil
+
+    private var field: some View {
+        TextField(placeholder, text: $query)
+            .textFieldStyle(.plain)
+            .frame(minWidth: 120)
+    }
 
     var body: some View {
         HStack(spacing: 6) {
             Image(systemName: "magnifyingglass")
                 .foregroundStyle(.secondary)
                 .accessibilityHidden(true)
-            TextField(placeholder, text: $query)
-                .textFieldStyle(.plain)
-                .frame(minWidth: 120)
+            if let focus { field.focused(focus) }
+            else { field }
             if !query.isEmpty {
                 Button { query = "" } label: { Image(systemName: "xmark.circle.fill") }
                     .buttonStyle(.plain)

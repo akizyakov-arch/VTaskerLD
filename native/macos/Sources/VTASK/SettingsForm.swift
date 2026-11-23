@@ -17,50 +17,9 @@ struct WorkspaceSettings: Decodable {
     }
 }
 
-struct SettingsForm: View {
-    @ObservedObject var model: WorkspaceModel
-    let people: [Person]
-    @State private var draft: WorkspaceSettings
-
-    init(model: WorkspaceModel, settings: WorkspaceSettings, people: [Person]) {
-        self.model = model
-        self.people = people
-        _draft = State(initialValue: settings)
-    }
-
-    var body: some View {
-        Form {
-            Picker("Тема", selection: $draft.theme) {
-                Text("Как в системе").tag("system")
-                Text("Светлая").tag("light")
-                Text("Тёмная").tag("dark")
-            }
-            TextField("Часовой пояс", text: $draft.timezone)
-            Picker("Кто я", selection: $draft.meId) {
-                Text("Не выбрано").tag(nil as Int?)
-                ForEach(people) { person in Text(person.name).tag(Optional(person.id)) }
-            }
-            Toggle("Распознавать после остановки записи", isOn: $draft.autoProcess)
-            LabeledContent("Отраслевой шаблон") { IndustryTemplateMenu(model: model) }
-            Button("Сохранить") {
-                Task {
-                    await model.command(["op": "settings", "data": [
-                        "theme": draft.theme,
-                        "timezone": draft.timezone.trimmingCharacters(in: .whitespacesAndNewlines),
-                        "auto_process": draft.autoProcess,
-                        "me_id": draft.meId.map { $0 as Any } ?? NSNull()
-                    ]])
-                }
-            }
-            .disabled(model.loading || model.saving)
-        }
-        .formStyle(.grouped)
-    }
-}
-
-
 struct AssistantVoiceSettingsForm: View {
     let canPreview: Bool
+    var compact = false
     @AppStorage(AssistantReplyVoice.preferenceKey) private var replyVoice: AssistantReplyVoice = .irina
     @StateObject private var preview = AssistantSpeech()
     @AppStorage(AssistantVoicePreferences.speakRepliesKey)
@@ -77,19 +36,49 @@ struct AssistantVoiceSettingsForm: View {
 
 
     var body: some View {
+        Group {
+            if compact {
+                VStack(alignment: .leading, spacing: 10) { voiceControls }
+            } else {
+                fullForm
+            }
+        }
+        .onChange(of: replyVoice) { _ in preview.stop() }
+        .onChange(of: canPreview) { allowed in if !allowed { preview.stop() } }
+        .onDisappear { preview.stop() }
+    }
+
+    @ViewBuilder
+    private var voiceControls: some View {
+        HStack {
+            Picker("Голос Валли", selection: $replyVoice) {
+                ForEach(AssistantReplyVoice.allCases) { voice in Text(voice.title).tag(voice) }
+            }
+            if compact {
+                Button(action: togglePreview) {
+                    Image(systemName: preview.isSpeaking ? "stop.fill" : "play.fill")
+                }
+                .help(preview.isSpeaking ? "Остановить" : "Прослушать голос")
+                .accessibilityLabel(preview.isSpeaking ? "Остановить" : "Прослушать голос")
+                .disabled(!canPreview)
+            }
+        }
+        if !compact {
+            Button(preview.isSpeaking ? "Остановить" : "Прослушать голос", action: togglePreview)
+                .disabled(!canPreview)
+        }
+        Toggle("Озвучивать ответы", isOn: $speakReplies)
+    }
+
+    private func togglePreview() {
+        if preview.isSpeaking { preview.stop() }
+        else { preview.speak("Привет! Я Валли, ваш помощник в задачах и совещаниях.", voice: replyVoice) }
+    }
+
+    private var fullForm: some View {
         Form {
             Section("Ассистент") {
-                Toggle("Озвучивать ответы", isOn: $speakReplies)
-                Picker("Голос Валли", selection: $replyVoice) {
-                    ForEach(AssistantReplyVoice.allCases) { voice in
-                        Text(voice.title).tag(voice)
-                    }
-                }
-                Button(preview.isSpeaking ? "Остановить" : "Прослушать голос") {
-                    if preview.isSpeaking { preview.stop() }
-                    else { preview.speak("Привет! Я Валли, ваш помощник в задачах и совещаниях.", voice: replyVoice) }
-                }
-                .disabled(!canPreview)
+                voiceControls
                 Toggle("Понимать свободные фразы через выбранный ИИ", isOn: $semanticInterpretation)
                 Text("Выбранная модель получает текст нераспознанной команды. Поиск по проектам и задачам выполняется на Mac.")
                     .font(.caption)
@@ -130,9 +119,6 @@ struct AssistantVoiceSettingsForm: View {
         .task(id: recognitionEngine) {
             if recognitionEngine == .speechAnalyzer { await checkAnalyzer() }
         }
-        .onChange(of: replyVoice) { _ in preview.stop() }
-        .onChange(of: canPreview) { allowed in if !allowed { preview.stop() } }
-        .onDisappear { preview.stop() }
     }
 
     private var supportsSpeechAnalyzer: Bool {

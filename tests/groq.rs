@@ -1420,10 +1420,9 @@ fn starter_glossary_combines_with_company_variants_and_switches_industry() {
         .groq_prepare_projects(meeting, MODELS[0], true, false, &[], false)
         .unwrap();
     let relevant = snapshot["company_terms"].as_array().unwrap();
-    assert_eq!(relevant.len(), 1);
-    assert_eq!(relevant[0]["term"], canonical);
-    assert_eq!(relevant[0]["section"], "Релизы");
-    let variants = relevant[0]["variants"].as_array().unwrap();
+    let relevant = relevant.iter().find(|entry| entry["term"] == canonical).unwrap();
+    assert_eq!(relevant["section"], "Релизы");
+    let variants = relevant["variants"].as_array().unwrap();
     assert!(variants.contains(&company_variant));
     assert!(variants.iter().any(|variant| variant["text"] == "выкатить на прод"));
 
@@ -1435,4 +1434,281 @@ fn starter_glossary_combines_with_company_variants_and_switches_industry() {
     let company_term = state["glossary_terms"].as_array().unwrap().iter()
         .find(|entry| entry["term"] == canonical).unwrap();
     assert_eq!(company_term["variants"], json!([company_variant]));
+}
+
+#[test]
+fn reviews_survive_repeat_analysis_and_train_the_next_meeting() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("terms.sqlite3");
+    let mut store = Store::open(&path).unwrap();
+    let connection = Connection::open(&path).unwrap();
+    let (first, segment) = meeting_with_transcript(
+        &store, &connection, "Пошив", "Подготовим бортовик, сатинчик и шумок.",
+    );
+    let output = |segment| json!({
+        "summary":"Подготовка тканей","open_questions":[],"tasks":[],"decisions":[],
+        "observations":[
+            {"kind":"unclear_term","text":"бортовик","source_segment_ids":[segment]},
+            {"kind":"unclear_term","text":"сатинчик","source_segment_ids":[segment]},
+            {"kind":"unclear_term","text":"шумок","source_segment_ids":[segment]},
+            {"kind":"unclear_term","text":"ошибочная ссылка","source_segment_ids":[-1]}
+        ]
+    });
+    let (run, _, _) = store.groq_prepare_projects(first, MODELS[0], true, true, &[], false).unwrap();
+    store.groq_complete(run, &output(segment)).unwrap();
+    assert_eq!(store.workspace(false, None).unwrap()["term_proposals"].as_array().unwrap().len(), 3);
+    assert_eq!(store.workspace(true, None).unwrap()["term_proposals"], json!([]));
+
+    store.workspace_action(&json!({
+        "op":"review_term_proposal","proposal_id":"бортовик","status":"approved",
+        "data":{"term":"Бортовик","variants":[]},
+    })).unwrap();
+    store.workspace_action(&json!({
+        "op":"review_term_proposal","proposal_id":"шумок","status":"rejected"
+    })).unwrap();
+    let term = store.workspace_action(&json!({
+        "op":"save_company_term","data":{"term":"Сатин","variants":[]}
+    })).unwrap();
+    let merge = |revision| json!({
+        "op":"review_term_proposal","proposal_id":"сатинчик","status":"merged",
+        "id":term["id"],"revision":revision,
+        "data":{"term":"Сатин","variants":[{"text":"сатинчик","language":"ru"}]},
+    });
+    assert!(store.workspace_action(&merge(json!(0))).is_err());
+    store.workspace_action(&merge(term["revision"].clone())).unwrap();
+    assert!(store.workspace_action(&merge(term["revision"].clone())).is_err());
+
+    let (repeated, _, _) = store.groq_prepare_projects(first, MODELS[0], true, true, &[], false).unwrap();
+    store.groq_complete(repeated, &output(segment)).unwrap();
+    let (second, second_segment) = meeting_with_transcript(
+        &store, &connection, "Закупки", "Снова нужны бортовик и сатинчик. Остался шумок.",
+    );
+    let (next, snapshot, _) = store.groq_prepare_projects(second, MODELS[0], true, true, &[], false).unwrap();
+    let relevant = snapshot["company_terms"].as_array().unwrap();
+    assert!(relevant.iter().any(|term| term["term"] == "Бортовик"));
+    assert!(relevant.iter().any(|term| term["term"] == "Сатин"));
+    assert!(!relevant.iter().any(|term| term["term"] == "шумок"));
+    store.groq_complete(next, &output(second_segment)).unwrap();
+
+    drop(store);
+    store = Store::open(&path).unwrap();
+    let state = store.workspace(false, None).unwrap();
+    let proposals = state["term_proposals"].as_array().unwrap();
+    assert_eq!(proposals.len(), 3);
+    for (word, status) in [("бортовик", "approved"), ("сатинчик", "merged"), ("шумок", "rejected")] {
+        let proposal = proposals.iter().find(|proposal| proposal["id"] == word).unwrap();
+        assert_eq!(proposal["status"], status);
+        assert_eq!(proposal["sources"].as_array().unwrap().len(), 2);
+    }
+}
+
+#[test]
+fn company_can_save_distinct_contexts_for_the_same_spelling() {
+    let (_dir, store, _, _) = setup();
+    let add = |term, context| store.workspace_action(&json!({
+        "op":"save_company_term","data":{
+            "term":term,"variants":[{"text":"залить","context":context}]
+        }
+    }));
+    add("Заливка конструкции", "плиту").unwrap();
+    add("Загрузка сборки", "сборку").unwrap();
+    assert!(add("Другая запись для плиты", "ПЛИТУ").is_err());
+    let state = store.workspace(false, None).unwrap();
+    let terms = state["glossary_terms"].as_array().unwrap();
+    assert_eq!(terms.iter().filter(|term| term["variants"].as_array().unwrap().iter()
+        .any(|variant| variant["text"] == "залить")).count(), 2);
+}
+
+#[test]
+fn supplied_industry_packages_are_selectable_and_provide_local_definitions() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("packs.sqlite3");
+    let store = Store::open(&path).unwrap();
+    let connection = Connection::open(&path).unwrap();
+    let (meeting, _) = meeting_with_transcript(
+        &store, &connection, "Склад", "Согласовать кросс-докинг. Дедлайн завтра.",
+    );
+    let select = |industry| store.workspace_action(&json!({
+        "op":"settings","data":{"industry_template":industry}
+    })).unwrap();
+    select("logistics");
+    let state = store.workspace(false, None).unwrap();
+    assert_eq!(state["industry_catalog"].as_array().unwrap().len(), 25);
+    assert_eq!(state["settings"]["industry_template"], "logistics");
+    let (_, snapshot, _) = store
+        .groq_prepare_projects(meeting, MODELS[0], true, false, &[], false)
+        .unwrap();
+    let relevant = snapshot["company_terms"].as_array().unwrap();
+    assert!(relevant.iter().any(|term| term["term"] == "Дедлайн"));
+    assert!(relevant.iter().any(|term| term["term"] == "Кросс-докинг"
+        && term["definition"] == "Перегрузка через терминал без длительного хранения"
+        && term["lookup_only"] == true));
+    assert_eq!(snapshot["segments"][0]["text"], "Согласовать кросс-докинг. Дедлайн завтра.");
+
+    connection.execute("UPDATE workspace_settings SET data_json=json_set(data_json,'$.industry_template','decor') WHERE key='preferences'", []).unwrap();
+    let legacy = store.workspace(false, None).unwrap();
+    assert_eq!(legacy["settings"]["industry_template"], "events");
+
+    select("events");
+    let state = store.workspace(false, None).unwrap();
+    let options = state["industry_catalog"].as_array().unwrap();
+    assert!(options.iter().any(|option| option["id"] == "events" && option["title"] == "Мероприятия и декор"));
+    assert!(!options.iter().any(|option| option["id"] == "decor"));
+    assert_eq!(state["industry_terms"], legacy["industry_terms"]);
+    let active = state["industry_terms"].as_array().unwrap();
+    assert!(active.iter().any(|term| term["term"] == "Раншит"));
+    assert!(active.iter().any(|term| term["term"] == "Передача в пошив"));
+    assert!(!active.iter().any(|term| term["term"] == "Кросс-докинг"));
+}
+
+#[test]
+fn dictionary_json_preview_round_trip_and_isolated_package_updates() {
+    let (_directory, store, _, _) = setup();
+    let action = |payload: Value| store.workspace_action(&payload);
+    let preview = |document: &Value| action(json!({
+        "op":"preview_dictionary_import","document":document
+    })).unwrap();
+    let apply = |document: &Value, report: &Value| action(json!({
+        "op":"apply_dictionary_import","document":document,"token":report["token"]
+    }));
+    let export = |scope| action(json!({"op":"export_dictionary","scope":scope})).unwrap();
+
+    let company = json!({"format":"vtask-company-dictionary","schema_version":1,"entries":[
+        {"term":"Бортовик","definition":"Тестовое описание","variants":[{"text":"борт","language":"ru","context":"пиджака"}]},
+        {"term":"Другое значение","variants":[{"text":"борт","context":"пиджака"}]},
+        {"term":"","variants":[]}
+    ]});
+    let report = preview(&company);
+    assert_eq!(report["added"], 1);
+    assert_eq!(report["conflict"], 1);
+    assert_eq!(report["invalid"], 1);
+    assert_eq!(export("company")["entries"], json!([]));
+    apply(&company, &report).unwrap();
+    assert!(apply(&company, &report).is_err());
+    let exported = export("company");
+    assert_eq!(exported["entries"][0]["definition"], "Тестовое описание");
+    assert_eq!(exported["entries"][0]["variants"][0]["context"], "пиджака");
+    let duplicate = preview(&exported);
+    assert_eq!(duplicate["duplicate"], 1);
+    assert_eq!(duplicate["added"], 0);
+
+    action(json!({"op":"settings","data":{"industry_template":"events"}})).unwrap();
+    let events = export("industry");
+    assert_eq!(preview(&events)["updated"], 0);
+    let imported = json!({"schema_version":"1.0","industry_id":"03_events",
+        "industry_name_ru":"Мероприятия", "revision":"2026-12-01","entries":[
+        {"id":"03_events.0001","canonical":"Раншит","definition_ru":"Сценарный график мероприятия",
+         "language":"ru","aliases":["run sheet","ран-лист"],"industry_id":"03_events","status":"active","category":"term"},
+        {"id":"03_events.extra","canonical":"Технический прогон","definition_ru":"Репетиция с оборудованием",
+         "language":"ru","aliases":["техпрогон"],"industry_id":"03_events","status":"active","category":"term"},
+        {"id":"03_events.extra","canonical":"Дубль","definition_ru":"Запись с повторным идентификатором",
+         "language":"ru","aliases":[],"industry_id":"03_events","status":"active"}
+    ]});
+    let report = preview(&imported);
+    assert_eq!(report["updated"], 1);
+    assert_eq!(report["added"], 1);
+    assert_eq!(report["conflict"], 1);
+    assert_eq!(export("industry"), events);
+    apply(&imported, &report).unwrap();
+    let merged = export("industry");
+    assert_eq!(merged["revision"], "2026-12-01");
+    assert_eq!(merged["entries"].as_array().unwrap().len(),
+        events["entries"].as_array().unwrap().len() + 1);
+    assert_eq!(preview(&merged)["updated"], 0);
+    assert_eq!(export("company"), exported);
+
+    let custom = json!({"format":"vtask-industry-dictionary","schema_version":1,
+        "industry_id":"custom_studio","industry_name_ru":"Моя студия","revision":"1",
+        "entries":[{"source_id":"studio.one","term":"Раскрой","variants":[],"definition":"Подготовка деталей",
+            "specialization_ids":["cutting"]}]});
+    apply(&custom, &preview(&custom)).unwrap();
+    action(json!({"op":"settings","data":{"industry_template":"custom_studio"}})).unwrap();
+    let state = store.workspace(false, None).unwrap();
+    assert!(state["industry_catalog"].as_array().unwrap().iter().any(|item| item["id"] == "custom_studio"));
+    assert!(state["industry_terms"].as_array().unwrap().iter().any(|item| item["term"] == "Раскрой"));
+    assert!(state["specialization_catalog"].as_array().unwrap().iter().any(|item| item["id"] == "custom_studio/cutting"));
+    assert_eq!(export("industry")["entries"][0]["specialization_ids"], json!(["cutting"]));
+}
+
+#[test]
+fn meeting_inherits_project_dictionary_scope_or_uses_its_own() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("scoped.sqlite3");
+    let store = Store::open(&path).unwrap();
+    let connection = Connection::open(&path).unwrap();
+    let (meeting, _segment) = meeting_with_transcript(
+        &store, &connection, "Подготовка", "Согласовать раншит, кросс-докинг и KPI.",
+    );
+    let action = |body: Value| store.workspace_action(&body);
+    action(json!({"op":"settings","data":{"industry_template":"marketing"}})).unwrap();
+    let project = action(json!({"op":"save_project","data":{
+        "title":"Производство","status":"active","terminology_industries":["decor","logistics","events"]
+    }})).unwrap();
+    let project_id = project["id"].as_i64().unwrap();
+    assert_eq!(project["terminology_industries"], json!(["events","logistics"]));
+    let without_scope = json!({"op":"save_meeting","id":meeting,"data":{
+        "title":"Подготовка","project_id":project_id,"participants":[]
+    }});
+    action(without_scope.clone()).unwrap();
+    let snapshot = store.groq_snapshot(meeting).unwrap();
+    assert_eq!(snapshot["industry_templates"], json!(["events","logistics"]));
+    let terms = |snapshot: &Value, term: &str| snapshot["company_terms"].as_array().unwrap()
+        .iter().any(|entry| entry["term"] == term);
+    for term in ["Раншит","Кросс-докинг","KPI"] {
+        assert!(terms(&snapshot,term));
+    }
+    let state = store.workspace(false,None).unwrap();
+    assert!(state.get("scoped_glossaries").is_none());
+    let scoped = action(json!({"op":"scoped_glossary","scopes":["events","logistics"]})).unwrap();
+    assert!(scoped.as_array().unwrap().iter().any(|entry| entry["term"] == "Кросс-докинг"));
+
+    let (original, _, _) = store.groq_prepare_projects(meeting, MODELS[0], true, false, &[], false).unwrap();
+    store.groq_complete(original, &json!({"summary":"Подготовка","tasks":[],"decisions":[],"open_questions":[]})).unwrap();
+
+    let mut update = without_scope.clone();
+    update["data"]["terminology_industries"] = json!(["unknown"]);
+    assert!(action(update.clone()).is_err());
+    update["data"]["terminology_industries"] = json!(["universal"]);
+    action(update.clone()).unwrap();
+    action(without_scope).unwrap();
+    let (next, snapshot, cached) = store.groq_prepare_projects(meeting, MODELS[0], true, false, &[], false).unwrap();
+    assert!(!cached && next != original);
+    assert_eq!(snapshot["industry_templates"], json!(["universal"]));
+    assert!(!terms(&snapshot,"Раншит"));
+    assert!(!terms(&snapshot,"Кросс-докинг"));
+    assert!(terms(&snapshot,"KPI"));
+
+    update["data"]["terminology_industries"] = json!([]);
+    action(update).unwrap();
+    assert_eq!(store.groq_snapshot(meeting).unwrap()["industry_templates"], json!(["events","logistics"]));
+}
+
+#[test]
+fn specialization_filters_the_live_vocabulary_without_loading_other_industries() {
+    let (_dir, store, meeting, _) = setup();
+    let action = |body: Value| store.workspace_action(&body);
+    let project = action(json!({"op":"save_project","data":{
+        "title":"Монтаж","status":"active","terminology_industries":["events/decor","it/qa"]
+    }})).unwrap();
+    let project_id = project["id"].as_i64().unwrap();
+    action(json!({"op":"save_meeting","id":meeting,"data":{
+        "title":"Монтаж","project_id":project_id,"participants":[]
+    }})).unwrap();
+    let workspace = store.workspace(false,None).unwrap();
+    assert!(workspace["specialization_catalog"].as_array().unwrap().iter().any(|spec| {
+        spec["id"] == "events/decor" && spec["industry_id"] == "events" && spec["title"] == "Декор"
+    }));
+    assert!(workspace.get("scoped_glossaries").is_none());
+    let scoped = action(json!({"op":"scoped_glossary","scopes":["events/decor","it/qa"]})).unwrap();
+    let has = |name| scoped.as_array().unwrap().iter().any(|term| term["term"] == name);
+    assert!(has("Передача в пошив") && has("Бутафория") && has("Регрессия") && has("Дедлайн"));
+    assert!(!has("Саундчек") && !has("Kubernetes"));
+    let analysis = store.groq_snapshot(meeting).unwrap();
+    assert_eq!(analysis["industry_template"], "events");
+    assert_eq!(analysis["industry_templates"], json!(["events/decor","it/qa"]));
+    assert!(action(json!({"op":"scoped_glossary","scopes":["it/unknown"]})).is_err());
+
+    let events = action(json!({"op":"export_dictionary","scope":"industry"})).unwrap();
+    assert_eq!(events["revision"], "1.1 · 2026-11-21");
+    assert_eq!(events["entries"].as_array().unwrap().len(), 84);
 }

@@ -113,12 +113,19 @@ class Provider(unittest.TestCase):
    with self.assertRaises(g.ProviderError):
     g.interpret(data)
 
- def test_assistant_rejects_creation_on_the_main_route(self):
-  intent = dict.fromkeys(g.ASSISTANT_SCHEMA['properties'])
-  intent.update(action='create_task', title='Новая задача')
-  with patch.object(g, 'request', return_value=intent):
-   with self.assertRaises(g.ProviderError):
-    g.interpret({'text':'Создай новую задачу'})
+ def test_assistant_routes_creation_to_review_drafts(self):
+  for action, text in (
+   ('create_project', 'Создай проект Горы'),
+   ('create_task', 'Добавь задачу заказать ткани'),
+   ('create_meeting', 'Давай запланируем встречу на завтра'),
+   ('create_decision', 'Зафиксируй решение выбрать фиолетовый'),
+  ):
+   intent = dict.fromkeys(g.ASSISTANT_SCHEMA['properties'])
+   intent.update(action=action, title='Уточнённое название')
+   with self.subTest(action=action), patch.object(g, 'request', return_value=intent) as request:
+    self.assertEqual(g.interpret({'text':text, 'has_project':True}), intent)
+    self.assertEqual(request.call_count, 1)
+    self.assertNotIn('projects', request.call_args.args[1])
 
  def test_strict_schema_and_secret_only_in_authorization(self):
   captured=[]
@@ -316,6 +323,25 @@ class AIBudgetTests(unittest.TestCase):
                    'нужен сотовый поликарбонат для стенда в планах сотиковый узор')
   self.assertEqual(segments[0]['text'], 'Нужен сотик для стенда, в планах сотиковый узор')
 
+ def test_company_glossary_uses_nearby_words_for_ambiguous_variants(self):
+  glossary = [
+   {'term':'бетонировать','variants':[{'text':'залить','context':'плиту'}]},
+   {'term':'загрузить','variants':[{'text':'залить','context':'сборку'}]},
+  ]
+  patterns = g.glossary_index(glossary)
+  self.assertEqual(g.expand_glossary('Залить плиту', patterns), 'бетонировать плиту')
+  self.assertEqual(g.expand_glossary('Сборку надо залить', patterns), 'сборку надо загрузить')
+  self.assertEqual(g.expand_glossary('Надо залить', patterns), 'надо залить')
+  self.assertEqual(g.expand_glossary('Плиту и сборку надо залить', patterns), 'плиту и сборку надо залить')
+
+ def test_company_glossary_bounds_the_context_to_relevant_entries(self):
+  glossary = [{'term': 'Термин ' + str(i), 'variants': []} for i in range(30)]
+  segments = [{'id': 1, 'text': '. '.join(item['term'] for item in glossary[:20])}]
+  terms = g.relevant_company_terms(glossary, segments)
+  self.assertEqual(len(terms), 12)
+  self.assertEqual(terms, glossary[:12])
+  self.assertEqual(g.relevant_company_terms(glossary, [{'id': 2, 'text': 'Обычная речь'}]), [])
+
  def test_industry_selects_terms_and_keeps_shared_sections(self):
   segments = [{'id':1,'text':'Нужно выкатить на прод, принять скрытые работы и сверить смету.'}]
   def titles(industry):
@@ -324,5 +350,11 @@ class AIBudgetTests(unittest.TestCase):
   self.assertEqual(titles('construction'), {'Приёмка', 'Финансы'})
   self.assertEqual(titles('universal'), {'Финансы'})
   self.assertEqual(titles('decor'), {'Финансы'})
+  decor = [{'id':2, 'text':'Нужно отшить образец и развесить декор.'}]
+  events = g.meeting_topic_glossary(decor, 'events')
+  self.assertEqual({item['topic'] for item in events}, {'Изготовление', 'Монтаж'})
+  self.assertEqual(g.meeting_topic_glossary(decor, 'decor'), events)
+  combined = g.meeting_topic_glossary(decor + segments, ['events/decor', 'it/qa'])
+  self.assertEqual({item['topic'] for item in combined}, {'Изготовление', 'Монтаж', 'Релизы', 'Финансы'})
 
 if __name__=='__main__':unittest.main()

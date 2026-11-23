@@ -38,6 +38,13 @@ struct ValliAvatar: View {
         }
         .frame(width: size, height: size)
         .clipShape(shape)
+        .overlay {
+            if state == .listening {
+                shape.strokeBorder(Color.accentColor, lineWidth: 2)
+                    .shadow(color: Color.accentColor.opacity(0.58), radius: size * 0.09)
+                    .allowsHitTesting(false)
+            }
+        }
         .scaleEffect(highlighted && !reduceMotion ? 1.06 : 1)
         .animation(reduceMotion ? nil : .easeOut(duration: 0.15), value: highlighted)
         .animation(animated && !reduceMotion ? .easeOut(duration: 0.18) : nil, value: state)

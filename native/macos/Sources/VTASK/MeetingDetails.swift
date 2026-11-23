@@ -9,6 +9,7 @@ struct MeetingEditor: View {
     @State private var hasSchedule: Bool
     @State private var projectID: Int?
     @State private var participants: Set<Int>
+    @State private var industries: [String]
 
     init(model: WorkspaceModel, meeting: Meeting) {
         self.model = model
@@ -18,6 +19,7 @@ struct MeetingEditor: View {
         _hasSchedule = State(initialValue: meeting.scheduledDate != nil)
         _projectID = State(initialValue: meeting.projectId)
         _participants = State(initialValue: Set(meeting.participants))
+        _industries = State(initialValue: meeting.terminologyIndustries ?? [])
     }
 
     var body: some View {
@@ -34,6 +36,12 @@ struct MeetingEditor: View {
                 ForEach(model.workspace?.projects.filter { $0.archived != true || $0.id == meeting.projectId } ?? []) { project in
                     Text(project.title).tag(Optional(project.id))
                 }
+            }
+            if let workspace = model.workspace {
+                let inherited = workspace.terminologySelection(projectID: projectID)
+                IndustrySelectionField(options: workspace.industryOptions, specializations: workspace.specializationCatalog ?? [],
+                    inheritedTitle: (projectID == nil ? "Из настроек · " : "Из проекта · ")
+                        + workspace.terminologyTitles(inherited), selection: $industries)
             }
             Section("Участники") {
                 ForEach(model.workspace?.people ?? []) { person in
@@ -56,6 +64,7 @@ struct MeetingEditor: View {
                             "title": title,
                             "project_id": projectID.map { $0 as Any } ?? NSNull(),
                             "participants": participants.sorted(),
+                            "terminology_industries": industries,
                             "scheduled_at": hasSchedule ? ISO8601DateFormatter().string(from: schedule) as Any : NSNull()
                         ]
                         if await model.command(["op": "save_meeting", "id": meeting.id, "data": data]) {
@@ -256,6 +265,7 @@ struct MeetingDecisions: View {
     @Environment(\.meetingTopics) private var meetingTopics
     let decisions: [Decision]
     let proposals: [Proposal]
+    var missingWorkPeriod: ((String) -> Bool)? = nil
     let review: (Proposal) -> Void
 
     var body: some View {
@@ -268,7 +278,7 @@ struct MeetingDecisions: View {
                     case .proposed(let proposal):
                         return MeetingTopicEntry<Decision>.proposalTopic(proposal, topics: meetingTopics, glossary: glossary)
                     }
-                }) { row in
+                }, missingWorkPeriod: missingWorkPeriod) { row in
                     switch row {
                     case .confirmed(let decision):
                         HStack(alignment: .firstTextBaseline, spacing: 10) {
@@ -326,17 +336,28 @@ struct MeetingDisclosure<Content: View>: View {
     let title: String
     let icon: String
     let count: Int?
+    let trailingIndicator: Bool
     @ViewBuilder let content: () -> Content
     @State private var expanded: Bool
     @State private var hovering = false
 
     init(title: String, icon: String, count: Int?, initiallyExpanded: Bool = false,
-         @ViewBuilder content: @escaping () -> Content) {
+         trailingIndicator: Bool = false, @ViewBuilder content: @escaping () -> Content) {
         self.title = title
         self.icon = icon
         self.count = count
+        self.trailingIndicator = trailingIndicator
         self.content = content
         _expanded = State(initialValue: initiallyExpanded)
+    }
+
+    private var indicator: some View {
+        Image(systemName: "chevron.right")
+            .font(.caption.weight(.semibold))
+            .rotationEffect(.degrees(expanded ? 90 : 0))
+            .foregroundStyle(.secondary)
+            .frame(width: 12)
+            .accessibilityHidden(true)
     }
 
     var body: some View {
@@ -346,18 +367,13 @@ struct MeetingDisclosure<Content: View>: View {
                 expanded.toggle()
             } label: {
                 HStack(spacing: 10) {
-                    Image(systemName: "chevron.right")
-                        .font(.caption.weight(.semibold))
-                        .rotationEffect(.degrees(expanded ? 90 : 0))
-                        .foregroundStyle(.secondary)
-                        .frame(width: 12)
-                        .accessibilityHidden(true)
+                    if !trailingIndicator { indicator }
                     Image(systemName: icon)
                         .foregroundStyle(.tint)
                         .frame(width: 22)
                         .accessibilityHidden(true)
                     Text(title).font(.headline)
-                    Spacer(minLength: 8)
+                    if !trailingIndicator { Spacer(minLength: 8) }
                     if let count {
                         Text(count, format: .number)
                             .font(.caption.weight(.medium).monospacedDigit())
@@ -365,6 +381,10 @@ struct MeetingDisclosure<Content: View>: View {
                             .padding(.horizontal, 8)
                             .padding(.vertical, 3)
                             .background(.quaternary, in: Capsule())
+                    }
+                    if trailingIndicator {
+                        Spacer(minLength: 8)
+                        indicator
                     }
                 }
                 .padding(.horizontal, 16)

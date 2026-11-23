@@ -5,6 +5,8 @@ struct LiveTranscript: Decodable {
         struct Segment: Decodable {
             let text: String
             let speakerId: String?
+            let startMs: Int?
+            let endMs: Int?
 
             var line: String {
                 guard let speakerId, let index = Int(speakerId.replacingOccurrences(of: "speaker_", with: "")) else { return text }
@@ -14,6 +16,8 @@ struct LiveTranscript: Decodable {
         let id: Int
         let sequence: Int
         let lastSequence: Int?
+        let startMs: Int?
+        let endMs: Int?
         let state: String
         let error: String?
         let segments: [Segment]
@@ -32,44 +36,33 @@ struct LiveTranscript: Decodable {
     let chunks: [Chunk]
 }
 
-struct LiveAssistantCommands {
-    private var seen: Set<Int> = []
-    private var partial: String?
-    private var lastSequence: Int?
+struct LiveCommandClip: Equatable {
+    let sessionID: String
+    let start: Int
+    var end: Int?
 
-    mutating func read(_ chunks: [LiveTranscript.Chunk]) -> [String] {
-        var commands: [String] = []
-        for chunk in chunks where chunk.state == "completed" && seen.insert(chunk.id).inserted {
-            if lastSequence != chunk.sequence - 1 { partial = nil }
-            lastSequence = chunk.lastSequence ?? chunk.sequence
-            for segment in chunk.segments {
-                for sentence in segment.text.split(whereSeparator: { ".!?…\n".contains($0) }) {
-                    let phrase = sentence.trimmingCharacters(in: .whitespacesAndNewlines)
-                    let candidate: String
-                    if let wake = phrase.range(of: #"^[«“"]?валли\b[\s,–—:-]*"#,
-                                               options: [.regularExpression, .caseInsensitive]) {
-                        candidate = String(phrase[wake.upperBound...])
-                    } else if let partial {
-                        candidate = partial.isEmpty ? phrase : partial + " " + phrase
-                    } else {
-                        continue
-                    }
-                    partial = nil
-                    if candidate.isEmpty {
-                        partial = candidate
-                    } else if candidate.range(of: #"^(?:найди|найдите|покажи|покажите|открой|откройте|выведи)\b"#,
-                                              options: [.regularExpression, .caseInsensitive]) != nil {
-                        if candidate.range(of: #"\bзадач(?:а|у|и|е|ей|ам|ами|ах)?\b"#,
-                                           options: [.regularExpression, .caseInsensitive]) != nil {
-                            commands.append(candidate)
-                        } else if candidate.split(separator: " ").count <= 3 {
-                            partial = candidate
-                        }
-                    }
-                }
-            }
+    enum Result: Equatable {
+        case waiting, unavailable, ready(String)
+    }
+
+    func read(_ transcript: LiveTranscript?) -> Result {
+        guard let end, let transcript, transcript.sessionId == sessionID else { return .waiting }
+        let covering = transcript.chunks.filter { ($0.startMs ?? end) < end && ($0.endMs ?? start) > start }
+            .sorted { ($0.startMs ?? 0) < ($1.startMs ?? 0) }
+        if covering.contains(where: { ["deferred", "failed"].contains($0.state) }) { return .unavailable }
+        guard covering.last?.endMs ?? 0 >= end, covering.allSatisfy({ $0.state == "completed" }) else {
+            return .waiting
         }
-        return commands
+        var through = start
+        for chunk in covering {
+            guard let from = chunk.startMs, let to = chunk.endMs, from <= through + 50 else { return .unavailable }
+            through = max(through, to)
+        }
+        let fragments = covering.flatMap(\.segments).filter {
+            guard let from = $0.startMs, let to = $0.endMs else { return false }
+            return min(to, end) - max(from, start) >= min(250, max(1, to - from))
+        }
+        return .ready(fragments.map(\.text).joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines))
     }
 }
 

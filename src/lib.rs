@@ -14,6 +14,7 @@ pub mod voice;
 pub mod voice_capture;
 pub mod voice_matching;
 pub mod web;
+mod work_period_catalog;
 pub mod workspace;
 use anyhow::{bail, Context, Result};
 use rusqlite::{params, Connection};

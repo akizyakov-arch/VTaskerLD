@@ -13,7 +13,7 @@
     {"term": "Планирование рисков", "language": "ru", "section": "Планирование", "variants": [{"text": "разобрать риски", "language": "ru"}, {"text": "сверить риски", "language": "ru"}]},
     {"term": "Согласование объёма работ", "language": "ru", "section": "Согласование", "variants": [{"text": "утвердить объём", "language": "ru"}, {"text": "уточнить объёмы", "language": "ru"}]}
   ],
-  "decor": [
+  "events": [
     {"term": "Подбор референсов", "language": "ru", "section": "Концепция и замеры", "variants": [{"text": "собрать рефы", "language": "ru"}, {"text": "накидать рефы", "language": "ru"}]},
     {"term": "Коллаж для согласования концепции", "language": "ru", "section": "Концепция и замеры", "variants": [{"text": "мудборд", "language": "ru"}, {"text": "доска настроения", "language": "ru"}]},
     {"term": "Контрольный замер площадки", "language": "ru", "section": "Концепция и замеры", "variants": [{"text": "перемерить площадку", "language": "ru"}, {"text": "снять контрольные размеры", "language": "ru"}]},

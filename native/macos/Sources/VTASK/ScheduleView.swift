@@ -7,6 +7,7 @@ struct ScheduleView: View {
     let people: [Person]
     let today: String
     let openTask: (Int) -> Void
+    var showsGanttPicker = true
     @State private var gantt = false
     @State private var period: Period = .month
     @State private var selectedDate: Date?
@@ -41,14 +42,16 @@ struct ScheduleView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Picker("Планирование", selection: $gantt) {
-                Label("Календарь задач", systemImage: "calendar").tag(false)
-                Label("Диаграмма Ганта", systemImage: "chart.bar.xaxis").tag(true)
+            if showsGanttPicker {
+                Picker("Планирование", selection: $gantt) {
+                    Label("Календарь задач", systemImage: "calendar").tag(false)
+                    Label("Диаграмма Ганта", systemImage: "chart.bar.xaxis").tag(true)
+                }
+                .labelsHidden()
+                .pickerStyle(.segmented)
+                .fixedSize()
+                Divider()
             }
-            .labelsHidden()
-            .pickerStyle(.segmented)
-            .fixedSize()
-            Divider()
             if gantt { ganttView } else { agenda }
         }
     }

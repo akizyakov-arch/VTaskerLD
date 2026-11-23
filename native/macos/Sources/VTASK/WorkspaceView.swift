@@ -16,28 +16,53 @@ struct WorkspaceView: View {
 
     @StateObject private var model = WorkspaceModel(launchesLocalCore: true)
     @State private var selection: Selection = .dashboard
+    @State private var settingsArea: SettingsArea = .general
+    @State private var glossaryTab: GlossaryTab = .terms
     @State private var history: [NavigationEntry] = []
     @Environment(\.colorScheme) private var colorScheme
     @State private var navigationVisible = true
     @State private var assistantVisible = false
+    @State private var assistantVoiceEnabled = false
     @State private var showingIndustrySetup = false
     @State private var offeredIndustrySetup = false
     @State private var valliButtonHovered = false
+    @State private var tourStep: ValliTourStep?
+    @State private var showingHelpError = false
     @State private var taskDraftID: Int?
     @State private var assistantLive: LiveTranscript?
-    @State private var liveAssistantRequests: [String] = []
-    @State private var archivedProjects = false
-    @State private var projectDirectoryFilters = ProjectDirectory.Filters()
+    @State private var projectDirectoryFilters = ProjectDirectoryFilters()
     @State private var personDirectoryFilters = PersonDirectory.Filters()
-    @State private var meetingQuery = ""
-    @State private var meetingProjectFilter: Int?
-    @State private var meetingPersonFilter: Int?
+    @State private var meetingFilters = MeetingDirectoryFilters()
+    @FocusState private var meetingSearchFocused: Bool
+    @State private var dashboardQuery = ""
+    @FocusState private var dashboardSearchFocused: Bool
+    @State private var scopedGlossary: [CompanyTerm] = []
+    @State private var loadedGlossaryKey: String?
+    private var activeTerminology: [String] {
+        model.workspace?.terminologySelection(projectID: project?.id ?? inspectedTask?.projectId,
+                                             meeting: selectedMeeting) ?? []
+    }
+
+    private var scopedGlossaryKey: String {
+        let revisions = model.workspace?.companyTerms?.map { "\($0.id):\($0.revision)" } ?? []
+        return activeTerminology.joined(separator: ",") + "|" +
+            revisions.joined(separator: ",") + "|\(model.dictionaryGeneration)"
+    }
+
     private var companyGlossary: CompanyGlossary {
-        CompanyGlossary(model.workspace?.glossaryTerms ?? model.workspace?.companyTerms ?? [])
+        guard let workspace = model.workspace else { return CompanyGlossary() }
+        if !activeTerminology.isEmpty {
+            return CompanyGlossary(loadedGlossaryKey == scopedGlossaryKey ? scopedGlossary : workspace.companyTerms ?? [])
+        }
+        return CompanyGlossary(workspace.glossaryTerms ?? workspace.companyTerms ?? [])
     }
 
     private var meetingTopics: MeetingTopics {
-        MeetingTopics(industry: model.workspace?.settings.industryTemplate ?? .decor)
+        let selected = activeTerminology
+        if selected.isEmpty {
+            return MeetingTopics(industry: model.workspace?.settings.industryTemplate ?? .events)
+        }
+        return MeetingTopics(industries: selected.map { IndustryTemplate(rawValue: $0) })
     }
 
     private var palette: PanelPalette {
@@ -55,15 +80,30 @@ struct WorkspaceView: View {
         case audio = "Аудио"
     }
 
+    private enum GlossaryTab: String, CaseIterable {
+        case terms = "Термины"
+        case periods = "Этапы работ"
+    }
+
     private enum TaskTab: String, CaseIterable {
         case items = "Задачи и решения"
         case board = "Доска"
+        case calendar = "Календарь"
+
+        var icon: String {
+            switch self {
+            case .items: return "checklist"
+            case .board: return "rectangle.split.3x1"
+            case .calendar: return "calendar"
+            }
+        }
     }
 
     private enum ProjectTab: String, CaseIterable {
         case overview = "Обзор"
         case items = "Задачи и решения"
         case meetings = "Совещания"
+        case materials = "Материалы"
     }
 
     private struct ProjectSections {
@@ -71,6 +111,17 @@ struct WorkspaceView: View {
         var kind: ApprovalsView.ItemList.Kind = .all
         var status: ApprovalsView.ItemList.Status = .all
         var filters = ApprovalsView.Filters()
+    }
+
+    private struct ProjectEdit {
+        let snapshot: Project
+        let target: ProjectEditor.Target
+    }
+
+    private enum ProjectNavigation {
+        case open(Selection, Int?)
+        case edit(Project, ProjectEditor.Target)
+        case back
     }
 
     private struct NavigationEntry {
@@ -89,6 +140,8 @@ struct WorkspaceView: View {
         let approvals: ApprovalsView.ItemList.Status
         let query: String
         let status: TaskFilter
+        let priority: String?
+        let period: TaskFilter
         let project: Int?
         let assignee: Int?
         let unassigned: Bool
@@ -113,11 +166,14 @@ struct WorkspaceView: View {
     @State private var approvalAfterDiscard: ApprovalsView.InspectedItem?
     @State private var approvalFilters = ApprovalsView.Filters()
     @State private var recoveringRecording = false
-    @State private var editingProject: Project?
+    @State private var projectEdit: ProjectEdit?
+    @State private var pendingProjectNavigation: ProjectNavigation?
     @State private var projectArchiveRequest: Project?
     @State private var creation: Creation?
+    @State private var assistantEditsCreation = false
     @State private var savedView: SavedTaskView?
-    @AppStorage("workItems.groupByTopic") private var groupByTopic = false
+    @AppStorage("workItems.groupByTopic") private var groupByTopic = true
+    @FocusState private var taskSearchFocused: Bool
     @State private var taskTab: TaskTab = .items
     @State private var taskKind: ApprovalsView.ItemList.Kind = .all
     @State private var taskApprovalStatus: ApprovalsView.ItemList.Status = .all
@@ -126,10 +182,13 @@ struct WorkspaceView: View {
     @State private var deletingView: SavedTaskView?
     @State private var query = ""
     @State private var taskStatus: TaskFilter = .all
+    @State private var taskPriority: String?
+    @State private var taskPeriod: TaskFilter = .all
     @State private var projectFilter: Int?
     @State private var assigneeFilter: Int?
     @State private var unassignedOnly = false
     @State private var newTitle = ""
+    @State private var newIndustries: [String] = []
     @State private var newMeetingDate = Date()
     @State private var usesCustomMeetingDate = false
     @State private var newParticipants: Set<Int> = []
@@ -139,6 +198,8 @@ struct WorkspaceView: View {
     @State private var creationProjectID: Int?
     @State private var creationNewProjectName: String?
     @State private var creationNeedsProject = false
+    @State private var creationProjectHint: String?
+    @State private var pendingProjectDate: String?
     @State private var newProjectOwnerID: Int?
     @State private var unresolvedProjectOwner: String?
     @State private var newProjectDescription = ""
@@ -165,7 +226,7 @@ struct WorkspaceView: View {
     }
 
     private func create(_ kind: Creation) async {
-        guard !model.saving && !model.loading else { return }
+        guard !model.saving && !model.loading && canSaveCreation(kind) else { return }
         let enteredTitle = newTitle.trimmingCharacters(in: .whitespacesAndNewlines)
         let title = kind == .meeting && enteredTitle.isEmpty ? "Совещание" : enteredTitle
         if let name = creationNewProjectName {
@@ -181,7 +242,7 @@ struct WorkspaceView: View {
         switch kind {
         case .project:
             payload = ["op": "save_project", "data": [
-                "title": title, "status": "planned",
+                "title": title, "status": "planned", "terminology_industries": newIndustries,
                 "description": newProjectDescription.trimmingCharacters(in: .whitespacesAndNewlines),
                 "owner_id": newProjectOwnerID.map { $0 as Any } ?? NSNull(),
                 "start_date": newProjectStart.isEmpty ? NSNull() as Any : newProjectStart,
@@ -195,6 +256,7 @@ struct WorkspaceView: View {
         case .meeting:
             payload = ["op": "save_meeting", "data": [
                 "title": title, "project_id": projectID, "participants": newParticipants.sorted(),
+                "terminology_industries": newIndustries,
                 "scheduled_at": ISO8601DateFormatter().string(from: usesCustomMeetingDate ? newMeetingDate : .now)
             ]]
         case .task:
@@ -208,17 +270,36 @@ struct WorkspaceView: View {
                 "due_time": newTaskDueTime.isEmpty || newTaskDueDate.isEmpty ? NSNull() as Any : newTaskDueTime
             ]]
         }
-        if kind == .meeting {
-            guard let id = await model.createEntity(payload) else { return }
-            creation = nil
-            assistantVisible = false
+        guard let id = await model.createEntity(payload) else { return }
+        cancelCreation()
+        switch kind {
+        case .project:
+            navigate(.project(id))
+        case .task:
+            openTask(id)
+            if project != nil {
+                projectSections.kind = .tasks
+                projectSections.status = .approved
+                projectSections.filters = ApprovalsView.Filters()
+            } else {
+                taskTab = .items
+                taskKind = .tasks
+                taskApprovalStatus = .approved
+                approvalFilters = ApprovalsView.Filters()
+            }
+        case .meeting:
             openMeeting(id)
-        } else if kind == .person {
-            guard let id = await model.createEntity(payload) else { return }
-            creation = nil
+        case .decision:
+            if let selectedProject {
+                navigate(.project(selectedProject.id))
+                projectSections.tab = .items
+                projectSections.kind = .decisions
+                projectSections.status = .approved
+                projectSections.filters = ApprovalsView.Filters()
+                inspectedApproval = .decision(id)
+            }
+        case .person:
             navigate(.people, itemID: id)
-        } else if await model.command(payload) {
-            creation = nil
         }
     }
 
@@ -246,7 +327,7 @@ struct WorkspaceView: View {
         case .settings: return "Настройки"
         case .meetings: return "Совещания"
         case .people: return "Участники"
-        case .glossary: return "Справочник"
+        case .glossary: return "Справочники"
         default: return project?.title ?? "Задачи и решения"
         }
     }
@@ -265,7 +346,7 @@ struct WorkspaceView: View {
     }
 
     private var tasks: [TaskItem] {
-        let text = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        let text = selection == .tasks && taskTab == .items ? "" : query.trimmingCharacters(in: .whitespacesAndNewlines)
         if let savedView, let workspace = model.workspace {
             return savedView.apply(to: visibleTasks, in: workspace, project: project?.id)
         }
@@ -273,7 +354,10 @@ struct WorkspaceView: View {
             if let projectID = project?.id ?? projectFilter, task.projectId != projectID { return false }
             if unassignedOnly && task.assigneeId != nil { return false }
             if let assigneeFilter, task.assigneeId != assigneeFilter { return false }
-            if !taskStatus.matches(task, today: model.workspace?.today ?? "") { return false }
+            let today = model.workspace?.today ?? ""
+            if !taskStatus.matches(task, today: today) { return false }
+            if taskPeriod != .all && !taskPeriod.matches(task, today: today) { return false }
+            if let taskPriority, taskPriority != (task.priority ?? "normal") { return false }
             return text.isEmpty || task.title.localizedCaseInsensitiveContains(text)
                 || task.description?.localizedCaseInsensitiveContains(text) == true
         }
@@ -284,12 +368,18 @@ struct WorkspaceView: View {
             inspectedApproval = nil
             return
         }
+        if projectEdit != nil {
+            guard !model.saving else { return }
+            pendingProjectNavigation = .open(destination, itemID)
+            return
+        }
         history.append(NavigationEntry(section: selection, itemID: selectedItemID,
                                        approval: inspectedApproval, meetingTab: meetingTab,
                                        projectSections: projectSections,
                                        taskFilters: TaskFilterSnapshot(savedView: savedView, tab: taskTab, kind: taskKind,
                                                                       approvals: taskApprovalStatus, query: query,
-                                                                      status: taskStatus, project: projectFilter,
+                                                                      status: taskStatus, priority: taskPriority, period: taskPeriod,
+                                                                      project: projectFilter,
                                                                       assignee: assigneeFilter, unassigned: unassignedOnly)))
         if case .project = destination, selection != destination {
             projectSections = ProjectSections()
@@ -305,6 +395,11 @@ struct WorkspaceView: View {
     }
 
     private func goBack() {
+        if projectEdit != nil {
+            guard !model.saving else { return }
+            pendingProjectNavigation = .back
+            return
+        }
         if inspectedApproval != nil {
             inspectedApproval = nil
             return
@@ -317,6 +412,8 @@ struct WorkspaceView: View {
         taskApprovalStatus = filters.approvals
         query = filters.query
         taskStatus = filters.status
+        taskPriority = filters.priority
+        taskPeriod = filters.period
         projectFilter = filters.project
         assigneeFilter = filters.assignee
         unassignedOnly = filters.unassigned
@@ -370,12 +467,20 @@ struct WorkspaceView: View {
     }
 
     private func openTask(_ id: Int) {
-        if let project, visibleTasks.contains(where: { $0.id == id && $0.projectId == project.id }) {
-            navigate(.project(project.id), itemID: id)
+        if let task = visibleTasks.first(where: { $0.id == id }),
+           let taskProjectID = task.projectId, project?.id == taskProjectID || selectedMeeting?.projectId == taskProjectID {
+            navigate(.project(taskProjectID), itemID: id)
             projectSections.tab = .items
+            projectSections.status = .approved
+            projectSections.kind = .tasks
+            projectSections.filters = ApprovalsView.Filters()
             return
         }
         navigate(.tasks, itemID: id)
+        taskTab = .items
+        taskKind = .tasks
+        taskApprovalStatus = .approved
+        approvalFilters = ApprovalsView.Filters()
         savedView = nil
         query = ""
         projectFilter = nil
@@ -384,90 +489,27 @@ struct WorkspaceView: View {
         taskStatus = visibleTasks.first { $0.id == id }?.stageKind == "cancelled" ? .cancelled : .all
     }
 
-    private func showProjectCard(_ project: Project) {
-        if self.project?.id != project.id { navigate(.project(project.id)) }
-        editingProject = project
-    }
-
-    private func taskFilters(includesSearch: Bool = true) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
-            if let savedView {
-                ViewThatFits(in: .horizontal) {
-                    HStack(spacing: 8) { savedTaskFilter(savedView); Spacer(minLength: 8); taskViewMenu }
-                    VStack(alignment: .leading, spacing: 8) { savedTaskFilter(savedView); taskViewMenu }
-                }
-            } else {
-                if includesSearch {
-                    ViewThatFits(in: .horizontal) {
-                        HStack(spacing: 8) { taskSearch; taskFilterMenus }
-                        VStack(alignment: .leading, spacing: 8) { taskSearch; taskFilterMenus }
-                    }
-                } else {
-                    taskFilterMenus
-                }
-                ViewThatFits(in: .horizontal) {
-                    HStack(spacing: 6) { taskShortcuts }
-                    VStack(alignment: .leading, spacing: 6) {
-                        HStack(spacing: 6) { taskShortcut(.all, icon: "tray"); myTaskShortcut }
-                        HStack(spacing: 6) { taskShortcut(.today, icon: "calendar"); taskShortcut(.overdue, icon: "exclamationmark.clock") }
-                    }
-                }
-                if let name = taskFilterSummary {
-                    HStack(spacing: 8) {
-                        Label(name, systemImage: "line.3.horizontal.decrease")
-                            .foregroundStyle(palette.muted)
-                        Button("Сбросить") { resetTaskFilters() }.buttonStyle(.link)
-                    }
-                    .font(.caption)
-                }
+    private func showProjectCard(_ project: Project, target: ProjectEditor.Target = .details) {
+        if let projectEdit {
+            if projectEdit.snapshot.id != project.id {
+                pendingProjectNavigation = .edit(project, target)
             }
+            return
         }
-        .panelCard()
-        .padding(.horizontal, 24)
-        .padding(.vertical, 12)
+        if self.project?.id != project.id { navigate(.project(project.id)) }
+        if selectedItemID != nil && taskDraftID != selectedItemID { closeInspector() }
+        inspectedApproval = nil
+        projectSections.tab = .overview
+        assistantVisible = false
+        projectEdit = ProjectEdit(snapshot: project, target: target)
     }
 
-    private var taskSearch: some View {
-        PanelSearchField(placeholder: "Поиск задач", query: $query)
-    }
-
-    private var taskFilterMenus: some View {
-        HStack(spacing: 8) {
-            Menu {
-                Menu("Статус и срок") {
-                    Picker("Статус и срок", selection: $taskStatus) {
-                        ForEach(TaskFilter.allCases) { filter in Text(filter.rawValue).tag(filter) }
-                    }
-                    .pickerStyle(.inline)
-                }
-                if project == nil {
-                    Menu("Проект") {
-                        Picker("Проект", selection: $projectFilter) {
-                            Text("Все проекты").tag(nil as Int?)
-                            ForEach(projects) { project in Text(project.title).tag(Optional(project.id)) }
-                        }
-                        .pickerStyle(.inline)
-                    }
-                }
-                Menu("Исполнитель") {
-                    Picker("Исполнитель", selection: Binding(
-                        get: { unassignedOnly ? -1 : assigneeFilter },
-                        set: {
-                            unassignedOnly = $0 == -1
-                            assigneeFilter = unassignedOnly ? nil : $0
-                        }
-                    )) {
-                        Text("Все исполнители").tag(nil as Int?)
-                        Text("Без исполнителя").tag(Optional(-1))
-                        ForEach(model.workspace?.people ?? []) { person in Text(person.name).tag(Optional(person.id)) }
-                    }
-                    .pickerStyle(.inline)
-                }
-            } label: {
-                Label("Фильтры", systemImage: taskFilterSummary == nil
-                      ? "line.3.horizontal.decrease.circle" : "line.3.horizontal.decrease.circle.fill")
-            }
-            taskViewMenu
+    private func discardProjectEdit(and continueTo: ProjectNavigation) {
+        projectEdit = nil
+        switch continueTo {
+        case .open(let destination, let itemID): navigate(destination, itemID: itemID)
+        case .edit(let project, let target): showProjectCard(project, target: target)
+        case .back: goBack()
         }
     }
 
@@ -510,56 +552,10 @@ struct WorkspaceView: View {
         }
     }
 
-    @ViewBuilder
-    private var taskShortcuts: some View {
-        taskShortcut(.all, icon: "tray")
-        myTaskShortcut
-        taskShortcut(.today, icon: "calendar")
-        taskShortcut(.overdue, icon: "exclamationmark.clock")
-    }
-
-    private var myTaskShortcut: some View {
-        let me = model.workspace?.settings.meId
-        return taskShortcutButton("Мои", icon: "person.crop.circle", selected: me != nil && assigneeFilter == me && taskStatus == .active) {
-            assigneeFilter = me
-            unassignedOnly = false
-            taskStatus = .active
-        }
-        .disabled(me == nil)
-    }
-
-    private func taskShortcut(_ filter: TaskFilter, icon: String) -> some View {
-        taskShortcutButton(filter.rawValue, icon: icon,
-                           selected: taskStatus == filter && (filter != .all || taskFilterSummary == nil)) {
-            if filter == .all { resetTaskFilters() }
-            else { taskStatus = filter }
-        }
-    }
-
-    private func taskShortcutButton(_ title: String, icon: String, selected: Bool, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Label(title, systemImage: icon)
-                .font(.callout.weight(.medium))
-                .foregroundStyle(selected ? palette.selectedInk : palette.muted)
-                .padding(.horizontal, 9)
-                .padding(.vertical, 5)
-                .background(selected ? palette.selected : palette.sidebar, in: RoundedRectangle(cornerRadius: 7))
-        }
-        .buttonStyle(.plain)
-        .accessibilityAddTraits(selected ? .isSelected : [])
-    }
-
-    private var taskFilterSummary: String? {
-        let person = model.workspace?.people.first { $0.id == assigneeFilter }
-        let filteredProject = project == nil ? projects.first { $0.id == projectFilter } : nil
-        let parts = [taskStatus == .all ? nil : taskStatus.rawValue,
-                     unassignedOnly ? "Без исполнителя" : person?.speakerPickerName, filteredProject?.title]
-            .compactMap { $0 }
-        return parts.isEmpty ? nil : parts.joined(separator: " · ")
-    }
-
     private func resetTaskFilters() {
         taskStatus = .all
+        taskPriority = nil
+        taskPeriod = .all
         assigneeFilter = nil
         unassignedOnly = false
         projectFilter = nil
@@ -587,10 +583,10 @@ struct WorkspaceView: View {
                 VStack(alignment: .leading, spacing: 4) {
                     nav("Сегодня", icon: "calendar", destination: .dashboard)
                     nav("Проекты", icon: "square.3.layers.3d", destination: .projectList)
-                    nav("Совещания", icon: "video", destination: .meetings)
                     nav("Задачи и решения", icon: "checkmark.square", destination: .tasks, count: visibleTasks.filter { $0.stageKind == "active" }.count)
+                    nav("Совещания", icon: "video", destination: .meetings)
                     nav("Участники", icon: "person.2", destination: .people)
-                    nav("Справочник", icon: "book", destination: .glossary)
+                    nav("Справочники", icon: "book", destination: .glossary)
                     nav("Обработка", icon: "waveform", destination: .processing)
                 }
                 .padding(.horizontal, 10)
@@ -631,7 +627,7 @@ struct WorkspaceView: View {
                 if let workspace = model.workspace {
                     Dashboard(
                         tasks: visibleTasks, projects: projects, people: workspace.people,
-                        today: workspace.today, openTask: openTask,
+                        today: workspace.today, query: dashboardQuery, openTask: openTask,
                         showTasks: { filter in
                             navigate(.tasks)
                             taskTab = .items
@@ -640,9 +636,7 @@ struct WorkspaceView: View {
                             approvalFilters.query = ""
                             savedView = nil
                             query = ""
-                            projectFilter = nil
-                            assigneeFilter = nil
-                            unassignedOnly = false
+                            resetTaskFilters()
                             taskStatus = filter
                         },
                         showAssignee: { assignee in
@@ -653,13 +647,13 @@ struct WorkspaceView: View {
                             approvalFilters.query = ""
                             savedView = nil
                             query = ""
-                            projectFilter = nil
+                            resetTaskFilters()
                             assigneeFilter = assignee
                             unassignedOnly = assignee == nil
                             taskStatus = .active
                         },
                         myID: workspace.settings.meId,
-                        openProjects: { navigate(.projectList) },
+                        openProjects: { openDashboardProjects(activeOnly: false) },
                         openMeetings: { navigate(.meetings) },
                         meetings: workspace.meetings,
                         pending: workspace.proposals.filter { $0.status == "pending" },
@@ -676,7 +670,13 @@ struct WorkspaceView: View {
                         },
                         openProject: { navigate(.project($0)) },
                         openMeeting: openMeeting,
-                        openApprovals: openApprovals
+                        openApprovals: openApprovals,
+                        openActiveProjects: { openDashboardProjects(activeOnly: true) },
+                        createTask: { beginCreation(.task) },
+                        createMeeting: { beginCreation(.meeting) },
+                        createProject: { beginCreation(.project) },
+                        openWorkPeriods: { openGlossary(.periods) },
+                        photoURL: model.personPhotoURL
                     )
 
                 } else if let error = model.error {
@@ -692,95 +692,69 @@ struct WorkspaceView: View {
         }
     }
 
+    private func openDashboardProjects(activeOnly: Bool) {
+        projectDirectoryFilters.query = ""
+        projectDirectoryFilters.owner = ""
+        projectDirectoryFilters.section = activeOnly ? .current : .all
+        projectDirectoryFilters.status = activeOnly ? "active" : ""
+        navigate(.projectList)
+    }
+
     private var detailLayout: some View {
         HStack(spacing: 0) {
             VStack(alignment: .leading, spacing: 0) {
                 if let error = model.error {
                     Text(error).foregroundStyle(.secondary).padding()
                 }
-                if selection == .tasks {
-                    Picker("Раздел задач", selection: $taskTab) {
-                        ForEach(TaskTab.allCases, id: \.self) { Text($0.rawValue).tag($0) }
-                    }
-                    .labelsHidden()
-                    .pickerStyle(.segmented)
-                    .frame(maxWidth: 470)
-                    .padding(.horizontal, 24)
-                    .padding(.vertical, 8)
-                    if taskTab == .items {
-                        itemFilters(kind: $taskKind, status: $taskApprovalStatus)
-                        if taskApprovalStatus != .pending && taskKind != .decisions {
-                            taskFilters(includesSearch: false)
-                        }
-                    } else { taskFilters() }
-                }
-                if let project {
-                    HStack {
-                        Button { navigate(.projectList) } label: { Label("Все проекты", systemImage: "arrow.left") }
-                            .buttonStyle(.link)
-                        Spacer()
-                        Menu {
-                            Button("Новое совещание") { beginCreation(.meeting) }
-                            Button("Новая задача") { beginCreation(.task) }
-                            Button("Новое решение") { beginCreation(.decision) }
-                        } label: {
-                            Image(systemName: "plus").accessibilityLabel("Добавить в проект")
-                        }
-                        .menuIndicator(.hidden)
-                        .help("Добавить в проект")
-                        .disabled(project.archived == true || model.saving)
-                    }
-                    .padding(.horizontal, 24).padding(.top, 12)
-                    Picker("Раздел проекта", selection: $projectSections.tab) {
-                        ForEach(ProjectTab.allCases, id: \.self) { Text($0.rawValue).tag($0) }
-                    }
-                    .labelsHidden()
-                    .pickerStyle(.segmented)
-                    .frame(maxWidth: 470)
-                    .padding(.horizontal, 24)
-                    .padding(.vertical, 8)
-                }
+                if selection == .tasks { taskDirectoryControls }
                 if model.loading && model.workspace == nil {
                     ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else if selection == .processing {
                     List(model.workspace?.meetings.filter { $0.processing != nil || !$0.recordings.isEmpty } ?? []) { meeting in
                         Section(meeting.visibleTitle) { ProcessingControls(model: model, meeting: meeting) }
                     }
-                } else if selection == .projectList, let workspace = model.workspace {
-                    ProjectDirectory(workspace: workspace, archived: $archivedProjects, filters: $projectDirectoryFilters,
-                                     openProject: { navigate(.project($0)) }, openTask: openTask,
-                                     editProject: showProjectCard, changeArchive: { projectArchiveRequest = $0 },
-                                     actionsDisabled: model.saving || model.loading)
-                } else if selection == .settings, let workspace = model.workspace {
-                    ScrollView {
-                        EngineSettingsForm(model: model)
-                        SettingsForm(model: model, settings: workspace.settings, people: workspace.people)
-                        AssistantVoiceSettingsForm(canPreview: model.capture?.active == nil)
-                        VoiceMatchingSettingsForm(model: model)
+                } else if (selection == .projectList || project != nil), let workspace = model.workspace {
+                    ProjectDirectory(workspace: workspace, filters: $projectDirectoryFilters, selected: project,
+                                     allowsSplit: selectedItemID == nil && inspectedApproval == nil,
+                                     openProject: { navigate(.project($0)) }, closeProject: { navigate(.projectList) },
+                                     createProject: { beginCreation(.project) }, openTask: openTask,
+                                     editProject: { showProjectCard($0) }, changeArchive: { projectArchiveRequest = $0 },
+                                     actionsDisabled: model.saving || model.loading || projectEdit != nil) {
+                        if let project { projectDetail(project, workspace: workspace) }
                     }
+                } else if selection == .settings, let workspace = model.workspace {
+                    SettingsPage(model: model, workspace: workspace, area: $settingsArea,
+                                 openGlossary: { openGlossary(.terms) }, openWorkPeriodCatalog: { openGlossary(.periods) },
+                                 openProcessing: { navigate(.processing) })
                 } else if selection == .meetings {
                     if let meeting = selectedMeeting {
                         meetingPage(meeting)
-                    } else {
-                        meetingDirectory
+                    } else if let workspace = model.workspace {
+                        MeetingDirectory(meetings: workspace.meetings, projects: workspace.projects,
+                                         people: workspace.people, timeZone: meetingTimeZone,
+                                         capture: model.capture?.active, filters: $meetingFilters, open: openMeeting)
                     }
                 } else if selection == .people {
                     PersonDirectory(model: model, selection: inspectedItemSelection, filters: $personDirectoryFilters)
                 } else if selection == .glossary, let workspace = model.workspace {
-                    CompanyGlossaryView(model: model, entries: workspace.companyTerms ?? [],
-                                        industry: workspace.settings.industryTemplate ?? .decor,
-                                        starterTerms: workspace.industryTerms ?? [],
-                                        meetings: workspace.meetings, openMeeting: openMeeting)
-                } else if let project, let workspace = model.workspace {
-                    projectContent(project, workspace: workspace)
-                        .id(project.id)
+                    glossaryPage(workspace)
                 } else if selection == .tasks && taskTab == .items, let workspace = model.workspace {
                     ApprovalsView(model: model, workspace: workspace, inspectedItem: approvalSelection,
                                   filters: $approvalFilters, itemList: .init(
                                     project: nil, kind: taskKind, status: taskApprovalStatus,
                                     openTask: { navigate(.tasks, itemID: $0) }, openMeeting: openMeeting,
-                                    acceptedTasks: tasks, taskGrouping: savedView?.group
+                                    acceptedTasks: tasks, taskGrouping: savedView?.group,
+                                    directory: .init(projectID: projectFilter,
+                                                     assigneeID: assigneeFilter, unassigned: unassignedOnly,
+                                                     selectedTaskID: selectedItemID, changeView: changeTaskDirectoryView)
                                   ), groupByTopic: groupByTopic)
+                } else if selection == .tasks && taskTab == .calendar, let workspace = model.workspace {
+                    ScrollView {
+                        ScheduleView(tasks: tasks, projects: projects, people: workspace.people,
+                                     today: workspace.today, openTask: openCalendarTask, showsGanttPicker: false)
+                            .panelCard()
+                            .padding(15)
+                    }
                 } else {
                     taskWorkspace
                         .id(selection)
@@ -828,11 +802,280 @@ struct WorkspaceView: View {
         }
     }
 
+    private func openGlossary(_ tab: GlossaryTab) {
+        glossaryTab = tab
+        navigate(.glossary)
+    }
+
+    private func glossaryPage(_ workspace: Workspace) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 4) {
+                ForEach(GlossaryTab.allCases, id: \.self) { tab in
+                    let active = glossaryTab == tab
+                    Button { glossaryTab = tab } label: {
+                        Label(tab.rawValue, systemImage: tab == .terms ? "text.book.closed" : "square.3.layers.3d")
+                            .font(.callout.weight(.semibold))
+                            .foregroundStyle(active ? Color.white : palette.text)
+                            .padding(.horizontal, 17).padding(.vertical, 9)
+                            .background(active ? Color(red: 0.40, green: 0.24, blue: 0.83)
+                                        : palette.projectAccent.opacity(0.09), in: RoundedRectangle(cornerRadius: 9))
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityAddTraits(active ? .isSelected : [])
+                }
+            }
+            .padding(.horizontal, 24)
+            .padding(.vertical, 10)
+
+            switch glossaryTab {
+            case .terms:
+                CompanyGlossaryView(model: model, entries: workspace.companyTerms ?? [],
+                                    proposals: workspace.termProposals ?? [], meetings: workspace.meetings,
+                                    openMeeting: openMeeting, openDictionarySettings: {
+                                        settingsArea = .terminology
+                                        navigate(.settings)
+                                    })
+            case .periods:
+                WorkPeriodCatalogView(model: model, embedded: true)
+            }
+        }
+    }
+
+    private var showsPendingTasksOnly: Bool { taskTab == .items && taskApprovalStatus == .pending }
+
+    private var taskDirectoryControls: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            ScrollView(.horizontal) {
+                HStack(spacing: 3) {
+                    ForEach(TaskTab.allCases, id: \.self) { tab in
+                        Button {
+                            taskTab = tab
+                        } label: {
+                            Label(tab.rawValue, systemImage: tab.icon)
+                                .font(.callout.weight(.semibold))
+                                .foregroundStyle(tab == taskTab ? .white : palette.text)
+                                .padding(.horizontal, 12).padding(.vertical, 8)
+                                .background(tab == taskTab ? Color(red: 0.41, green: 0.24, blue: 0.84) : .clear,
+                                            in: RoundedRectangle(cornerRadius: 8))
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityAddTraits(tab == taskTab ? .isSelected : [])
+                    }
+                }
+                .padding(3)
+                .background(palette.projectAccent.opacity(0.09), in: RoundedRectangle(cornerRadius: 10))
+            }
+            .scrollIndicators(.hidden)
+            if let savedView {
+                HStack { savedTaskFilter(savedView); Spacer(); taskViewMenu }
+                    .panelCard(inset: 8)
+            } else {
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: 8) {
+                        taskScopeControls
+                        taskTimeControls
+                    }
+                    .fixedSize(horizontal: true, vertical: false)
+                    VStack(alignment: .leading, spacing: 7) {
+                        ScrollView(.horizontal) { HStack(spacing: 7) { taskScopeControls } }
+                        ScrollView(.horizontal) { HStack(spacing: 7) { taskTimeControls } }
+                    }
+                    .scrollIndicators(.hidden)
+                }
+                .panelCard(inset: 9)
+            }
+        }
+        .padding(.horizontal, 15)
+        .padding(.vertical, 8)
+    }
+
+    @ViewBuilder
+    private var taskScopeControls: some View {
+        Menu {
+            Button("Мои задачи") {
+                assigneeFilter = model.workspace?.settings.meId
+                unassignedOnly = false
+                if !showsPendingTasksOnly { taskStatus = .active }
+            }
+            .disabled(model.workspace?.settings.meId == nil)
+            Button("Сбросить фильтры", action: resetDirectoryFilters)
+        } label: {
+            Label("Фильтры", systemImage: "line.3.horizontal.decrease.circle")
+                .foregroundStyle(palette.projectAccent)
+        }
+        let projectTitle = projects.first { $0.id == projectFilter }?.title ?? "Проект"
+        taskFilterMenu("Проект", value: projectTitle) {
+            Picker("Проект", selection: $projectFilter) {
+                Text("Все проекты").tag(nil as Int?)
+                ForEach(projects) { Text($0.title).tag(Optional($0.id)) }
+            }
+        }
+        taskFilterMenu("Статус задачи", value: taskStatus == .all ? "Статус" : taskStatus.rawValue) {
+            Picker("Статус", selection: $taskStatus) {
+                ForEach([TaskFilter.all, .active, .done, .cancelled, .overdue]) { status in
+                    Text(status == .all ? "Все статусы" : status.rawValue).tag(status)
+                }
+                if ![TaskFilter.all, .active, .done, .cancelled, .overdue].contains(taskStatus) {
+                    Text(taskStatus.rawValue).tag(taskStatus)
+                }
+            }
+        }
+        .disabled(showsPendingTasksOnly)
+        let priorities = [("low", "Низкий"), ("normal", "Обычный"), ("high", "Высокий"), ("critical", "Критический")]
+        taskFilterMenu("Приоритет", value: priorities.first { $0.0 == taskPriority }?.1 ?? "Приоритет") {
+            Picker("Приоритет", selection: $taskPriority) {
+                Text("Все приоритеты").tag(nil as String?)
+                ForEach(priorities, id: \.0) { id, name in Text(name).tag(Optional(id)) }
+            }
+        }
+        .disabled(showsPendingTasksOnly)
+    }
+
+    @ViewBuilder
+    private var taskTimeControls: some View {
+        let people = model.workspace?.people ?? []
+        let assigneeTitle = people.first { $0.id == assigneeFilter }?.speakerPickerName
+        taskFilterMenu("Ответственный", value: unassignedOnly ? "Без исполнителя" : assigneeTitle ?? "Ответственный") {
+            Picker("Ответственный", selection: Binding(
+                get: { unassignedOnly ? -1 : assigneeFilter },
+                set: { unassignedOnly = $0 == -1; assigneeFilter = unassignedOnly ? nil : $0 }
+            )) {
+                Text("Все исполнители").tag(nil as Int?)
+                Text("Без исполнителя").tag(Optional(-1))
+                ForEach(people) { Text($0.speakerPickerName).tag(Optional($0.id)) }
+            }
+        }
+        taskFilterMenu("Период задачи", value: taskPeriod == .all ? "Период" : taskPeriod.rawValue) {
+            Picker("Период", selection: $taskPeriod) {
+                Text("Все даты").tag(TaskFilter.all)
+                ForEach([TaskFilter.today, .dueSoon, .later, .undated]) { Text($0.rawValue).tag($0) }
+            }
+        }
+        .disabled(showsPendingTasksOnly)
+        Button("Сбросить", action: resetDirectoryFilters).buttonStyle(.link)
+        if taskTab == .items { groupingButton.labelStyle(.iconOnly) }
+        taskViewMenu.labelStyle(.iconOnly)
+    }
+
+    private func taskFilterMenu<Items: View>(_ title: String, value: String,
+                                               @ViewBuilder items: () -> Items) -> some View {
+        Menu(content: items) {
+            Text(String(value.prefix(22))).lineLimit(1)
+        }
+        .accessibilityLabel(title)
+        .accessibilityValue(value)
+        .fixedSize()
+    }
+
+    private var taskDirectorySearch: some View {
+        HStack(spacing: 6) {
+            PanelSearchField(placeholder: "Поиск задач и решений…",
+                             query: taskTab == .items ? $approvalFilters.query : $query,
+                             focus: $taskSearchFocused)
+            Button("⌘K") { taskSearchFocused = true }
+                .font(.caption.monospaced())
+                .buttonStyle(.bordered)
+                .keyboardShortcut("k", modifiers: .command)
+                .accessibilityLabel("Перейти к поиску задач и решений")
+        }
+        .frame(width: 218)
+    }
+
+    private func resetDirectoryFilters() {
+        resetTaskFilters()
+        approvalFilters.reset()
+        query = ""
+        approvalFilters.query = ""
+    }
+
+    private func changeTaskDirectoryView(_ kind: ApprovalsView.ItemList.Kind,
+                                         _ status: ApprovalsView.ItemList.Status) {
+        inspectedApproval = nil
+        taskKind = kind
+        taskApprovalStatus = status
+    }
+
+    private func openCalendarTask(_ id: Int) {
+        navigate(.tasks, itemID: id)
+    }
+
     private var taskWorkspace: some View {
-        TaskWorkspace(model: model, tasks: tasks, projects: projects,
+        TaskWorkspace(model: model, tasks: tasks, projects: projects, projectID: savedView == nil ? projectFilter : nil,
                       people: model.workspace?.people ?? [], selection: inspectedItemSelection)
             .padding(.horizontal, 24)
             .padding(.bottom, 16)
+    }
+
+    private func projectDetail(_ project: Project, workspace: Workspace) -> some View {
+        let edit = projectEdit.flatMap { $0.snapshot.id == project.id ? $0 : nil }
+        return VStack(spacing: 0) {
+            ProjectDetailHeader(project: project,
+                                direction: workspace.terminologyTitles(project.terminologyIndustries ?? []),
+                                actionsDisabled: model.saving || model.loading || edit != nil,
+                                editing: edit != nil, edit: { showProjectCard(project) },
+                                changeStatus: { status in
+                                    guard status != project.status else { return }
+                                    Task { await model.updateProject(project, changes: ["status": status]) }
+                                },
+                                archive: { projectArchiveRequest = project },
+                                createMeeting: { beginCreation(.meeting) },
+                                createTask: { beginCreation(.task) },
+                                createDecision: { beginCreation(.decision) })
+            ScrollView(.horizontal) {
+                HStack(spacing: 13) {
+                    projectDetailTab("Обзор", icon: "chart.bar", tab: .overview)
+                    projectDetailTab("Совещания", icon: "calendar", tab: .meetings,
+                                     count: workspace.meetings.filter { $0.projectId == project.id }.count)
+                    projectDetailTab("Задачи", icon: "checkmark.square", tab: .items, kind: .tasks,
+                                     count: workspace.tasks.filter { $0.projectId == project.id && $0.stageKind != "cancelled" }.count)
+                    projectDetailTab("Решения", icon: "bolt", tab: .items, kind: .decisions,
+                                     count: workspace.decisions.filter { $0.projectId == project.id && $0.active }.count)
+                    projectDetailTab("Материалы", icon: "folder", tab: .materials)
+                }
+                .padding(.horizontal, 13)
+            }
+            .scrollIndicators(.hidden)
+            .disabled(edit != nil)
+            Divider()
+            if let edit {
+                ProjectEditor(model: model, project: edit.snapshot, target: edit.target, close: { projectEdit = nil })
+                    .id(edit.snapshot.id)
+            } else {
+                projectContent(project, workspace: workspace).id(project.id)
+            }
+        }
+    }
+
+    private func projectDetailTab(_ title: String, icon: String, tab: ProjectTab,
+                                  kind: ApprovalsView.ItemList.Kind? = nil, count: Int? = nil) -> some View {
+        let active = projectSections.tab == tab && (kind == nil || projectSections.kind == kind ||
+            (kind == .tasks && projectSections.kind == .all))
+        return Button {
+            if let kind, projectSections.kind != kind { inspectedApproval = nil }
+            projectSections.tab = tab
+            if let kind { projectSections.kind = kind }
+        } label: {
+            HStack(spacing: 5) {
+                Label(title, systemImage: icon).font(.callout.weight(active ? .semibold : .regular))
+                if let count {
+                    Text(count.formatted()).font(.caption.monospacedDigit())
+                        .padding(.horizontal, 5).background(palette.selected, in: Capsule())
+                }
+            }
+            .fixedSize()
+            .padding(.horizontal, 3)
+            .padding(.vertical, 9)
+            .frame(minHeight: 36)
+            .foregroundStyle(active ? palette.projectAccent : palette.text)
+            .overlay(alignment: .bottom) {
+                if active { Capsule().fill(palette.projectAccent).frame(height: 2) }
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityAddTraits(active ? .isSelected : [])
     }
 
     @ViewBuilder
@@ -844,13 +1087,18 @@ struct WorkspaceView: View {
                 projectSections.kind = .tasks
                 projectSections.status = .approved
                 projectSections.filters.query = ""
-            }, openBoard: {
+            }, openDecisions: {
+                projectSections.tab = .items
+                projectSections.kind = .decisions
+                projectSections.status = .approved
+                projectSections.filters.query = ""
+            }, photoURL: model.personPhotoURL, openBoard: {
                 navigate(.tasks)
                 resetTaskFilters()
                 projectFilter = project.id
                 taskTab = .board
-            }, editProject: {
-                showProjectCard(project)
+            }, editProject: { target in
+                showProjectCard(project, target: target)
             }, editingDisabled: model.saving || model.loading)
         case .items:
             itemFilters(kind: $projectSections.kind, status: $projectSections.status)
@@ -861,6 +1109,21 @@ struct WorkspaceView: View {
                           ), groupByTopic: groupByTopic)
         case .meetings:
             projectMeetings(project, workspace: workspace)
+        case .materials:
+            ScrollView {
+                VStack(alignment: .leading, spacing: 10) {
+                    Label("Материалы проекта", systemImage: "folder").font(.headline)
+                    if let materials = project.materials, !materials.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        Text(materials).textSelection(.enabled)
+                    } else {
+                        Text("Материалы пока не добавлены.").foregroundStyle(.secondary)
+                    }
+                    Button("Редактировать материалы") { showProjectCard(project) }
+                        .buttonStyle(.link).disabled(model.saving || model.loading)
+                }
+                .panelCard()
+                .padding(14)
+            }
         }
     }
 
@@ -952,7 +1215,7 @@ struct WorkspaceView: View {
         meetingFollowUp = .proposal(proposal)
     }
 
-    private func meetingTasks(_ meeting: Meeting) -> some View {
+    private func meetingTasks(_ meeting: Meeting, missingWorkPeriod: ((String) -> Bool)?) -> some View {
         let glossary = companyGlossary
         let tasks = visibleTasks.filter {
             $0.stageKind != "cancelled" && $0.sources?.contains { $0.meetingId == meeting.id } == true
@@ -973,7 +1236,7 @@ struct WorkspaceView: View {
                 case .proposed(let proposal):
                     return MeetingTopicEntry<TaskItem>.proposalTopic(proposal, topics: meetingTopics, glossary: glossary)
                 }
-            }) { row in
+            }, missingWorkPeriod: missingWorkPeriod) { row in
                 switch row {
                 case .confirmed(let task):
                     Button { meetingFollowUp = .task(task.id) } label: {
@@ -999,41 +1262,6 @@ struct WorkspaceView: View {
                     MeetingProposalRow(proposal: proposal, icon: "checkmark.circle", review: reviewMeetingProposal)
                 }
             }
-        }
-    }
-
-    private var meetingDirectory: some View {
-        let query = meetingQuery.trimmingCharacters(in: .whitespacesAndNewlines)
-        let meetings = (model.workspace?.meetings ?? []).filter { meeting in
-            (query.isEmpty || meeting.visibleTitle.localizedCaseInsensitiveContains(query)
-                || meeting.protocolTitle?.localizedCaseInsensitiveContains(query) == true)
-            && (meetingProjectFilter == nil || meeting.projectId == meetingProjectFilter)
-            && (meetingPersonFilter.map(meeting.participants.contains) ?? true)
-        }
-        return ScrollView {
-            LazyVStack(alignment: .leading, spacing: 0) {
-                VStack(alignment: .leading, spacing: 8) {
-                    TextField("Найти встречу", text: $meetingQuery).textFieldStyle(.roundedBorder)
-                    HStack {
-                        Picker("Проект", selection: $meetingProjectFilter) {
-                            Text("Все проекты").tag(nil as Int?)
-                            ForEach(projects) { Text($0.title).tag(Optional($0.id)) }
-                        }
-                        Picker("Участник", selection: $meetingPersonFilter) {
-                            Text("Все участники").tag(nil as Int?)
-                            ForEach(model.workspace?.people ?? []) { Text($0.name).tag(Optional($0.id)) }
-                        }
-                    }
-                }
-                .padding(.bottom, 16)
-                if meetings.isEmpty { Text("Встречи не найдены").foregroundStyle(palette.muted) }
-                ForEach(meetings) { meeting in
-                    Divider()
-                    meetingRow(meeting, showsProject: true)
-                }
-                Divider()
-            }
-            .padding(24)
         }
     }
 
@@ -1145,6 +1373,8 @@ struct WorkspaceView: View {
             .controlSize(.large)
             switch meetingTab {
             case .protocolText:
+                let missingWorkPeriod = model.workspace?.workPeriodTitles(for: activeTerminology)
+                    .map { meetingTopics.missingWorkPeriod(in: $0) }
                 VStack(alignment: .leading, spacing: 12) {
                     Text(meeting.protocolTitle ?? meeting.visibleTitle)
                         .font(.title3.weight(.semibold))
@@ -1155,12 +1385,13 @@ struct WorkspaceView: View {
                 .panelCard()
                 MeetingAnalysisView(model: model, meeting: meeting, openMeeting: openMeeting, openTask: openTask).id(meeting.id)
                 MeetingOpenQuestions(meeting: meeting).id(meeting.id)
-                meetingTasks(meeting).id(meeting.id)
+                meetingTasks(meeting, missingWorkPeriod: missingWorkPeriod).id(meeting.id)
                 MeetingDecisions(
                     decisions: model.workspace?.decisions.filter { $0.meetingId == meeting.id } ?? [],
                     proposals: model.workspace?.proposals.filter {
                         $0.kind == "decision" && $0.status == "pending" && $0.source?.meetingId == meeting.id
                     } ?? [],
+                    missingWorkPeriod: missingWorkPeriod,
                     review: reviewMeetingProposal
                 ).id(meeting.id)
                 if model.capture?.liveDisplay == true && liveMeetingID != meeting.id {
@@ -1275,8 +1506,10 @@ struct WorkspaceView: View {
         return model.workspace?.meetings.first { $0.id == selectedItemID }
     }
 
-    private func beginCreation(_ kind: Creation) {
+    private func beginCreation(_ kind: Creation, fromAssistant: Bool = false) {
+        assistantEditsCreation = fromAssistant
         newTitle = ""
+        newIndustries = []
         newMeetingDate = Date()
         usesCustomMeetingDate = false
         newParticipants = []
@@ -1284,6 +1517,8 @@ struct WorkspaceView: View {
         creationProjectID = project.flatMap { $0.archived == true ? nil : $0.id }
         creationNewProjectName = nil
         creationNeedsProject = kind == .decision
+        creationProjectHint = nil
+        pendingProjectDate = nil
         newProjectOwnerID = nil
         unresolvedProjectOwner = nil
         newProjectDescription = ""
@@ -1298,15 +1533,295 @@ struct WorkspaceView: View {
         creation = kind
     }
 
+    private func prepareAssistantCreation(_ draft: AssistantCreation, projectID: Int?, personID: Int?) {
+        beginCreation(draft.kind, fromAssistant: true)
+        assistantVisible = true
+        newTitle = draft.title
+        creationProjectID = projectID.flatMap { id in projects.contains { $0.id == id } ? id : nil }
+        if let name = draft.projectName, !name.isEmpty, creationProjectID == nil {
+            creationNeedsProject = true
+            creationProjectHint = name
+        }
+        switch draft.kind {
+        case .project:
+            newProjectDescription = draft.description ?? ""
+            if let fields = draft.projectFields {
+                newProjectStart = fields.start ?? ""
+                newProjectEnd = fields.end ?? ""
+                pendingProjectDate = fields.unspecifiedDate
+                newProjectOwnerID = personID
+                unresolvedProjectOwner = personID == nil ? fields.owner : nil
+            }
+        case .task:
+            newTaskDescription = draft.description ?? ""
+            newTaskAssigneeID = personID
+            unresolvedTaskAssignee = personID == nil ? draft.assignee : nil
+            newTaskDueDate = draft.dueDate ?? ""
+            newTaskDueTime = draft.dueTime ?? ""
+            if let priority = draft.priority, ["low", "normal", "high", "critical"].contains(priority) {
+                newTaskPriority = priority
+            }
+        case .meeting:
+            if draft.useCurrentMeetingTime {
+                newMeetingDate = .now
+                usesCustomMeetingDate = true
+            } else if let due = draft.dueDate {
+                applyMeetingSchedule(date: due, time: draft.dueTime)
+            }
+        case .decision, .person:
+            break
+        }
+    }
+
+    private func canSaveCreation(_ kind: Creation) -> Bool {
+        (kind == .meeting || !newTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty) &&
+            (!creationNeedsProject || creationProjectID != nil || creationNewProjectName != nil) &&
+            (kind != .project || (pendingProjectDate == nil && (unresolvedProjectOwner == nil || newProjectOwnerID != nil))) &&
+            (kind != .task || unresolvedTaskAssignee == nil || newTaskAssigneeID != nil)
+    }
+
+    private func creationConversation() -> CreationConversation? {
+        guard assistantEditsCreation, let kind = creation else { return nil }
+        var missing: [CreationField] = []
+        if kind != .meeting && newTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { missing.append(.title) }
+        if [.meeting, .task, .decision].contains(kind) && creationProjectID == nil { missing.append(.project) }
+        if kind == .project {
+            if pendingProjectDate != nil { missing.append(.dateRole) }
+            if newProjectStart.isEmpty { missing.append(.start) }
+            if newProjectEnd.isEmpty { missing.append(.end) }
+            if newProjectOwnerID == nil { missing.append(.owner) }
+            if newProjectDescription.isEmpty { missing.append(.description) }
+        }
+        if kind == .task {
+            if newTaskAssigneeID == nil { missing.append(.assignee) }
+            if newTaskDueDate.isEmpty { missing.append(.end) }
+            if newTaskDescription.isEmpty { missing.append(.description) }
+        }
+        if kind == .meeting {
+            if !usesCustomMeetingDate { missing.append(.meetingDate) }
+            if newParticipants.isEmpty { missing.append(.participants) }
+        }
+        return CreationConversation(kind: kind, missing: missing, canSave: canSaveCreation(kind))
+    }
+
+    private func cancelCreation() {
+        guard !model.saving else { return }
+        creation = nil
+        assistantEditsCreation = false
+    }
+
+    private func confirmAssistantCreation() async -> String? {
+        guard let dialog = creationConversation(), dialog.canSave else { return "Заполните обязательные поля в карточке." }
+        guard !model.saving && !model.loading else { return "Дождитесь сохранения текущих изменений." }
+        await create(dialog.kind)
+        return creation == nil ? nil : (model.error ?? "Не удалось сохранить. Проверьте данные в карточке.")
+    }
+
+    private func creationPeople(matching name: String) -> [Person] {
+        let words = CompanyGlossary.words(name)
+        guard !words.isEmpty else { return [] }
+        let people = model.workspace?.people ?? []
+        let exact = people.filter { person in
+            var forms = [person.name, person.nickname, person.lastName, person.speakerPickerName].compactMap { $0 }
+            if let lastName = person.lastName, !lastName.isEmpty {
+                forms.append(person.name + " " + lastName)
+                forms.append(lastName + " " + person.name)
+            }
+            return forms.contains { CompanyGlossary.words($0) == words }
+        }
+        if !exact.isEmpty { return exact }
+        guard words.count == 1 else { return [] }
+        let variants: [String: Set<String>] = [
+            "леша": ["алексей"], "алеша": ["алексей"], "ира": ["ирина"],
+            "саша": ["александр", "александра"], "маша": ["мария"], "даша": ["дарья"],
+            "миша": ["михаил"], "дима": ["дмитрий"], "вова": ["владимир"],
+        ]
+        let shortName = words[0]
+        return people.filter { person in
+            guard let first = CompanyGlossary.words(person.name).first else { return false }
+            let root = first.last.map { "ая".contains($0) } == true ? String(first.dropLast()) : first
+            return first == shortName || variants[shortName]?.contains(first) == true
+                || (root.count >= 3 && ["е", "у", "ю", "а", "я"].contains { shortName == root + $0 })
+        }
+    }
+
+    private func updateAssistantCreation(_ field: CreationField, value: String?) -> String? {
+        guard let kind = creationConversation()?.kind else { return "Откройте карточку создания." }
+        let today = model.workspace?.today ?? ""
+        let text = value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        switch field {
+        case .title:
+            guard !text.isEmpty else { return field.question }
+            newTitle = text
+        case .project:
+            guard kind != .project else { return "В карточке нового проекта можно изменить название." }
+            if value == nil {
+                guard kind != .decision else { return "Для решения нужно выбрать проект." }
+                creationProjectID = nil
+                creationNeedsProject = false
+                creationProjectHint = nil
+            } else {
+                let matches = projects.filter { CompanyGlossary.words($0.title) == CompanyGlossary.words(text) }
+                guard matches.count == 1, let project = matches.first else {
+                    return "Уточните название проекта или выберите его в карточке."
+                }
+                creationProjectID = project.id
+                creationProjectHint = nil
+            }
+        case .dateRole:
+            guard kind == .project else { return "Уточните дату." }
+            if value == nil {
+                pendingProjectDate = nil
+            } else if let date = pendingProjectDate {
+                let role = AssistantRequest.normalize(text)
+                if ["начало", "это начало", "дата начала"].contains(role) { newProjectStart = date }
+                else if ["срок", "это срок", "завершение", "дата завершения"].contains(role) { newProjectEnd = date }
+                else { return field.question }
+                pendingProjectDate = nil
+            } else if let date = AssistantProjectFields.parseDate(text, today: today) {
+                pendingProjectDate = date
+            } else {
+                return "Не удалось определить дату. Скажите, например, «17 декабря»."
+            }
+        case .start, .end, .meetingDate:
+            if kind == .meeting {
+                if value == nil { usesCustomMeetingDate = false; return nil }
+                if AssistantCreation.isImmediateMeeting(text) {
+                    newMeetingDate = .now
+                    usesCustomMeetingDate = true
+                    return nil
+                }
+                if let schedule = AssistantCreation.deadline(text, today: today),
+                   applyMeetingSchedule(date: schedule.date, time: schedule.time) { return nil }
+                return "Уточните дату и время, например «завтра в 15:30»."
+            }
+            guard kind == .project || (kind == .task && field == .end) else { return "В этой карточке нет такого поля даты." }
+            let schedule = AssistantCreation.deadline(text, today: today)
+            guard value == nil || schedule != nil else { return "Не удалось определить дату. Назовите день и месяц." }
+            let date = schedule?.date ?? ""
+            if kind == .task {
+                newTaskDueDate = date
+                newTaskDueTime = schedule?.time ?? ""
+            } else if field == .start {
+                guard newProjectEnd.isEmpty || date.isEmpty || date <= newProjectEnd else { return "Начало позже срока завершения. Уточните дату." }
+                newProjectStart = date
+                pendingProjectDate = nil
+            } else {
+                guard newProjectStart.isEmpty || date.isEmpty || date >= newProjectStart else { return "Срок раньше начала проекта. Уточните дату." }
+                newProjectEnd = date
+                pendingProjectDate = nil
+            }
+        case .owner, .assignee:
+            guard kind == .project || kind == .task else { return "Для встречи можно указать участников." }
+            let matches = value == nil ? [] : creationPeople(matching: text)
+            let person = matches.count == 1 ? matches.first : nil
+            guard value == nil || person != nil else {
+                return "Не удалось однозначно определить «" + text + "». Назовите имя и фамилию или выберите человека в карточке."
+            }
+            if kind == .project { newProjectOwnerID = person?.id; unresolvedProjectOwner = nil }
+            else { newTaskAssigneeID = person?.id; unresolvedTaskAssignee = nil }
+        case .participants:
+            guard kind == .meeting else { return "Участников можно добавить в карточке совещания." }
+            if value == nil { return nil }
+            guard let ids = MeetingParticipantNames.resolve(text, matches: {
+                creationPeople(matching: $0).map(\.id)
+            }) else {
+                return "Уточните имена участников или отметьте их в карточке."
+            }
+            newParticipants.formUnion(ids)
+        case .description:
+            if kind == .project { newProjectDescription = text }
+            else if kind == .task { newTaskDescription = text }
+            else { return "Здесь можно изменить название или текст решения." }
+        case .priority:
+            guard kind == .task else { return "Приоритет можно указать у задачи." }
+            switch AssistantRequest.normalize(text) {
+            case "низкий", "низкая": newTaskPriority = "low"
+            case "обычный", "средний", "нормальный": newTaskPriority = "normal"
+            case "высокий", "высокая", "важная": newTaskPriority = "high"
+            case "критический", "критичная", "срочно": newTaskPriority = "critical"
+            default: return "Укажите низкий, обычный, высокий или критический приоритет."
+            }
+        }
+        return nil
+    }
+
+    @discardableResult
+    private func applyMeetingSchedule(date: String, time: String?) -> Bool {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = meetingTimeZone
+        formatter.dateFormat = "HH:mm"
+        let time = time ?? formatter.string(from: .now)
+        formatter.dateFormat = "yyyy-MM-dd HH:mm"
+        guard let scheduled = formatter.date(from: date + " " + time) else { return false }
+        newMeetingDate = scheduled
+        usesCustomMeetingDate = true
+        return true
+    }
+
     private var topbar: some View {
         ViewThatFits(in: .horizontal) {
-            HStack(spacing: 16) { pageHeading; Spacer(minLength: 8); headerActions }
-            VStack(alignment: .leading, spacing: 12) { pageHeading; headerActions }
+            HStack(spacing: 12) {
+                pageHeading
+                Spacer(minLength: 8)
+                if showsMeetingDirectory { meetingSearch }
+                if selection == .dashboard { dashboardSearch }
+                headerActions
+            }
+            VStack(alignment: .leading, spacing: 10) {
+                if showsMeetingDirectory || selection == .dashboard {
+                    ViewThatFits(in: .horizontal) {
+                        HStack { pageHeading; Spacer(minLength: 8); headerActions }
+                        VStack(alignment: .leading, spacing: 10) { pageHeading; headerActions }
+                    }
+                    if showsMeetingDirectory { meetingSearch }
+                    else { dashboardSearch }
+                } else {
+                    pageHeading
+                    headerActions
+                }
+            }
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.horizontal, 24)
-        .padding(.vertical, 16)
+        .padding(.vertical, selection == .tasks ? 12 : 16)
         .background(palette.background)
         .overlay(alignment: .bottom) { Rectangle().fill(palette.border).frame(height: 1) }
+    }
+
+    private var showsMeetingDirectory: Bool { selection == .meetings && selectedMeeting == nil }
+    private var compactHeader: Bool { showsMeetingDirectory || selection == .dashboard }
+
+    private var dashboardSearch: some View {
+        HStack(spacing: 5) {
+            PanelSearchField(placeholder: "Задачи, проекты, совещания…", query: $dashboardQuery,
+                             focus: $dashboardSearchFocused)
+            Button("⌘K") { dashboardSearchFocused = true }
+                .font(.caption.monospaced())
+                .buttonStyle(.plain)
+                .keyboardShortcut("k", modifiers: .command)
+                .accessibilityLabel("Перейти к поиску на главной")
+                .padding(.trailing, 8)
+        }
+        .background(palette.surface, in: Capsule())
+        .overlay { Capsule().strokeBorder(palette.border).allowsHitTesting(false) }
+        .frame(width: 250)
+    }
+
+    private var meetingSearch: some View {
+        HStack(spacing: 5) {
+            PanelSearchField(placeholder: "Найти встречу…", query: $meetingFilters.query, focus: $meetingSearchFocused)
+            Button("⌘K") { meetingSearchFocused = true }
+                .font(.caption.monospaced())
+                .buttonStyle(.plain)
+                .keyboardShortcut("k", modifiers: .command)
+                .accessibilityLabel("Перейти к поиску встреч")
+                .padding(.trailing, 8)
+        }
+        .background(palette.surface, in: Capsule())
+        .overlay { Capsule().strokeBorder(palette.border).allowsHitTesting(false) }
+        .frame(width: 208)
     }
 
     private var pageHeading: some View {
@@ -1315,8 +1830,10 @@ struct WorkspaceView: View {
                 Image(systemName: "line.3.horizontal").font(.system(size: 20)).frame(width: 38, height: 38)
             }
             .accessibilityLabel(navigationVisible ? "Скрыть навигацию" : "Показать навигацию")
-            NavigationBackButton(action: goBack)
-                .disabled((history.isEmpty && inspectedApproval == nil) || model.saving)
+            if !compactHeader || !history.isEmpty {
+                NavigationBackButton(action: goBack)
+                    .disabled((history.isEmpty && inspectedApproval == nil) || model.saving)
+            }
             if let meeting = selectedMeeting {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("Совещания").font(.headline).foregroundStyle(palette.text)
@@ -1326,10 +1843,32 @@ struct WorkspaceView: View {
                 }
             } else {
                 VStack(alignment: .leading, spacing: 4) {
-                    Text("VTASK · мой компьютер").font(.caption).foregroundStyle(palette.muted)
-                    Text(sectionTitle)
-                        .font(.system(size: 32, weight: .bold)).tracking(-0.8)
+                    Text(selection == .settings || selection == .glossary ? "VTASK  ›  \(sectionTitle)" :
+                            showsMeetingDirectory ? "VTASK  ›  Совещания" : "VTASK · мой компьютер")
+                        .font(.caption).foregroundStyle(palette.muted)
+                    Text(project == nil ? sectionTitle : "Проекты")
+                        .font(.system(size: selection == .tasks ? 28 : 32, weight: .bold)).tracking(-0.8)
                         .foregroundStyle(palette.text).lineLimit(1).accessibilityAddTraits(.isHeader)
+                    if selection == .settings {
+                        Text("Персонализируйте VTASK под свои задачи и рабочие процессы.")
+                            .font(.callout).foregroundStyle(palette.muted)
+                    } else if selection == .tasks {
+                        Text("Задачи и договорённости по проектам и совещаниям.")
+                            .font(.callout).foregroundStyle(palette.muted).lineLimit(1)
+                            .frame(maxWidth: 340, alignment: .leading)
+                    } else if showsMeetingDirectory {
+                        Text("Все встречи, записи и результаты.")
+                            .font(.callout).foregroundStyle(palette.muted)
+                    } else if selection == .glossary {
+                        Text("Термины и этапы работ для ваших проектов.")
+                            .font(.callout).foregroundStyle(palette.muted)
+                    } else if selection == .dashboard {
+                        Text("Ключевые задачи, проекты и ближайшие события.")
+                            .font(.callout).foregroundStyle(palette.muted)
+                    } else if selection == .projectList || project != nil {
+                        Text("Совещания, задачи и результаты по проектам.")
+                            .font(.callout).foregroundStyle(palette.muted)
+                    }
                 }
             }
         }
@@ -1337,26 +1876,33 @@ struct WorkspaceView: View {
 
     private var headerActions: some View {
         HStack(spacing: 8) {
+            if selection == .tasks { taskDirectorySearch }
+            if showsMeetingDirectory {
+                Button { beginCreation(.meeting) } label: {
+                    Label("Создать встречу", systemImage: "plus")
+                        .font(.callout.weight(.semibold))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 13).padding(.vertical, 7)
+                        .background(Color(red: 0.40, green: 0.24, blue: 0.83), in: Capsule())
+                        .contentShape(Capsule())
+                }
+                .buttonStyle(.plain)
+                .opacity(model.workspace == nil || model.saving ? 0.55 : 1)
+                .disabled(model.workspace == nil || model.saving)
+            }
             if let meeting = selectedMeeting {
                 Button { editingMeeting = meeting } label: { Label("Участники", systemImage: "person.2") }
                     .buttonStyle(.bordered)
                     .disabled(model.saving || model.capture?.active?.meetingId == meeting.id)
-            } else if let project {
-                Button("Карточка проекта") { showProjectCard(project) }.disabled(model.saving)
-                Button {
-                    projectArchiveRequest = project
-                } label: {
-                    let archived = project.archived == true
-                    Image(systemName: archived ? "arrow.uturn.backward" : "archivebox")
-                        .accessibilityLabel(archived ? "Восстановить проект" : "Перенести проект в архив")
-                        .help(archived ? "Восстановить проект" : "Перенести проект в архив")
-                }
-                .disabled(model.saving || model.loading)
             }
             Menu {
                 ForEach(Creation.allCases.filter { $0 != .decision }) { kind in
                     Button(kind.rawValue) { beginCreation(kind) }
                         .disabled(model.workspace == nil || (project?.archived == true && (kind == .task || kind == .meeting)))
+                }
+                if compactHeader {
+                    Menu("Тема интерфейса") { themeOptions }
+                        .disabled(model.workspace == nil || model.saving)
                 }
                 Divider()
                 Button("Обновить") { Task { await model.reload() } }
@@ -1368,20 +1914,26 @@ struct WorkspaceView: View {
             }
             .menuIndicator(.hidden)
             .help("Добавить")
-            Menu {
-                ForEach([("system", "Как в системе"), ("light", "Светлая"), ("dark", "Тёмная")], id: \.0) { theme in
-                    Button {
-                        Task { await model.command(["op": "settings", "data": ["theme": theme.0]]) }
-                    } label: {
-                        if model.workspace?.settings.theme == theme.0 { Label(theme.1, systemImage: "checkmark") }
-                        else { Text(theme.1) }
-                    }
+            .disabled(projectEdit != nil)
+            if !compactHeader {
+                Menu {
+                    themeOptions
+                } label: {
+                    Label(["light": "Светлая", "dark": "Тёмная"][model.workspace?.settings.theme ?? ""] ?? "Как в системе",
+                          systemImage: "circle.lefthalf.filled").accessibilityLabel("Тема интерфейса")
                 }
-            } label: {
-                Label(["light": "Светлая", "dark": "Тёмная"][model.workspace?.settings.theme ?? ""] ?? "Как в системе",
-                      systemImage: "circle.lefthalf.filled").accessibilityLabel("Тема интерфейса")
+                .disabled(model.workspace == nil || model.saving)
             }
-            .disabled(model.workspace == nil || model.saving)
+            Menu {
+                Button("Открыть справку VTASK", action: openUserGuide)
+                Button("Начать тур с Валли", action: startTour)
+                    .disabled(!canStartTour)
+            } label: {
+                Image(systemName: "questionmark.circle")
+            }
+            .menuIndicator(.hidden)
+            .accessibilityLabel("Справка")
+            .help("Справка и тур с Валли")
             Button { assistantVisible.toggle() } label: {
                 HStack(spacing: 7) {
                     ValliAvatar(state: valliTakingNotes ? .takingNotes : .idle, size: 32,
@@ -1396,11 +1948,59 @@ struct WorkspaceView: View {
             }
             .buttonStyle(.bordered)
             .onHover { valliButtonHovered = $0 }
+            .disabled(projectEdit != nil)
             .accessibilityLabel("Валли")
             .accessibilityValue(valliTakingNotes ? ValliState.takingNotes.title : "")
         }
-        .controlSize(.large)
+        .controlSize(compactHeader ? .regular : .large)
         .fixedSize(horizontal: true, vertical: false)
+    }
+
+    private var themeOptions: some View {
+        ForEach([("system", "Как в системе"), ("light", "Светлая"), ("dark", "Тёмная")], id: \.0) { theme in
+            Button {
+                Task { await model.command(["op": "settings", "data": ["theme": theme.0]]) }
+            } label: {
+                if model.workspace?.settings.theme == theme.0 { Label(theme.1, systemImage: "checkmark") }
+                else { Text(theme.1) }
+            }
+        }
+    }
+
+    private var canNavigateTour: Bool {
+        model.workspace != nil && !model.saving && projectEdit == nil && taskDraftID == nil && creation == nil
+    }
+
+    private var canStartTour: Bool {
+        canNavigateTour && model.capture?.active == nil && !assistantVoiceEnabled
+    }
+
+    private func startTour() {
+        guard canStartTour else { return }
+        assistantVisible = true
+        showTourStep(.today)
+    }
+
+    private func openUserGuide() {
+        let url = Bundle.main.url(forResource: "VTASK-user-guide", withExtension: "html")
+            ?? Bundle.module.url(forResource: "VTASK-user-guide", withExtension: "html")
+        showingHelpError = !(url.map { NSWorkspace.shared.open($0) } ?? false)
+    }
+
+    private func showTourStep(_ step: ValliTourStep) {
+        guard canNavigateTour else { return }
+        switch step {
+        case .today: navigate(.dashboard)
+        case .projects: navigate(.projectList)
+        case .meetings: navigate(.meetings)
+        case .approvals: openApprovals()
+        case .glossary: openGlossary(.periods)
+        case .settings:
+            settingsArea = .general
+            navigate(.settings)
+        case .assistant: break
+        }
+        tourStep = step
     }
 
     @ViewBuilder
@@ -1457,10 +2057,13 @@ struct WorkspaceView: View {
         return model.capture?.active?.sessionId ?? selectedMeeting.map { "meeting-\($0.id)" }
     }
 
+    private var assistantDocked: Bool {
+        tourStep != nil || liveMeetingID != nil || assistantEditsCreation || assistantVoiceEnabled
+    }
+
     private let assistantWidth: CGFloat = 355
 
     private func pollAssistantLive(_ session: CaptureStatus.Session) async {
-        var commands = LiveAssistantCommands()
         guard let sessionID = session.sessionId else { return }
         while !Task.isCancelled {
             if let snapshot = try? await model.liveTranscript(for: session.meetingId),
@@ -1468,11 +2071,6 @@ struct WorkspaceView: View {
                 let startedLive = assistantLive?.sessionId != sessionID
                 assistantLive = snapshot
                 if startedLive { assistantVisible = true }
-                let requests = commands.read(snapshot.chunks)
-                if !requests.isEmpty {
-                    liveAssistantRequests.append(contentsOf: requests)
-                    assistantVisible = true
-                }
             }
             do { try await Task.sleep(for: .seconds(3)) } catch { return }
         }
@@ -1482,10 +2080,10 @@ struct WorkspaceView: View {
     private var assistantDrawer: some View {
         if let workspace = model.workspace {
             ZStack(alignment: .trailing) {
-                if liveMeetingID == nil {
+                if !assistantDocked {
                     Color.black.opacity(0.16).contentShape(Rectangle()).onTapGesture { assistantVisible = false }
                 }
-                VStack(alignment: .leading, spacing: 0) {
+                ZStack {
                     AssistantSearch(tasks: visibleTasks, today: workspace.today, projects: projects, glossaryModel: model,
                                     currentProject: project ?? workspace.projects.first { $0.id == selectedMeeting?.projectId },
                                     currentTask: project != nil && projectSections.tab != .items && taskDraftID != selectedItemID
@@ -1504,10 +2102,10 @@ struct WorkspaceView: View {
                                         return ("«\(task.title)» теперь в статусе «\(stage.title)».", true)
                                     }, people: workspace.people,
                                     proposals: workspace.proposals, meetings: workspace.meetings,
-                                    openTask: { assistantVisible = false; openTask($0) },
+                                    openTask: { openTask($0) },
+                                    openMeeting: openMeeting,
                                     openProject: { navigate(.project($0)) },
                                     openProposal: { proposal in
-                                        assistantVisible = false
                                         if project == nil {
                                             openApprovals()
                                         } else {
@@ -1518,12 +2116,18 @@ struct WorkspaceView: View {
                                         }
                                         approvalSelection.wrappedValue = .proposal(proposal.id)
                                     },
-                                    canUseMicrophone: model.capture?.active == nil && creation == nil,
+                                    prepareCreation: prepareAssistantCreation,
+                                    creationConversation: creationConversation,
+                                    updateCreation: updateAssistantCreation,
+                                    finishCreation: confirmAssistantCreation,
+                                    cancelCreation: cancelCreation,
+                                    canUseMicrophone: model.capture?.active == nil && (creation == nil || assistantEditsCreation),
                                     meetingRecording: model.capture?.active != nil,
+                                    liveSession: model.capture?.liveDisplay == true ? model.capture?.active : nil,
+                                    captureActivity: model.captureActivity,
+                                    voiceEnabled: $assistantVoiceEnabled,
                                     takingNotes: valliTakingNotes,
-                                    liveTranscript: selection == .meetings && model.capture?.liveDisplay == true &&
-                                        (liveMeetingID == nil || liveMeetingID == selectedMeeting?.id) ? assistantLive : nil,
-                                    liveRequests: $liveAssistantRequests,
+                                    liveTranscript: assistantLive,
                                     transcribe: model.transcribeAssistant,
                                     interpret: model.interpretAssistant,
                                     submitLocalCommand: { text, taskID, proposalID, update in
@@ -1534,7 +2138,18 @@ struct WorkspaceView: View {
                                         let id = await model.createEntity(payload)
                                         return (id, model.error)
                                     },
+                                    startTour: canStartTour ? startTour : nil,
                                     close: { assistantVisible = false })
+                        .opacity(tourStep == nil ? 1 : 0)
+                        .disabled(tourStep != nil)
+                        .allowsHitTesting(tourStep == nil)
+                        .accessibilityHidden(tourStep != nil)
+                    if let tourStep {
+                        ValliTourPanel(step: tourStep, canNavigate: canNavigateTour,
+                                       canSpeak: model.capture?.active == nil && !assistantVoiceEnabled,
+                                       showStep: showTourStep,
+                                       close: { self.tourStep = nil })
+                    }
                 }
                 .frame(width: assistantWidth)
                 .frame(maxHeight: .infinity)
@@ -1550,21 +2165,61 @@ struct WorkspaceView: View {
             workspace.tasks.isEmpty && workspace.meetings.isEmpty
     }
 
-    var body: some View {
+    private var workspaceShell: some View {
         HStack(spacing: 0) {
-            if navigationVisible {
+            if navigationVisible && !assistantEditsCreation {
                 sidebar
                 Rectangle().fill(palette.border).frame(width: 1)
             }
             VStack(spacing: 0) {
                 topbar
                 recordingBanner
-                workspaceLayout.frame(maxWidth: .infinity, maxHeight: .infinity)
+                if assistantEditsCreation, let kind = creation {
+                    ScrollView {
+                        creationForm(kind)
+                            .frame(maxWidth: .infinity, alignment: .center)
+                            .padding(12)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
+                    workspaceLayout.frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
             }
             .background(palette.background)
-            .padding(.trailing, assistantVisible && liveMeetingID != nil ? assistantWidth : 0)
+            .padding(.trailing, assistantVisible && assistantDocked ? assistantWidth : 0)
             .overlay(alignment: .trailing) {
                 if assistantVisible { assistantDrawer }
+            }
+        }
+    }
+
+    var body: some View {
+        workspaceShell
+        .onChange(of: assistantVisible) { visible in
+            if !visible { tourStep = nil }
+        }
+        .onChange(of: model.capture?.active != nil) { recording in
+            if recording { tourStep = nil }
+        }
+        .alert("Не удалось открыть справку", isPresented: $showingHelpError) {
+            Button("OK", role: .cancel) {}
+        }
+        .task(id: scopedGlossaryKey) {
+            let selection = activeTerminology
+            let key = scopedGlossaryKey
+            guard !selection.isEmpty else {
+                scopedGlossary = []
+                loadedGlossaryKey = nil
+                return
+            }
+            do {
+                let terms = try await model.scopedGlossary(for: selection)
+                guard !Task.isCancelled, key == scopedGlossaryKey else { return }
+                scopedGlossary = terms
+                loadedGlossaryKey = key
+            } catch {
+                guard !Task.isCancelled, key == scopedGlossaryKey else { return }
+                loadedGlossaryKey = nil
             }
         }
         .environment(\.companyGlossary, companyGlossary)
@@ -1587,7 +2242,6 @@ struct WorkspaceView: View {
         .task { await model.pollCapture() }
         .task(id: livePreviewContext) {
             assistantLive = nil
-            liveAssistantRequests.removeAll()
             guard livePreviewContext != nil else { return }
             if let session = model.capture?.active {
                 await pollAssistantLive(session)
@@ -1634,9 +2288,14 @@ struct WorkspaceView: View {
             MeetingEditor(model: model, meeting: meeting)
                 .sheetCloseButton(disabled: model.saving)
         }
-        .sheet(item: $editingProject) { project in
-            ProjectEditor(model: model, project: project)
-                .sheetCloseButton(disabled: model.saving)
+        .alert("В проекте есть несохранённые изменения", isPresented: Binding(
+            get: { pendingProjectNavigation != nil },
+            set: { if !$0 { pendingProjectNavigation = nil } }
+        ), presenting: pendingProjectNavigation) { destination in
+            Button("Продолжить редактирование", role: .cancel) {}
+            Button("Выйти без сохранения", role: .destructive) { discardProjectEdit(and: destination) }
+        } message: { _ in
+            Text("Чтобы применить изменения, сохраните проект перед переходом.")
         }
         .alert(projectArchiveRequest?.archived == true ? "Восстановить проект?" : "Перенести проект в архив?",
                isPresented: Binding(get: { projectArchiveRequest != nil }, set: { if !$0 { projectArchiveRequest = nil } }),
@@ -1652,123 +2311,144 @@ struct WorkspaceView: View {
         } message: { project in
             Text(project.title)
         }
-        .sheet(item: $creation) { kind in
-            VStack(alignment: .leading, spacing: 16) {
-                Text(kind.rawValue).font(.headline)
-                TextField(kind == .meeting ? "Название (по умолчанию «Совещание»)" :
-                          kind == .person ? "Имя" : kind == .decision ? "Текст решения" : "Название", text: $newTitle)
-                if kind == .project {
-                    TextField("Краткое описание", text: $newProjectDescription, axis: .vertical)
-                        .lineLimit(2...4)
-                    if let unresolvedProjectOwner, newProjectOwnerID == nil {
-                        Text("Уточните владельца «" + unresolvedProjectOwner + "».").foregroundStyle(.secondary)
-                    }
-                    Picker("Владелец", selection: $newProjectOwnerID) {
-                        Text(unresolvedProjectOwner == nil ? "Не назначен" : "Выберите владельца").tag(nil as Int?)
-                        ForEach(model.workspace?.people ?? []) { Text($0.name).tag(Optional($0.id)) }
-                    }
-                    ProjectDateField(title: "Начало", value: $newProjectStart)
-                    ProjectDateField(title: "Срок завершения", value: $newProjectEnd)
+        .sheet(item: Binding(get: { assistantEditsCreation ? nil : creation },
+                             set: { if !assistantEditsCreation { creation = $0 } })) { kind in
+            creationForm(kind).frame(width: 420)
+                .sheetCloseButton(disabled: model.saving)
+        }
+    }
+
+    private func creationForm(_ kind: Creation) -> some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text(kind.rawValue).font(.headline)
+            TextField(kind == .meeting ? "Название (по умолчанию «Совещание»)" :
+                      kind == .person ? "Имя" : kind == .decision ? "Текст решения" : "Название", text: $newTitle)
+            if kind == .project {
+                TextField("Краткое описание", text: $newProjectDescription, axis: .vertical)
+                    .lineLimit(2...4)
+                if let unresolvedProjectOwner, newProjectOwnerID == nil {
+                    Text("Уточните владельца «" + unresolvedProjectOwner + "».").foregroundStyle(.secondary)
                 }
-                if [.task, .meeting, .decision].contains(kind) {
-                    if let creationNewProjectName {
-                        LabeledContent("Новый проект", value: creationNewProjectName)
-                    } else {
-                        Picker("Проект", selection: $creationProjectID) {
-                            Text(creationNeedsProject ? "Выберите проект" : "Без проекта").tag(nil as Int?)
-                            ForEach(projects) { Text($0.title).tag(Optional($0.id)) }
-                        }
-                    }
+                Picker("Владелец", selection: $newProjectOwnerID) {
+                    Text(unresolvedProjectOwner == nil ? "Не назначен" : "Выберите владельца").tag(nil as Int?)
+                    ForEach(model.workspace?.people ?? []) { Text($0.name).tag(Optional($0.id)) }
                 }
-                if kind == .task {
-                    if let unresolvedTaskAssignee, newTaskAssigneeID == nil {
-                        Text("Уточните исполнителя «" + unresolvedTaskAssignee + "».").foregroundStyle(.secondary)
-                    }
-                    Picker("Исполнитель", selection: $newTaskAssigneeID) {
-                        Text(unresolvedTaskAssignee == nil ? "Не назначен" : "Выберите исполнителя").tag(nil as Int?)
-                        ForEach(model.workspace?.people ?? []) { Text($0.name).tag(Optional($0.id)) }
-                    }
-                    TextField("Подробности", text: $newTaskDescription, axis: .vertical)
+                if let date = pendingProjectDate {
+                    Text("К какому полю относится дата " + ProjectDateField.display(date) + "?")
+                        .foregroundStyle(.secondary)
                     HStack {
-                        TextField("Срок (ГГГГ-ММ-ДД)", text: $newTaskDueDate)
-                        TextField("Время (ЧЧ:ММ)", text: $newTaskDueTime)
-                            .disabled(newTaskDueDate.isEmpty)
-                    }
-                    Picker("Приоритет", selection: $newTaskPriority) {
-                        Text("Низкий").tag("low")
-                        Text("Обычный").tag("normal")
-                        Text("Высокий").tag("high")
-                        Text("Критический").tag("critical")
+                        Button("Начало") { newProjectStart = date; pendingProjectDate = nil }
+                        Button("Завершение") { newProjectEnd = date; pendingProjectDate = nil }
+                        Button("Пропустить") { pendingProjectDate = nil }
                     }
                 }
-                if kind == .meeting {
-                    Toggle("Назначить другую дату и время", isOn: $usesCustomMeetingDate)
-                    if usesCustomMeetingDate {
-                        DatePicker("Дата и время", selection: $newMeetingDate, displayedComponents: [.date, .hourAndMinute])
-                            .environment(\.timeZone, meetingTimeZone)
-                    } else {
-                        Text("Дата и время заполнятся при сохранении.").font(.caption).foregroundStyle(.secondary)
-                    }
-                    Text("Участники").font(.headline)
-                    ScrollView {
-                        VStack(alignment: .leading, spacing: 8) {
-                            ForEach(model.workspace?.people ?? []) { person in
-                                Toggle(person.name, isOn: Binding(
-                                    get: { newParticipants.contains(person.id) },
-                                    set: { selected in
-                                        if selected { newParticipants.insert(person.id) }
-                                        else { newParticipants.remove(person.id) }
-                                    }
-                                ))
-                                .toggleStyle(.checkbox)
-                            }
-                        }
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                    }
-                    .frame(height: 120)
-                    HStack {
-                        TextField("Имя нового участника", text: $newParticipantName)
-                            .onSubmit { Task { await addMeetingParticipant() } }
-                        Button("Добавить участника") { Task { await addMeetingParticipant() } }
-                            .disabled(newParticipantName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                ProjectDateField(title: "Начало", value: $newProjectStart)
+                ProjectDateField(title: "Срок завершения", value: $newProjectEnd)
+            }
+            if [.task, .meeting, .decision].contains(kind) {
+                if let hint = creationProjectHint, creationProjectID == nil {
+                    Text("Уточните проект «" + hint + "».").foregroundStyle(.secondary)
+                }
+                if let creationNewProjectName {
+                    LabeledContent("Новый проект", value: creationNewProjectName)
+                } else {
+                    Picker("Проект", selection: $creationProjectID) {
+                        Text(creationNeedsProject ? "Выберите проект" : "Без проекта").tag(nil as Int?)
+                        ForEach(projects) { Text($0.title).tag(Optional($0.id)) }
                     }
                 }
-                if let error = model.error { Text(error).foregroundStyle(.red) }
-                let canSave = (kind == .meeting || !newTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty) &&
-                    (!creationNeedsProject || creationProjectID != nil || creationNewProjectName != nil) &&
-                    (kind != .project || unresolvedProjectOwner == nil || newProjectOwnerID != nil) &&
-                    (kind != .task || unresolvedTaskAssignee == nil || newTaskAssigneeID != nil)
+            }
+            if [.project, .meeting].contains(kind), let workspace = model.workspace {
+                let parent = kind == .meeting ? creationProjectID : nil
+                IndustrySelectionField(options: workspace.industryOptions, specializations: workspace.specializationCatalog ?? [],
+                    inheritedTitle: (parent == nil ? "Из настроек · " : "Из проекта · ")
+                        + workspace.terminologyTitles(workspace.terminologySelection(projectID: parent)),
+                    selection: $newIndustries)
+            }
+            if kind == .task {
+                if let unresolvedTaskAssignee, newTaskAssigneeID == nil {
+                    Text("Уточните исполнителя «" + unresolvedTaskAssignee + "».").foregroundStyle(.secondary)
+                }
+                Picker("Исполнитель", selection: $newTaskAssigneeID) {
+                    Text(unresolvedTaskAssignee == nil ? "Не назначен" : "Выберите исполнителя").tag(nil as Int?)
+                    ForEach(model.workspace?.people ?? []) { Text($0.name).tag(Optional($0.id)) }
+                }
+                TextField("Подробности", text: $newTaskDescription, axis: .vertical)
                 HStack {
-                    Spacer()
-                    Button("Отмена") { creation = nil }
-                    Button("Сохранить") { Task { await create(kind) } }
-                        .keyboardShortcut(.defaultAction)
-                        .disabled(!canSave)
+                    TextField("Срок (ГГГГ-ММ-ДД)", text: $newTaskDueDate)
+                    TextField("Время (ЧЧ:ММ)", text: $newTaskDueTime)
+                        .disabled(newTaskDueDate.isEmpty)
                 }
+                Picker("Приоритет", selection: $newTaskPriority) {
+                    Text("Низкий").tag("low")
+                    Text("Обычный").tag("normal")
+                    Text("Высокий").tag("high")
+                    Text("Критический").tag("critical")
+                }
+            }
+            if kind == .meeting {
+                Toggle("Назначить другую дату и время", isOn: $usesCustomMeetingDate)
+                if usesCustomMeetingDate {
+                    DatePicker("Дата и время", selection: $newMeetingDate, displayedComponents: [.date, .hourAndMinute])
+                        .environment(\.timeZone, meetingTimeZone)
+                } else {
+                    Text("Дата и время заполнятся при сохранении.").font(.caption).foregroundStyle(.secondary)
+                }
+                Text("Участники").font(.headline)
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 8) {
+                        ForEach(model.workspace?.people ?? []) { person in
+                            Toggle(person.speakerPickerName, isOn: Binding(
+                                get: { newParticipants.contains(person.id) },
+                                set: { selected in
+                                    if selected { newParticipants.insert(person.id) }
+                                    else { newParticipants.remove(person.id) }
+                                }
+                            ))
+                            .toggleStyle(.checkbox)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(height: 120)
+                HStack {
+                    TextField("Имя нового участника", text: $newParticipantName)
+                        .onSubmit { Task { await addMeetingParticipant() } }
+                    Button("Добавить участника") { Task { await addMeetingParticipant() } }
+                        .disabled(newParticipantName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+            }
+            if let error = model.error { Text(error).foregroundStyle(.red) }
+            HStack {
+                Spacer()
+                Button("Отмена", action: cancelCreation)
+                Button("Сохранить") { Task { await create(kind) } }
+                    .buttonStyle(.borderedProminent)
+                    .keyboardShortcut(assistantEditsCreation ? nil : .defaultAction)
+                    .disabled(!canSaveCreation(kind))
+            }
+        }
+        .padding()
+        .frame(maxWidth: 500)
+        .disabled(model.saving || model.loading)
+        .interactiveDismissDisabled(model.saving)
+        .sheet(item: $newMeetingPerson) { person in
+            VStack(alignment: .leading, spacing: 12) {
+                Text("Карточка участника").font(.title3.bold())
+                Form {
+                    PersonDetailsEditor(model: model, person: person)
+                    VoiceProfileView(model: model, person: person)
+                }
+                .formStyle(.grouped)
+                .scrollContentBackground(.hidden)
+                .background(palette.background)
+                Button("Вернуться к совещанию") { newMeetingPerson = nil }
+                    .disabled(model.saving)
             }
             .padding()
-            .frame(width: 420)
-            .disabled(model.saving || model.loading)
+            .frame(width: 460, height: 520)
             .sheetCloseButton(disabled: model.saving)
             .interactiveDismissDisabled(model.saving)
-            .sheet(item: $newMeetingPerson) { person in
-                VStack(alignment: .leading, spacing: 12) {
-                    Text("Карточка участника").font(.title3.bold())
-                    Form {
-                        PersonDetailsEditor(model: model, person: person)
-                        VoiceProfileView(model: model, person: person)
-                    }
-                    .formStyle(.grouped)
-                    .scrollContentBackground(.hidden)
-                    .background(palette.background)
-                    Button("Вернуться к совещанию") { newMeetingPerson = nil }
-                        .disabled(model.saving)
-                }
-                .padding()
-                .frame(width: 460, height: 520)
-                .sheetCloseButton(disabled: model.saving)
-                .interactiveDismissDisabled(model.saving)
-            }
         }
     }
 }

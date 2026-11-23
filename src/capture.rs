@@ -58,7 +58,9 @@ impl CaptureManager {
         json!({"available":self.helper.is_file(),"active":self.active.as_ref().map(|s| {
             let pause=s.paused_at.map_or(Duration::ZERO,|t|t.elapsed());
             let elapsed=s.ready_at.map_or(Duration::ZERO,|t|t.elapsed()).saturating_sub(s.pause_total+pause);
-            json!({"meeting_id":s.meeting,"session_id":s.session_id,"fragments":s.fragments,"saved_ms":s.base_ms+s.saved_frames*1000/s.sample_rate.max(1),"elapsed_ms":elapsed.as_millis(),"source":s.source["name"].as_str().unwrap_or("Микрофон по умолчанию"),"device":s.source,"level":s.level,"can_pause":s.pause_supported,"error":s.error,"state":if s.stopping.is_some(){"stopping"}else if s.paused_at.is_some(){"paused"}else if s.confirmed{"recording"}else{"starting"}})
+            let elapsed_ms = elapsed.as_millis() as u64;
+            let position_ms = s.base_ms.saturating_add(elapsed_ms);
+            json!({"meeting_id":s.meeting,"session_id":s.session_id,"fragments":s.fragments,"saved_ms":s.base_ms+s.saved_frames*1000/s.sample_rate.max(1),"elapsed_ms":elapsed_ms,"position_ms":position_ms,"source":s.source["name"].as_str().unwrap_or("Микрофон по умолчанию"),"device":s.source,"level":s.level,"can_pause":s.pause_supported,"error":s.error,"state":if s.stopping.is_some(){"stopping"}else if s.paused_at.is_some(){"paused"}else if s.confirmed{"recording"}else{"starting"}})
         }),"last":self.last})
     }
     pub fn pause(&mut self, meeting: i64, resume: bool) -> Result<()> {

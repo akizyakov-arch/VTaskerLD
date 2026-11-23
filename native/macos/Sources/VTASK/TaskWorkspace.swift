@@ -4,9 +4,11 @@ struct TaskWorkspace: View {
     @ObservedObject var model: WorkspaceModel
     let tasks: [TaskItem]
     let projects: [Project]
+    let projectID: Int?
     let people: [Person]
     @Binding var selection: Int?
     @State private var dropColumn: BoardColumn?
+    @State private var editingProject: Project?
     @Environment(\.colorScheme) private var colorScheme
 
     private struct BoardColumn: Equatable {
@@ -23,6 +25,9 @@ struct TaskWorkspace: View {
     ]
 
     private var palette: PanelPalette { PanelPalette(dark: colorScheme == .dark) }
+    private var editableProjects: [Project] {
+        projects.filter { projectID == nil || $0.id == projectID }
+    }
 
     private func stages(for project: Int?) -> [Stage] {
         projects.first { $0.id == project }?.stages ?? model.workspace?.defaultStages ?? []
@@ -31,13 +36,16 @@ struct TaskWorkspace: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             toolbar
-            if tasks.isEmpty {
+            if tasks.isEmpty && !editableProjects.contains(where: { $0.id == projectID }) {
                 Label("Задач нет", systemImage: "checklist")
                     .foregroundStyle(.secondary)
                     .panelCard()
             } else {
                 boardView
             }
+        }
+        .sheet(item: $editingProject) { project in
+            BoardEditor(model: model, project: project)
         }
     }
 
@@ -51,6 +59,21 @@ struct TaskWorkspace: View {
                 .foregroundStyle(.secondary)
                 .accessibilityLabel("Задач: \(tasks.count)")
             Spacer(minLength: 0)
+            if editableProjects.count == 1, let project = editableProjects.first {
+                Button { editingProject = project } label: {
+                    Label("Редактировать доску", systemImage: "slider.horizontal.3")
+                }
+                .disabled(model.saving || model.loading)
+            } else if !editableProjects.isEmpty {
+                Menu {
+                    ForEach(editableProjects) { project in
+                        Button(project.title) { editingProject = project }
+                    }
+                } label: {
+                    Label("Редактировать доску", systemImage: "slider.horizontal.3")
+                }
+                .disabled(model.saving || model.loading)
+            }
             if model.lastBatchID != nil {
                 Button {
                     Task { await model.undoBatch() }
@@ -66,13 +89,29 @@ struct TaskWorkspace: View {
 
     private var boardView: some View {
         let groups = Dictionary(grouping: tasks, by: \.projectId)
-        let projectIDs = groups.keys.sorted { ($0 ?? 0) < ($1 ?? 0) }
+        let projectIDs = if let projectID, editableProjects.contains(where: { $0.id == projectID }) {
+            [Optional(projectID)]
+        } else {
+            groups.keys.sorted { ($0 ?? 0) < ($1 ?? 0) }
+        }
         return ScrollView([.horizontal, .vertical]) {
             VStack(alignment: .leading, spacing: 18) {
                 ForEach(projectIDs, id: \.self) { projectID in
-                    Label(projects.first { $0.id == projectID }?.title ?? "Без проекта", systemImage: "folder")
-                        .font(.headline)
-                        .accessibilityAddTraits(.isHeader)
+                    HStack(spacing: 8) {
+                        let project = projects.first { $0.id == projectID }
+                        Label(project?.title ?? "Без проекта", systemImage: "folder")
+                            .font(.headline)
+                            .accessibilityAddTraits(.isHeader)
+                        if editableProjects.count > 1, let project {
+                            Button { editingProject = project } label: {
+                                Image(systemName: "slider.horizontal.3")
+                            }
+                            .buttonStyle(.borderless)
+                            .help("Редактировать доску проекта")
+                            .accessibilityLabel("Редактировать доску «\(project.title)»")
+                            .disabled(model.saving || model.loading)
+                        }
+                    }
                     HStack(alignment: .top, spacing: 12) {
                         ForEach(Array(stages(for: projectID).enumerated()), id: \.element.id) { index, stage in
                             let column = BoardColumn(projectID: projectID, stageID: stage.id)
